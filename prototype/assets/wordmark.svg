@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 80" width="360" height="80">
+  <rect width="360" height="80" fill="#3E2723"></rect>
+  <g font-family="&#39;Space Grotesk&#39;, system-ui, sans-serif" font-size="26" font-weight="600" letter-spacing="-0.5">
+    <text x="24" y="50" fill="#DDF4C9">OpenSwim</text>
+    <text x="170" y="50" fill="#E8B44F">·</text>
+    <text x="186" y="50" fill="#DDF4C9">Podcast</text>
+  </g>
+</svg>

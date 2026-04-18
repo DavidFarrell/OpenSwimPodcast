@@ -1,0 +1,1370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>OpenSwim Podcast — Workbench prototype</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+/* OpenSwim Podcast — base tokens + components (from kit) */
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url("fonts/space-grotesk-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 300 600;
+  font-display: swap;
+  src: url("fonts/jetbrains-mono-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2212;
+}
+
+:root{
+  --ct-coffee:#3E2723;--ct-coffee-deep:#2A1A16;--ct-coffee-mid:#4E342E;--ct-coffee-soft:#5D3F39;--ct-coffee-ink:#1C110E;
+  --ct-tea:#DDF4C9;--ct-tea-dim:rgba(221,244,201,.68);--ct-tea-muted:rgba(221,244,201,.42);--ct-tea-faint:rgba(221,244,201,.22);--ct-tea-hair:rgba(221,244,201,.12);--ct-tea-ghost:rgba(221,244,201,.08);
+  --ct-amber:#E8B44F;--ct-amber-dim:rgba(232,180,79,.18);--ct-error:#C96F4A;--ct-error-dim:rgba(201,111,74,.16);
+  --bg:var(--ct-coffee);--bg-inset:var(--ct-coffee-deep);--fg:var(--ct-tea);--fg-dim:var(--ct-tea-dim);--fg-muted:var(--ct-tea-muted);
+  --rule:var(--ct-tea-hair);--rule-strong:var(--ct-tea-faint);--accent:var(--ct-amber);--destructive:var(--ct-error);
+  --font-sans:"Space Grotesk",ui-sans-serif,system-ui,sans-serif;
+  --font-mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
+  --fs-caption:10px;--fs-meta:11px;--fs-body:13px;--fs-title:15px;--fs-subhead:22px;--fs-hero:44px;
+  --fw-light:300;--fw-regular:400;--fw-medium:500;--fw-semibold:600;--fw-bold:700;
+  --tracking-hero:-1.5px;--tracking-subhead:-.5px;--tracking-mono:1.5px;
+  --lh-tight:1;--lh-snug:1.25;--lh-body:1.55;--lh-loose:1.9;
+  --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;--sp-6:24px;--sp-7:32px;--sp-8:48px;--sp-9:64px;
+  --radius:0;--stroke:1px;--dur-fast:100ms;--dur-base:160ms;--dur-slow:280ms;--ease:cubic-bezier(.2,.8,.2,1);
+  --row-h:44px;--row-pad-y:11px;--row-pad-x:16px;--thumb-sz:28px;--chrome-h:30px;
+}
+html,body{margin:0;padding:0;background:#0a0605;}
+body.openswim{background:#0a0605;color:var(--fg);font-family:var(--font-sans);font-size:var(--fs-body);line-height:var(--lh-body);-webkit-font-smoothing:antialiased;}
+#root{display:flex;flex-direction:column;align-items:center;gap:24px;padding:24px;}
+.print-page{width:1120px;height:720px;flex-shrink:0;position:relative;background:#0a0605;}
+.print-cap{position:absolute;left:28px;top:-18px;font-family:var(--font-mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(221,244,201,.5);}
+@media print{
+  @page{size:1120px 720px;margin:0;}
+  html,body{background:#0a0605 !important;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
+  body.openswim{background:#0a0605 !important;}
+  *{-webkit-print-color-adjust:exact !important;print-color-adjust:exact !important;}
+  #root{gap:0;padding:0;}
+  .print-page{page-break-after:always;break-after:page;page-break-inside:avoid;break-inside:avoid;}
+  .print-page:last-child{page-break-after:auto;}
+  .print-cap{display:none;}
+}
+.openswim *{box-sizing:border-box}
+::selection{background:var(--ct-amber);color:var(--ct-coffee-ink)}
+.openswim ::-webkit-scrollbar{width:10px;height:10px}
+.openswim ::-webkit-scrollbar-track{background:transparent}
+.openswim ::-webkit-scrollbar-thumb{background:var(--ct-tea-hair)}
+.openswim ::-webkit-scrollbar-thumb:hover{background:var(--ct-tea-faint)}
+
+/* Typography helpers */
+.ct-hero{font-family:var(--font-sans);font-size:var(--fs-hero);font-weight:var(--fw-semibold);letter-spacing:var(--tracking-hero);line-height:var(--lh-tight)}
+.ct-subhead{font-family:var(--font-sans);font-size:var(--fs-subhead);font-weight:var(--fw-semibold);letter-spacing:var(--tracking-subhead)}
+.ct-title{font-family:var(--font-sans);font-size:var(--fs-title);font-weight:var(--fw-medium)}
+.ct-label{font-family:var(--font-mono);font-size:var(--fs-caption);letter-spacing:var(--tracking-mono);text-transform:uppercase;color:var(--fg-muted)}
+.ct-meta{font-family:var(--font-mono);font-size:var(--fs-meta);color:var(--fg-dim)}
+
+/* Buttons */
+.ct-btn{display:inline-flex;align-items:center;gap:var(--sp-2);padding:9px 14px;border:none;border-radius:0;font-family:var(--font-sans);font-size:var(--fs-body);font-weight:var(--fw-medium);letter-spacing:.2px;cursor:pointer;transition:background var(--dur-fast) var(--ease),color var(--dur-fast) var(--ease),border-color var(--dur-fast) var(--ease);user-select:none;white-space:nowrap}
+.ct-btn:focus-visible{outline:2px solid var(--ct-amber);outline-offset:2px}
+.ct-btn--primary{background:var(--ct-tea);color:var(--ct-coffee);font-weight:var(--fw-semibold)}
+.ct-btn--primary:hover{background:#EBFADB}
+.ct-btn--primary:active{background:#C9E4B3}
+.ct-btn--secondary{background:transparent;color:var(--fg);border:1px solid var(--rule-strong)}
+.ct-btn--secondary:hover{background:var(--ct-tea-ghost);border-color:var(--ct-tea-muted)}
+.ct-btn--cta{background:var(--ct-amber);color:var(--ct-coffee-ink);font-weight:var(--fw-bold);letter-spacing:.3px;text-transform:uppercase;font-family:var(--font-mono);font-size:var(--fs-meta);padding:11px 14px}
+.ct-btn--cta:hover{background:#F1C36C}
+.ct-btn--ghost{background:transparent;color:var(--fg-muted);padding:9px 10px}
+.ct-btn--ghost:hover{color:var(--fg)}
+.ct-btn--destructive{background:transparent;color:var(--destructive);border:1px solid var(--destructive)}
+.ct-btn--destructive:hover{background:var(--destructive);color:var(--ct-coffee-ink)}
+.ct-btn--sm{padding:7px 11px;font-size:var(--fs-meta)}
+.ct-btn--xs{padding:4px 7px;font-size:10px;font-family:var(--font-mono);letter-spacing:.5px;text-transform:uppercase}
+.ct-btn[disabled]{opacity:.35;cursor:not-allowed}
+
+/* Tags */
+.ct-tag{display:inline-flex;align-items:center;gap:4px;padding:3px 7px;background:var(--ct-tea-hair);color:var(--fg);font-family:var(--font-mono);font-size:var(--fs-caption);letter-spacing:.5px;text-transform:uppercase;border-radius:0;line-height:1.4}
+.ct-tag--active{background:var(--ct-amber-dim);color:var(--ct-amber)}
+.ct-tag--on-device{background:rgba(221,244,201,.18);color:var(--fg)}
+.ct-tag--error{color:var(--destructive);background:var(--ct-error-dim)}
+.ct-tag--ghost{background:transparent;color:var(--fg-muted);border:1px solid var(--rule)}
+
+/* Inputs */
+.ct-input{background:transparent;color:var(--fg);border:1px solid var(--rule-strong);border-radius:0;padding:9px 12px;font-family:var(--font-sans);font-size:var(--fs-body);width:100%;outline:none;transition:border-color var(--dur-fast) var(--ease)}
+.ct-input::placeholder{color:var(--fg-muted)}
+.ct-input:focus{border-color:var(--ct-amber)}
+.ct-input-group{display:flex;align-items:center;gap:var(--sp-2);border:1px solid var(--rule-strong);padding:8px 12px;transition:border-color var(--dur-fast) var(--ease)}
+.ct-input-group:focus-within{border-color:var(--ct-amber)}
+.ct-input-group input{flex:1;background:none;border:none;outline:none;color:var(--fg);font-family:inherit;font-size:inherit}
+.ct-kbd{font-family:var(--font-mono);font-size:var(--fs-caption);color:var(--fg-muted);letter-spacing:.5px;border:1px solid var(--rule);padding:1px 5px}
+
+/* Toggle */
+.ct-toggle{display:inline-flex;align-items:center;gap:var(--sp-3);cursor:pointer;user-select:none}
+.ct-toggle__track{width:30px;height:16px;background:var(--ct-coffee-mid);position:relative;transition:background var(--dur-base) var(--ease);flex-shrink:0}
+.ct-toggle__thumb{position:absolute;top:2px;left:2px;width:12px;height:12px;background:var(--ct-tea-muted);transition:transform var(--dur-base) var(--ease),background var(--dur-base) var(--ease)}
+.ct-toggle[aria-checked=true] .ct-toggle__track{background:var(--ct-tea)}
+.ct-toggle[aria-checked=true] .ct-toggle__thumb{background:var(--ct-coffee-deep);transform:translateX(14px)}
+
+/* Rows */
+.ct-row{display:grid;grid-template-columns:26px var(--thumb-sz) 1fr 72px 60px 18px;gap:var(--sp-3);padding:var(--row-pad-y) var(--row-pad-x);align-items:center;border-bottom:1px solid var(--rule);background:transparent;transition:background var(--dur-fast) var(--ease);cursor:pointer}
+.ct-row:hover{background:var(--ct-tea-ghost)}
+.ct-row[data-state=active]{background:rgba(232,180,79,.06)}
+.ct-row[data-state=selected]{background:rgba(221,244,201,.04);box-shadow:inset 2px 0 0 var(--ct-tea)}
+.ct-row__n{font-family:var(--font-mono);font-size:var(--fs-meta);color:var(--fg-muted)}
+.ct-row__thumb{width:var(--thumb-sz);height:var(--thumb-sz);background:repeating-linear-gradient(45deg,var(--ct-coffee-mid) 0 4px,var(--ct-coffee-deep) 4px 8px);position:relative;overflow:hidden}
+.ct-row__main{overflow:hidden;min-width:0}
+.ct-row__title{font-size:var(--fs-body);font-weight:var(--fw-medium);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--fg)}
+.ct-row__show{font-family:var(--font-mono);font-size:var(--fs-caption);color:var(--fg-muted);letter-spacing:.4px;text-transform:uppercase;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ct-row__dur,.ct-row__size{font-family:var(--font-mono);font-size:var(--fs-meta);color:var(--fg-dim);text-align:right}
+.ct-row__size{color:var(--fg-muted)}
+.ct-row__dot{width:6px;height:6px;border-radius:50%;background:var(--fg-muted);justify-self:end}
+.ct-row[data-state=active] .ct-row__dot{background:var(--accent)}
+.ct-row[data-state=selected] .ct-row__dot{background:var(--fg)}
+
+/* Progress */
+.ct-progress{height:2px;background:var(--rule);position:relative;overflow:hidden}
+.ct-progress__fill{height:100%;background:var(--accent);transition:width var(--dur-slow) var(--ease)}
+
+/* Window */
+.ct-window{background:var(--ct-coffee-ink);display:flex;flex-direction:column;box-shadow:0 30px 80px rgba(0,0,0,.5),0 8px 20px rgba(0,0,0,.3);border:1px solid var(--ct-coffee-mid)}
+.ct-window__chrome{height:var(--chrome-h);display:flex;align-items:center;padding:0 12px;background:#0F0807;border-bottom:1px solid var(--rule);user-select:none;flex-shrink:0}
+.ct-window__dots{display:flex;gap:6px}
+.ct-window__dot{width:10px;height:10px;border-radius:50%}
+.ct-window__dot--r{background:#FF5F57}
+.ct-window__dot--y{background:#FEBC2E}
+.ct-window__dot--g{background:#28C840}
+.ct-window__title{flex:1;text-align:center;font-family:var(--font-mono);font-size:var(--fs-caption);color:var(--fg-muted);letter-spacing:.3px}
+.ct-window__body{flex:1;overflow:hidden;background:var(--bg);display:flex;flex-direction:column;min-height:0}
+
+/* Toolbar */
+.ct-toolbar{display:flex;align-items:flex-end;justify-content:space-between;padding:20px var(--sp-5) 14px;border-bottom:1px solid var(--rule);gap:16px}
+.ct-toolbar__actions{display:flex;gap:var(--sp-2);align-items:center}
+
+/* Log */
+.ct-log{font-family:var(--font-mono);font-size:var(--fs-meta);line-height:var(--lh-loose)}
+.ct-log__line--done{color:var(--fg);opacity:.8}
+.ct-log__line--active{color:var(--accent);font-weight:var(--fw-semibold)}
+.ct-log__line--pending{color:var(--fg);opacity:.3}
+.ct-log__line--error{color:var(--destructive);font-weight:var(--fw-semibold)}
+
+/* Keyframes */
+@keyframes ct-blink{0%,50%{opacity:1}51%,100%{opacity:.3}}
+.ct-cursor{animation:ct-blink 1s steps(1) infinite}
+@keyframes ct-fade-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.ct-anim-in{animation:ct-fade-in var(--dur-base) var(--ease) both}
+@keyframes ct-slide-in{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:none}}
+.ct-slide-in{animation:ct-slide-in var(--dur-slow) var(--ease) both}
+@keyframes ct-pulse-amber{0%,100%{opacity:1}50%{opacity:.5}}
+.ct-pulse{animation:ct-pulse-amber 1.6s ease-in-out infinite}
+@keyframes ct-march{from{background-position:0 0}to{background-position:16px 0}}
+.ct-march{background-image:repeating-linear-gradient(90deg,var(--ct-amber-dim) 0 6px,transparent 6px 12px);animation:ct-march 1s linear infinite}
+
+/* Mount pill */
+.ct-mount{display:inline-flex;align-items:center;gap:8px;padding:7px 11px;font-family:var(--font-mono);font-size:var(--fs-caption);letter-spacing:1.2px;text-transform:uppercase;color:var(--fg);border:1px solid var(--rule);cursor:pointer;transition:background var(--dur-fast) var(--ease),border-color var(--dur-fast) var(--ease);user-select:none}
+.ct-mount:hover{background:var(--ct-tea-ghost);border-color:var(--rule-strong)}
+.ct-mount__dot{width:6px;height:6px;border-radius:50%;background:var(--fg-muted)}
+.ct-mount[data-state=mounted] .ct-mount__dot{background:var(--ct-amber);box-shadow:0 0 0 3px rgba(232,180,79,.15)}
+.ct-mount[data-state=busy] .ct-mount__dot{background:var(--ct-amber);animation:ct-pulse-amber 1.2s ease-in-out infinite}
+.ct-mount[data-state=unmounted] .ct-mount__dot{background:var(--fg-muted)}
+.ct-mount[data-state=warning] .ct-mount__dot{background:var(--ct-error)}
+.ct-mount[data-state=warning]{color:var(--ct-error);border-color:var(--ct-error-dim)}
+
+/* Modal overlay */
+.ct-overlay{position:absolute;inset:0;background:rgba(12,6,5,.72);backdrop-filter:blur(2px);display:flex;align-items:center;justify-content:center;z-index:100;animation:ct-fade-in var(--dur-base) var(--ease) both}
+.ct-dialog{background:var(--ct-coffee);border:1px solid var(--rule-strong);min-width:420px;max-width:520px;box-shadow:0 30px 60px rgba(0,0,0,.5)}
+.ct-dialog__head{padding:16px 20px;border-bottom:1px solid var(--rule);display:flex;align-items:center;justify-content:space-between}
+.ct-dialog__body{padding:18px 20px}
+.ct-dialog__actions{padding:14px 20px;border-top:1px solid var(--rule);display:flex;gap:8px;justify-content:flex-end;background:var(--ct-coffee-deep)}
+
+/* Tweaks panel */
+.ct-tweaks{position:absolute;right:18px;bottom:18px;width:280px;background:var(--ct-coffee-deep);border:1px solid var(--rule-strong);z-index:200;font-family:var(--font-sans);box-shadow:0 16px 40px rgba(0,0,0,.5)}
+.ct-tweaks__head{padding:12px 14px;border-bottom:1px solid var(--rule);display:flex;align-items:center;justify-content:space-between}
+.ct-tweaks__body{padding:12px 14px;display:flex;flex-direction:column;gap:14px}
+.ct-tweaks__group{display:flex;flex-direction:column;gap:6px}
+.ct-tweaks__opts{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.ct-tweaks__opt{padding:6px 8px;border:1px solid var(--rule);background:transparent;color:var(--fg-dim);cursor:pointer;font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:1px;text-align:left;transition:all var(--dur-fast) var(--ease)}
+.ct-tweaks__opt:hover{border-color:var(--rule-strong);color:var(--fg)}
+.ct-tweaks__opt[data-active=true]{border-color:var(--ct-amber);color:var(--ct-amber);background:var(--ct-amber-dim)}
+
+/* Cover art */
+.cover-art{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-weight:600;color:var(--ct-coffee-ink);font-size:10px;letter-spacing:.5px;text-transform:uppercase;text-align:center;padding:2px;line-height:1;overflow:hidden}
+
+/* Order pill on Up Next selected rows */
+.ct-row__order{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:20px;padding:0 6px;background:var(--ct-tea);color:var(--ct-coffee-ink);font-family:var(--font-mono);font-size:11px;font-weight:600;letter-spacing:.5px;margin-left:8px;vertical-align:middle;line-height:1}
+
+/* Drag state on today rows */
+.today-row{cursor:default;position:relative}
+.today-row[data-dragging=true]{opacity:.35}
+.today-row[data-drop-above=true]{box-shadow:inset 0 2px 0 var(--ct-amber)}
+.today-row[data-drop-below=true]{box-shadow:inset 0 -2px 0 var(--ct-amber)}
+.today-row__drag{cursor:grab;display:inline-flex;align-items:center}
+.today-row__drag:active{cursor:grabbing}
+
+/* Today rows */
+.today-row{display:grid;grid-template-columns:40px 36px 1fr 110px 80px 70px 36px;gap:12px;padding:10px 16px;align-items:center;border-bottom:1px solid var(--rule);transition:background var(--dur-fast) var(--ease)}
+.today-row:hover{background:var(--ct-tea-ghost)}
+.today-row[data-fate=rename]{background:rgba(232,180,79,.04)}
+.today-row[data-fate=remove]{opacity:.45}
+.today-row[data-fate=remove] .today-row__title{text-decoration:line-through;text-decoration-color:var(--destructive)}
+
+/* Filename display */
+.fname{font-family:var(--font-mono);font-size:11px;color:var(--fg-muted);letter-spacing:.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fname em{font-style:normal;color:var(--ct-amber)}
+.fname s{color:var(--ct-error);text-decoration-color:var(--ct-error)}
+
+/* Stage stepper */
+.stage{display:grid;grid-template-columns:22px 1fr auto;gap:14px;padding:10px 20px;align-items:center;border-bottom:1px solid var(--rule);transition:background var(--dur-fast) var(--ease)}
+.stage[data-state=active]{background:rgba(232,180,79,.05)}
+.stage__bullet{width:14px;height:14px;border:1px solid var(--rule-strong);display:flex;align-items:center;justify-content:center;color:var(--fg-muted);font-family:var(--font-mono);font-size:9px;position:relative}
+.stage[data-state=done] .stage__bullet{background:var(--ct-tea);border-color:var(--ct-tea);color:var(--ct-coffee-ink)}
+.stage[data-state=active] .stage__bullet{border-color:var(--ct-amber);color:var(--ct-amber);animation:ct-pulse-amber 1.4s ease-in-out infinite}
+.stage[data-state=pending] .stage__bullet{color:var(--fg-muted)}
+.stage__label{font-family:var(--font-mono);font-size:12px;letter-spacing:1px;text-transform:uppercase;color:var(--fg-muted);display:flex;align-items:center;gap:12px}
+.stage[data-state=done] .stage__label{color:var(--fg);opacity:.8}
+.stage[data-state=active] .stage__label{color:var(--fg);font-weight:600}
+.stage__detail{color:var(--fg-muted);text-transform:none;letter-spacing:.3px;font-size:11px;font-weight:400}
+.stage[data-state=active] .stage__detail{color:var(--ct-amber);opacity:.85}
+.stage__right{font-family:var(--font-mono);font-size:11px;color:var(--fg-dim)}
+
+/* Success stats grid */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--rule)}
+.stats__cell{padding:18px 20px;border-right:1px solid var(--rule)}
+.stats__cell:last-child{border-right:none}
+.stats__label{font-family:var(--font-mono);font-size:10px;color:var(--fg-muted);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px}
+.stats__value{font-family:var(--font-sans);font-size:28px;font-weight:600;letter-spacing:-.8px;color:var(--fg);line-height:1}
+.stats__sub{font-family:var(--font-mono);font-size:10px;color:var(--fg-muted);margin-top:6px;letter-spacing:.5px}
+
+</style>
+</head>
+<body class="openswim">
+<div id="root"></div>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script>
+/* Curated sample data for the prototype */
+window.APP_DATA = (() => {
+  const rows = [
+    { title: "The fight over what counts as intelligence", show: "HARD FORK",           dur: "1:12:04", durMin: 72, size: "41.2M", sizeMB: 41.2, kind: "AUDIO" },
+    { title: "The last lighthouse keeper",                 show: "99% INVISIBLE",       dur: "44:18",   durMin: 44, size: "18.9M", sizeMB: 18.9, kind: "AUDIO" },
+    { title: "AI agents, copyright panic, and a hat",      show: "HARD FORK",           dur: "1:03:47", durMin: 64, size: "38.1M", sizeMB: 38.1, kind: "VIDEO" },
+    { title: "Why copper is the new oil",                  show: "ODD LOTS · BLOOMBERG", dur: "52:10",   durMin: 52, size: "22.4M", sizeMB: 22.4, kind: "AUDIO" },
+    { title: "The man who remade time",                    show: "RADIOLAB",            dur: "38:02",   durMin: 38, size: "16.0M", sizeMB: 16.0, kind: "AUDIO" },
+    { title: "Inside a 300-year-old bank",                 show: "PLANET MONEY",        dur: "29:45",   durMin: 30, size: "12.7M", sizeMB: 12.7, kind: "AUDIO" },
+    { title: "What a bee sees",                            show: "RADIOLAB",            dur: "35:18",   durMin: 35, size: "14.8M", sizeMB: 14.8, kind: "AUDIO" },
+    { title: "The accidental cartographer",                show: "SEARCH ENGINE",       dur: "1:08:33", durMin: 68, size: "39.4M", sizeMB: 39.4, kind: "AUDIO" },
+    { title: "A brief history of the open plan office",    show: "99% INVISIBLE",       dur: "41:02",   durMin: 41, size: "17.3M", sizeMB: 17.3, kind: "AUDIO" },
+    { title: "The quiet comeback of the sailboat",         show: "THE DAILY · NY TIMES", dur: "28:40",   durMin: 29, size: "12.0M", sizeMB: 12.0, kind: "AUDIO" },
+    { title: "When cities run out of water",               show: "THE EZRA KLEIN SHOW", dur: "1:24:12", durMin: 84, size: "48.8M", sizeMB: 48.8, kind: "AUDIO" },
+    { title: "The economics of attention",                 show: "ACQUIRED",            dur: "2:48:09", durMin: 168,size: "97.6M", sizeMB: 97.6, kind: "VIDEO" },
+    { title: "Who owns the sound of an airport?",          show: "99% INVISIBLE",       dur: "36:22",   durMin: 36, size: "15.3M", sizeMB: 15.3, kind: "AUDIO" },
+    { title: "The librarian who saved a country",          show: "THE REST IS HISTORY", dur: "58:40",   durMin: 59, size: "25.2M", sizeMB: 25.2, kind: "AUDIO" },
+    { title: "Forty seconds on the moon",                  show: "RADIOLAB",            dur: "42:09",   durMin: 42, size: "17.8M", sizeMB: 17.8, kind: "AUDIO" },
+    { title: "The map of the world's undersea cables",     show: "DARKNET DIARIES",     dur: "1:02:11", durMin: 62, size: "36.0M", sizeMB: 36.0, kind: "AUDIO" },
+    { title: "Why the 2000s sound so strange now",         show: "SEARCH ENGINE",       dur: "48:03",   durMin: 48, size: "20.3M", sizeMB: 20.3, kind: "AUDIO" },
+    { title: "How a typeface built an airline",            show: "99% INVISIBLE",       dur: "32:50",   durMin: 33, size: "13.9M", sizeMB: 13.9, kind: "AUDIO" },
+    { title: "Inside the last radio station",              show: "REPLY ALL",           dur: "51:19",   durMin: 51, size: "21.7M", sizeMB: 21.7, kind: "AUDIO" },
+    { title: "The physicist who listens to earthquakes",   show: "RADIOLAB",            dur: "44:55",   durMin: 45, size: "19.0M", sizeMB: 19.0, kind: "AUDIO" },
+    { title: "A year in the life of a single tomato",      show: "THE DAILY · NY TIMES", dur: "27:10",   durMin: 27, size: "11.4M", sizeMB: 11.4, kind: "AUDIO" },
+    { title: "The case for boring software",               show: "DITHERING",           dur: "15:22",   durMin: 15, size: "6.5M",  sizeMB: 6.5,  kind: "AUDIO" },
+    { title: "Why film grain won't die",                   show: "THE VERGECAST",       dur: "1:19:08", durMin: 79, size: "45.9M", sizeMB: 45.9, kind: "VIDEO" },
+    { title: "The secret life of hotel carpets",           show: "99% INVISIBLE",       dur: "39:44",   durMin: 40, size: "16.8M", sizeMB: 16.8, kind: "AUDIO" },
+    { title: "Agents, ghosts, and the attention economy",  show: "HARD FORK",           dur: "57:12",   durMin: 57, size: "33.2M", sizeMB: 33.2, kind: "VIDEO" },
+    { title: "The man who counts coastlines",              show: "RADIOLAB",            dur: "36:40",   durMin: 37, size: "15.5M", sizeMB: 15.5, kind: "AUDIO" },
+    { title: "The cult of carbon fiber",                   show: "SEARCH ENGINE",       dur: "43:01",   durMin: 43, size: "18.2M", sizeMB: 18.2, kind: "AUDIO" },
+    { title: "Are we running out of rivers?",              show: "THE EZRA KLEIN SHOW", dur: "1:10:55", durMin: 71, size: "41.1M", sizeMB: 41.1, kind: "AUDIO" },
+  ];
+  const upNext = rows.map((r, i) => ({ id: i + 1, ...r }));
+
+  // Previously on device — used for "will overwrite" fate on Today
+  const onDevice = [
+    { id: 900, title: "The accidental cartographer (yesterday)", show: "SEARCH ENGINE", size: "39.4M", sizeMB: 39.4, fname: "01_search.mp3" },
+    { id: 901, title: "Forty seconds on the moon (yesterday)",   show: "RADIOLAB",      size: "17.8M", sizeMB: 17.8, fname: "02_radiolab.mp3" },
+  ];
+
+  return { upNext, onDevice, deviceCapacityMB: 6200 };
+})();
+
+</script>
+<script type="text/babel" data-presets="react">
+/* global React */
+/* Atoms: Btn, Kbd, Tag, Toggle, Progress, CoverArt, MountPill */
+
+const { useState: useStateAtom } = React;
+
+function Btn({ variant = "primary", size, children, ...rest }) {
+  const cls = ["ct-btn", `ct-btn--${variant}`, size && `ct-btn--${size}`].filter(Boolean).join(" ");
+  return <button className={cls} {...rest}>{children}</button>;
+}
+function Kbd({ children }) { return <span className="ct-kbd">{children}</span>; }
+function Tag({ variant, children }) {
+  const cls = ["ct-tag", variant && `ct-tag--${variant}`].filter(Boolean).join(" ");
+  return <span className={cls}>{children}</span>;
+}
+function Toggle({ on, onChange, label, dim }) {
+  return (
+    <div className="ct-toggle" role="switch" aria-checked={on} tabIndex={0}
+      onClick={() => onChange(!on)}
+      onKeyDown={(e) => (e.key === " " || e.key === "Enter") && onChange(!on)}>
+      <div className="ct-toggle__track"><div className="ct-toggle__thumb"></div></div>
+      <span style={{ color: dim ? "var(--fg-dim)" : "var(--fg)", fontSize: 13 }}>{label}</span>
+    </div>
+  );
+}
+function Progress({ value }) {
+  return <div className="ct-progress"><div className="ct-progress__fill" style={{ width: `${value}%` }}></div></div>;
+}
+
+// Procedural cover art — deterministic per-show, flat coffee/tea/amber palette.
+const COVER_COLORS = [
+  "#E8B44F", "#DDF4C9", "#C96F4A", "#5D3F39", "#4E342E",
+  "#DDF4C9", "#E8B44F", "#C96F4A"
+];
+function hashStr(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return Math.abs(h); }
+function CoverArt({ show, size = 28 }) {
+  const h = hashStr(show || "x");
+  const pattern = h % 6;
+  const bg = COVER_COLORS[h % COVER_COLORS.length];
+  const fg = COVER_COLORS[(h + 3) % COVER_COLORS.length];
+  const letters = (show || "??").replace(/[^A-Za-z]/g, "").slice(0, 2).toUpperCase() || "··";
+  const stripe = (
+    <div style={{
+      position: "absolute", inset: 0,
+      backgroundImage: pattern === 0
+        ? `repeating-linear-gradient(45deg, ${bg} 0 3px, ${fg} 3px 4px)`
+        : pattern === 1
+        ? `repeating-linear-gradient(0deg, ${bg} 0 4px, ${fg} 4px 5px)`
+        : pattern === 2
+        ? `radial-gradient(circle at 30% 30%, ${fg} 0 30%, ${bg} 32%)`
+        : pattern === 3
+        ? `linear-gradient(135deg, ${bg} 50%, ${fg} 50%)`
+        : pattern === 4
+        ? `linear-gradient(${bg}, ${bg})`
+        : `repeating-linear-gradient(90deg, ${bg} 0 6px, ${fg} 6px 7px)`
+    }} />
+  );
+  const showLetters = size >= 28 && pattern !== 2 && pattern !== 3;
+  return (
+    <div style={{ width: size, height: size, position: "relative", flexShrink: 0, overflow: "hidden" }}>
+      {stripe}
+      {showLetters && <div className="cover-art" style={{ position: "absolute", inset: 0,
+        color: bg === "#DDF4C9" || bg === "#E8B44F" ? "var(--ct-coffee-ink)" : "var(--ct-tea)",
+        fontSize: Math.max(8, size * 0.32) }}>{letters}</div>}
+    </div>
+  );
+}
+
+function MountPill({ state = "mounted", label, free, onClick }) {
+  const labels = {
+    mounted: ["OpenSwim Pro", `${free || "6.2GB"} free`],
+    busy: ["OpenSwim Pro", "syncing…"],
+    unmounted: ["No device", "plug in to sync"],
+    warning: ["OpenSwim Pro", label || "low space"],
+  };
+  const [main, sub] = labels[state] || labels.mounted;
+  return (
+    <div className="ct-mount" data-state={state} onClick={onClick} role="button" tabIndex={0}>
+      <div className="ct-mount__dot"></div>
+      <div>
+        <div style={{ color: state === "unmounted" ? "var(--fg-muted)" : state === "warning" ? "var(--ct-error)" : "var(--fg)" }}>{main}</div>
+        <div style={{ color: "var(--fg-muted)", marginTop: 2, letterSpacing: ".8px", textTransform: "none" }}>{sub}</div>
+      </div>
+    </div>
+  );
+}
+
+function DragHandle() {
+  return (
+    <svg width="12" height="14" viewBox="0 0 12 14" fill="currentColor" style={{ opacity: .45, cursor: "grab" }}>
+      <circle cx="3.5" cy="3" r=".9"/><circle cx="3.5" cy="7" r=".9"/><circle cx="3.5" cy="11" r=".9"/>
+      <circle cx="8.5" cy="3" r=".9"/><circle cx="8.5" cy="7" r=".9"/><circle cx="8.5" cy="11" r=".9"/>
+    </svg>
+  );
+}
+
+Object.assign(window, { Btn, Kbd, Tag, Toggle, Progress, CoverArt, MountPill, DragHandle });
+
+</script>
+<script type="text/babel" data-presets="react">
+/* global React, CoverArt, MountPill */
+
+function Window({ title, children, badge }) {
+  return (
+    <div className="ct-window" style={{ width: "100%", height: "100%" }}>
+      <div className="ct-window__chrome">
+        <div className="ct-window__dots">
+          <div className="ct-window__dot ct-window__dot--r"></div>
+          <div className="ct-window__dot ct-window__dot--y"></div>
+          <div className="ct-window__dot ct-window__dot--g"></div>
+        </div>
+        <div className="ct-window__title">{title}</div>
+        <div style={{ width: 54 }}>{badge}</div>
+      </div>
+      <div className="ct-window__body">{children}</div>
+    </div>
+  );
+}
+
+function Wordmark() {
+  return (
+    <div style={{ display: "flex", alignItems: "baseline", fontFamily: "var(--font-sans)",
+      fontWeight: 600, fontSize: 15, letterSpacing: "-0.3px", color: "var(--fg)", lineHeight: 1 }}>
+      <span>OpenSwim</span>
+      <span style={{ color: "var(--ct-amber)", margin: "0 4px", fontSize: 12 }}>·</span>
+      <span style={{ color: "var(--fg-dim)", fontWeight: 400 }}>Podcast</span>
+    </div>
+  );
+}
+
+function Sidebar({ route, setRoute, todayCount, mountState, setShowMountDialog }) {
+  const items = [
+    { id: "up-next", label: "Up Next", meta: "POCKET CASTS" },
+    { id: "today", label: "Today", meta: todayCount ? `${todayCount} QUEUED` : "QUEUE" },
+    { id: "syncing", label: "Sync", meta: "DEVICE" },
+  ];
+  return (
+    <aside style={{ width: 196, borderRight: "1px solid var(--rule)", padding: "18px 0 0",
+      flexShrink: 0, position: "relative", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "0 18px 16px", borderBottom: "1px solid var(--rule)" }}>
+        <Wordmark />
+        <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 10,
+          color: "var(--fg-muted)", letterSpacing: "1.5px" }}>v1.2.0 · WORKBENCH</div>
+      </div>
+      <nav style={{ paddingTop: 10, flex: 1 }}>
+        {items.map((it) => {
+          const active = route === it.id;
+          return (
+            <div key={it.id} onClick={() => setRoute(it.id)}
+              style={{
+                padding: "11px 18px", cursor: "pointer",
+                background: active ? "var(--ct-tea-ghost)" : "transparent",
+                borderLeft: active ? "2px solid var(--ct-tea)" : "2px solid transparent",
+                paddingLeft: active ? 16 : 18,
+                transition: "background .1s var(--ease)",
+              }}>
+              <div style={{ fontSize: 15, fontWeight: 500,
+                color: active ? "var(--fg)" : "var(--fg-dim)" }}>{it.label}</div>
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 10,
+                color: "var(--fg-muted)", letterSpacing: "1.2px", marginTop: 3 }}>{it.meta}</div>
+            </div>
+          );
+        })}
+      </nav>
+      <div style={{ padding: "14px 14px 16px", borderTop: "1px solid var(--rule)" }}>
+        <MountPill state={mountState} onClick={() => setShowMountDialog && setShowMountDialog(true)} />
+      </div>
+    </aside>
+  );
+}
+
+function Toolbar({ label, title, actions, subtitle }) {
+  return (
+    <div className="ct-toolbar">
+      <div style={{ minWidth: 0 }}>
+        <div className="ct-label">{label}</div>
+        <div className="ct-subhead" style={{ marginTop: 4, color: "var(--fg)" }}>{title}</div>
+        {subtitle && <div className="ct-meta" style={{ marginTop: 6 }}>{subtitle}</div>}
+      </div>
+      <div className="ct-toolbar__actions">{actions}</div>
+    </div>
+  );
+}
+
+Object.assign(window, { Window, Wordmark, Sidebar, Toolbar });
+
+</script>
+<script type="text/babel" data-presets="react">
+/* global React, Btn, Kbd, Tag, Toggle, Progress, CoverArt, DragHandle, Toolbar */
+const { useState: useS1, useMemo: useM1 } = React;
+
+function LoginScreen({ onConnect }) {
+  const [cookie, setCookie] = useS1("");
+  const [step, setStep] = useS1(0); // 0 = input, 1 = connecting, 2 = done
+  const start = () => {
+    setStep(1);
+    setTimeout(() => { setStep(2); setTimeout(onConnect, 450); }, 1100);
+  };
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center",
+      justifyContent: "center", padding: 40, position: "relative" }}>
+      <div style={{ width: 68, height: 68, border: "1px solid var(--rule-strong)",
+        display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 28,
+        fontFamily: "var(--font-mono)", fontSize: 22, color: "var(--ct-amber)",
+        fontWeight: 600, letterSpacing: "1px", position: "relative" }}>
+        OS
+        <span style={{ position: "absolute", top: 6, right: 6, width: 5, height: 5,
+          borderRadius: "50%", background: "var(--ct-amber)",
+          boxShadow: "0 0 0 3px rgba(232,180,79,.15)" }}></span>
+      </div>
+      <div className="ct-hero" style={{ textAlign: "center" }}>Morning swim.</div>
+      <div className="ct-hero" style={{ textAlign: "center", opacity: .55, fontWeight: 300 }}>Seven episodes.</div>
+
+      <div style={{ width: 440, marginTop: 38 }}>
+        <div className="ct-meta" style={{ color: "var(--fg-muted)", letterSpacing: "1.5px",
+          textTransform: "uppercase", marginBottom: 10 }}>Connect Pocket Casts</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <input className="ct-input" placeholder="pocketcasts session cookie…" value={cookie}
+            onChange={(e) => setCookie(e.target.value)} disabled={step > 0}
+            style={{ fontFamily: "var(--font-mono)", fontSize: 12 }} />
+          <div style={{ display: "flex", gap: 8, justifyContent: "space-between", alignItems: "center" }}>
+            <div className="ct-meta" style={{ color: "var(--fg-muted)" }}>
+              stored in keychain · not shown again
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Btn variant="ghost" disabled={step > 0}>cancel</Btn>
+              <Btn variant="primary" onClick={start} disabled={step > 0}>
+                {step === 0 ? "Connect" : step === 1 ? "Connecting…" : "✓ Connected"}
+              </Btn>
+            </div>
+          </div>
+        </div>
+        {step >= 1 && (
+          <div style={{ marginTop: 20, paddingTop: 16, borderTop: "1px solid var(--rule)" }}>
+            <div className="ct-log">
+              <div className={step >= 1 ? "ct-log__line--done" : "ct-log__line--pending"}>✓ keychain unlocked</div>
+              <div className={step >= 1 ? "ct-log__line--done" : "ct-log__line--pending"}>✓ api.pocketcasts.com · 200</div>
+              <div className={step >= 2 ? "ct-log__line--done" : "ct-log__line--active"}>
+                {step >= 2 ? "✓ 28 episodes · up next fetched" : "▸ fetching up next…"}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function UpNextScreen({ items, selected, setSelected, goToday, onDeviceIds, mountState, order }) {
+  const [q, setQ] = useS1("");
+  const [filter, setFilter] = useS1("all");
+  const filtered = useM1(() => items.filter((it) => {
+    if (filter === "audio" && it.kind !== "AUDIO") return false;
+    if (filter === "video" && it.kind !== "VIDEO") return false;
+    if (!q) return true;
+    return (it.title + " " + it.show).toLowerCase().includes(q.toLowerCase());
+  }), [items, q, filter]);
+
+  const toggle = (id) => setSelected((s) => s.includes(id) ? s.filter((x) => x !== id) : [...s, id]);
+  const totalSelMin = selected.reduce((s, id) => {
+    const it = items.find((x) => x.id === id); return s + (it ? it.durMin : 0);
+  }, 0);
+  const totalSelMB = selected.reduce((s, id) => {
+    const it = items.find((x) => x.id === id); return s + (it ? it.sizeMB : 0);
+  }, 0);
+  const totalHM = `${Math.floor(totalSelMin / 60)}h ${Math.floor(totalSelMin % 60)}m`;
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}
+      data-screen-label="02 Up Next">
+      <Toolbar
+        label={`Up Next · ${items.length} episodes`}
+        title={selected.length ? `${selected.length} selected · ${totalHM} · ${totalSelMB.toFixed(1)}MB` : "Pick what you want on the headset today."}
+        actions={<>
+          <Btn variant="secondary" onClick={() => setSelected([])} disabled={!selected.length}>Clear</Btn>
+          <Btn variant="primary" onClick={goToday} disabled={!selected.length}>
+            Review today →
+          </Btn>
+        </>}
+      />
+      <div style={{ display: "flex", gap: 12, padding: "10px 20px",
+        borderBottom: "1px solid var(--rule)", alignItems: "center" }}>
+        <div className="ct-input-group" style={{ flex: 1, maxWidth: 360 }}>
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+            strokeWidth="1.4" style={{ color: "var(--fg-muted)" }}>
+            <circle cx="7" cy="7" r="4.5"/><path d="M 10.5 10.5 L 14 14"/>
+          </svg>
+          <input placeholder="search up next" value={q} onChange={(e) => setQ(e.target.value)} />
+          <Kbd>⌘K</Kbd>
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          {["all", "audio", "video"].map((f) => (
+            <button key={f} onClick={() => setFilter(f)} className="ct-btn ct-btn--xs"
+              style={{
+                background: filter === f ? "var(--ct-tea-ghost)" : "transparent",
+                color: filter === f ? "var(--fg)" : "var(--fg-muted)",
+                border: filter === f ? "1px solid var(--rule-strong)" : "1px solid var(--rule)",
+              }}>{f}</button>
+          ))}
+        </div>
+        <div style={{ flex: 1 }}></div>
+        <div className="ct-meta">{filtered.length} shown</div>
+      </div>
+      <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
+        {filtered.map((it, idx) => {
+          const isSelected = selected.includes(it.id);
+          const onDevice = onDeviceIds && onDeviceIds.includes(it.id);
+          const orderPos = order ? order.indexOf(it.id) : -1;
+          return (
+            <div key={it.id} className="ct-row"
+              data-state={isSelected ? "selected" : undefined}
+              onClick={() => toggle(it.id)}>
+              <div className="ct-row__n">
+                {isSelected && orderPos >= 0
+                  ? <span className="ct-row__order" style={{ marginLeft: 0 }}>{String(orderPos + 1).padStart(2, "0")}</span>
+                  : String(idx + 1).padStart(2, "0")}
+              </div>
+              <CoverArt show={it.show} size={28} />
+              <div className="ct-row__main">
+                <div className="ct-row__title">
+                  {it.title}
+                  {it.kind === "VIDEO" && (
+                    <span style={{ marginLeft: 8, fontFamily: "var(--font-mono)", fontSize: 10,
+                      color: "var(--fg-muted)", letterSpacing: ".5px", padding: "1px 4px",
+                      border: "1px solid var(--rule)" }}>VIDEO</span>
+                  )}
+                  {onDevice && (
+                    <span style={{ marginLeft: 8, fontFamily: "var(--font-mono)", fontSize: 10,
+                      color: "var(--fg-dim)", letterSpacing: ".5px" }}>· on device</span>
+                  )}
+                </div>
+                <div className="ct-row__show">{it.show}</div>
+              </div>
+              <div className="ct-row__dur">{it.dur}</div>
+              <div className="ct-row__size">{it.size}</div>
+              <div className="ct-row__dot"></div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+Object.assign(window, { LoginScreen, UpNextScreen });
+
+</script>
+<script type="text/babel" data-presets="react">
+/* global React, Btn, Toggle, CoverArt, DragHandle, Toolbar */
+const { useState: useS2, useMemo: useM2 } = React;
+
+// Pretty filename from show + slot
+function slugShow(show) {
+  const toks = show.toLowerCase().split(/[·\s]+/).map((t) => t.replace(/[^a-z]/g, "")).filter(Boolean);
+  return (toks[0] || "show").slice(0, 8);
+}
+function fnameFor(show, slot, ext = "mp3") {
+  return `${String(slot).padStart(2, "0")}_${slugShow(show)}.${ext}`;
+}
+
+function TodayScreen({ items, onDevice, selected, setSelected, order, setOrder,
+  goSync, goUpNext, deviceCapacityMB, rowFateVariant, audioFromVideo, setAudioFromVideo }) {
+
+  const queue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
+  const totalMin = queue.reduce((s, x) => s + x.durMin, 0);
+  const totalMB = queue.reduce((s, x) => s + x.sizeMB, 0);
+  const totalHM = `${Math.floor(totalMin / 60)}h ${Math.floor(totalMin % 60)}m`;
+  const used = onDevice.reduce((s, x) => s + x.sizeMB, 0);
+  const free = deviceCapacityMB - used;
+  const overCap = totalMB > free;
+
+  const [dragId, setDragId] = useS2(null);
+  const [dropTarget, setDropTarget] = useS2(null); // {id, pos}
+
+  // Fate computation: previous files on device that aren't in the new queue = REMOVED
+  // Queue items become either RENAME (renumbered) or NEW
+  const newSlots = queue.map((it, i) => ({
+    it, slot: i + 1,
+    prev: onDevice.find((d) => d.show === it.show),
+  }));
+  const removed = onDevice.filter((d) => !queue.some((q) => q.show === d.show));
+
+  const move = (id, dir) => {
+    setOrder((o) => {
+      const i = o.indexOf(id); const j = i + dir;
+      if (j < 0 || j >= o.length) return o;
+      const n = o.slice(); [n[i], n[j]] = [n[j], n[i]]; return n;
+    });
+  };
+  const remove = (id) => {
+    setSelected((s) => s.filter((x) => x !== id));
+    setOrder((o) => o.filter((x) => x !== id));
+  };
+
+  const handleDragStart = (id) => (e) => {
+    setDragId(id);
+    e.dataTransfer.effectAllowed = "move";
+    try { e.dataTransfer.setData("text/plain", String(id)); } catch (_) {}
+  };
+  const handleDragOver = (id) => (e) => {
+    e.preventDefault();
+    if (dragId == null || dragId === id) { setDropTarget(null); return; }
+    const rect = e.currentTarget.getBoundingClientRect();
+    const pos = (e.clientY - rect.top) < rect.height / 2 ? "above" : "below";
+    setDropTarget({ id, pos });
+  };
+  const handleDrop = (id) => (e) => {
+    e.preventDefault();
+    if (dragId == null || dragId === id) { setDragId(null); setDropTarget(null); return; }
+    setOrder((o) => {
+      const from = o.indexOf(dragId);
+      let to = o.indexOf(id);
+      if (from < 0 || to < 0) return o;
+      const n = o.slice();
+      const [m] = n.splice(from, 1);
+      const rect = e.currentTarget.getBoundingClientRect();
+      const pos = (e.clientY - rect.top) < rect.height / 2 ? "above" : "below";
+      to = n.indexOf(id);
+      n.splice(pos === "below" ? to + 1 : to, 0, m);
+      return n;
+    });
+    setDragId(null); setDropTarget(null);
+  };
+  const handleDragEnd = () => { setDragId(null); setDropTarget(null); };
+
+  if (!queue.length) {
+    return (
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center",
+        justifyContent: "center", gap: 16 }} data-screen-label="03 Today (empty)">
+        <div className="ct-label">nothing queued</div>
+        <div className="ct-subhead" style={{ color: "var(--fg-dim)" }}>Your headset is empty.</div>
+        <div style={{ marginTop: 8 }}><Btn variant="cta" onClick={goUpNext}>Pull from up next</Btn></div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}
+      data-screen-label="03 Today">
+      <Toolbar
+        label={`Today · ${queue.length} episodes`}
+        title="Ready for your swim."
+        subtitle={`${totalHM} · ${totalMB.toFixed(1)}MB · will write ${queue.length} file${queue.length>1?"s":""}, remove ${removed.length}`}
+        actions={<>
+          <Btn variant="secondary" onClick={goUpNext}>+ add more</Btn>
+          <Btn variant="cta" onClick={goSync} disabled={overCap}>
+            {overCap ? "OVER CAPACITY" : `SYNC ${queue.length} EP`}
+          </Btn>
+        </>}
+      />
+      <div style={{ padding: "12px 20px", borderBottom: "1px solid var(--rule)",
+        display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" }}>
+        <div className="ct-meta">
+          <span style={{ color: overCap ? "var(--ct-error)" : "var(--fg)" }}>{totalMB.toFixed(1)}MB</span>
+          <span> / {(free).toFixed(0)}MB free · ≈ {Math.round(totalMB / 1.8)}s at 1.8MB/s</span>
+        </div>
+        <div style={{ flex: 1, minWidth: 120, maxWidth: 240, height: 4,
+          background: "var(--rule)", position: "relative", overflow: "hidden" }}>
+          <div style={{
+            position: "absolute", left: 0, top: 0, bottom: 0,
+            width: `${Math.min(100, (totalMB / free) * 100)}%`,
+            background: overCap ? "var(--ct-error)" : "var(--ct-amber)",
+            transition: "width .28s var(--ease)" }} />
+        </div>
+        <div style={{ flex: 1 }}></div>
+        <div className="ct-meta" style={{ color: "var(--fg-muted)" }}>drag to reorder · video converts to MP3</div>
+      </div>
+
+      <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
+        <div style={{ padding: "12px 20px 6px", display: "flex", gap: 20,
+          borderBottom: "1px solid var(--rule)" }}>
+          <div className="ct-label" style={{ flex: 1 }}>Will write {queue.length} · device renames</div>
+        </div>
+
+        {newSlots.map(({ it, slot, prev }, idx) => {
+          const fname = fnameFor(it.show, slot, it.kind === "VIDEO" && audioFromVideo ? "mp3" : it.kind === "VIDEO" ? "mp4" : "mp3");
+          const isRename = prev && prev.fname && prev.fname !== fname;
+          const fate = isRename ? "rename" : "new";
+          return (
+            <div key={it.id} className="today-row" data-fate={fate}
+              draggable
+              data-dragging={dragId === it.id ? "true" : undefined}
+              data-drop-above={dropTarget && dropTarget.id === it.id && dropTarget.pos === "above" ? "true" : undefined}
+              data-drop-below={dropTarget && dropTarget.id === it.id && dropTarget.pos === "below" ? "true" : undefined}
+              onDragStart={handleDragStart(it.id)}
+              onDragOver={handleDragOver(it.id)}
+              onDrop={handleDrop(it.id)}
+              onDragEnd={handleDragEnd}
+              style={{ cursor: "grab" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--fg-muted)" }} className="today-row__drag">
+                <DragHandle />
+                <span style={{ fontFamily: "var(--font-mono)", fontSize: 11 }}>{String(slot).padStart(2, "0")}</span>
+              </div>
+              <CoverArt show={it.show} size={32} />
+              <div style={{ minWidth: 0 }}>
+                <div className="ct-row__title today-row__title">{it.title}
+                  {it.kind === "VIDEO" && (
+                    <span style={{ marginLeft: 8, fontFamily: "var(--font-mono)", fontSize: 10,
+                      color: "var(--fg-muted)", letterSpacing: ".5px", padding: "1px 4px",
+                      border: "1px solid var(--rule)" }}>
+                      {audioFromVideo ? "VIDEO→A" : "VIDEO"}
+                    </span>
+                  )}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 3 }}>
+                  <div className="ct-row__show">{it.show}</div>
+                  {rowFateVariant === "arrow" && prev && isRename && (
+                    <div className="fname"><s>{prev.fname}</s> <em>→ {fname}</em></div>
+                  )}
+                  {rowFateVariant === "arrow" && !prev && (
+                    <div className="fname"><em>+ {fname}</em></div>
+                  )}
+                  {rowFateVariant === "tag" && (
+                    <>
+                      {isRename && <span className="ct-tag ct-tag--active">RENAME</span>}
+                      {!prev && <span className="ct-tag ct-tag--on-device">NEW</span>}
+                      <div className="fname">{fname}</div>
+                    </>
+                  )}
+                  {rowFateVariant === "stripe" && (
+                    <div className="fname">{fname} {prev && isRename && <span style={{ color: "var(--ct-amber)" }}>· was {prev.fname}</span>}</div>
+                  )}
+                </div>
+              </div>
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 11,
+                color: "var(--fg-dim)", textAlign: "right" }}>{it.dur}</div>
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 11,
+                color: "var(--fg-muted)", textAlign: "right" }}>{it.size}</div>
+              <div style={{ display: "flex", gap: 2, justifyContent: "flex-end" }}>
+                <button className="ct-btn ct-btn--ghost ct-btn--sm" onClick={() => remove(it.id)}
+                  style={{ color: "var(--destructive)" }} title="remove">✕</button>
+              </div>
+              {rowFateVariant === "stripe" && (
+                <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: 3,
+                  background: isRename ? "var(--ct-amber)" : "var(--ct-tea)" }}></div>
+              )}
+            </div>
+          );
+        })}
+
+        {removed.length > 0 && (
+          <>
+            <div style={{ padding: "18px 20px 6px" }}>
+              <div className="ct-label" style={{ color: "var(--ct-error)" }}>Will remove {removed.length} · freeing {removed.reduce((s, x) => s + x.sizeMB, 0).toFixed(1)}MB</div>
+            </div>
+            {removed.map((d) => (
+              <div key={d.id} className="today-row" data-fate="remove" style={{ cursor: "default" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6,
+                  color: "var(--ct-error)", fontFamily: "var(--font-mono)", fontSize: 11 }}>✕</div>
+                <div style={{ width: 32, height: 32, background: "var(--ct-coffee-deep)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--fg-muted)" }}>--</div>
+                <div style={{ minWidth: 0 }}>
+                  <div className="today-row__title" style={{ color: "var(--fg-dim)" }}>{d.title}</div>
+                  <div style={{ display: "flex", gap: 10, marginTop: 3 }}>
+                    <div className="ct-row__show">{d.show}</div>
+                    <div className="fname"><s>{d.fname}</s></div>
+                  </div>
+                </div>
+                <div></div>
+                <div style={{ fontFamily: "var(--font-mono)", fontSize: 11,
+                  color: "var(--fg-muted)", textAlign: "right" }}>{d.size}</div>
+                <div></div>
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+Object.assign(window, { TodayScreen, fnameFor, slugShow });
+
+</script>
+<script type="text/babel" data-presets="react">
+/* global React, Btn, Progress, CoverArt, Toolbar, slugShow, fnameFor */
+const { useState: useS3, useEffect: useE3, useMemo: useM3 } = React;
+
+const STAGES = [
+  { id: "finalise", label: "Finalise order", detail: "locking slot numbers" },
+  { id: "delete",   label: "Remove old",    detail: "delete superseded files" },
+  { id: "convert",  label: "Convert video", detail: "extract audio @ 128kbps" },
+  { id: "transfer", label: "Transfer",      detail: "copy to OpenSwim Pro" },
+  { id: "verify",   label: "Verify",        detail: "checksum + eject-safe" },
+];
+
+function SyncScreen({ items, order, onDevice, audioFromVideo, onDone, onBack, armed, onArm,
+  syncLayoutVariant, motionVariant, setMountState }) {
+
+  const queue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
+  const removedFiles = onDevice.filter((d) => !queue.some((q) => q.show === d.show));
+  const videoCount = queue.filter((x) => x.kind === "VIDEO").length;
+  const totalMB = queue.reduce((s, x) => s + x.sizeMB, 0);
+
+  // Build a flat list of log lines keyed to stage and file.
+  const plan = useM3(() => {
+    const out = [];
+    out.push({ stage: "finalise", kind: "info", txt: `order locked · ${queue.length} slots` });
+    removedFiles.forEach((d) => out.push({ stage: "delete", kind: "del", txt: `rm ${d.fname}`, size: d.size }));
+    queue.forEach((it, i) => {
+      if (it.kind === "VIDEO" && audioFromVideo) {
+        out.push({ stage: "convert", kind: "conv", txt: `${it.show.toLowerCase().split(" ")[0]} · extract audio`, size: it.size, it, slot: i + 1 });
+      }
+    });
+    queue.forEach((it, i) => {
+      const fname = fnameFor(it.show, i + 1, it.kind === "VIDEO" && audioFromVideo ? "mp3" : it.kind === "VIDEO" ? "mp4" : "mp3");
+      out.push({ stage: "transfer", kind: "xfer", txt: fname, size: it.size, it, slot: i + 1 });
+    });
+    out.push({ stage: "verify", kind: "info", txt: `checksum ${queue.length} files · eject-safe` });
+    return out;
+  }, [queue, removedFiles, audioFromVideo]);
+
+  const [idx, setIdx] = useS3(0);
+  const [sub, setSub] = useS3(0); // 0..1 within current line
+  const [phase, setPhase] = useS3(armed ? "running" : "idle"); // idle | running | done
+
+  useE3(() => {
+    if (phase === "idle") { setMountState && setMountState("mounted"); return; }
+    setMountState && setMountState("busy");
+    return () => setMountState && setMountState("mounted");
+  }, [phase]);
+
+  useE3(() => {
+    if (phase !== "running") return;
+    const tick = setInterval(() => {
+      setSub((s) => {
+        const step = plan[idx] && plan[idx].kind === "xfer" ? 0.18 : 0.45;
+        const n = s + step;
+        if (n >= 1) {
+          setIdx((i) => {
+            if (i + 1 >= plan.length) { setPhase("done"); return i; }
+            return i + 1;
+          });
+          return 0;
+        }
+        return n;
+      });
+    }, 200);
+    return () => clearInterval(tick);
+  }, [phase, idx, plan]);
+
+  const stageIdxMap = Object.fromEntries(STAGES.map((s, i) => [s.id, i]));
+  const currentStage = plan[idx] ? plan[idx].stage : "verify";
+  const currentStageIdx = stageIdxMap[currentStage] ?? 0;
+
+  // Per-stage progress
+  const stageProgress = STAGES.map((st, si) => {
+    const items = plan.map((p, i) => ({ ...p, i })).filter((p) => p.stage === st.id);
+    const done = items.filter((p) => p.i < idx).length;
+    const active = items.some((p) => p.i === idx);
+    const pct = items.length ? (done + (active ? sub : 0)) / items.length : (si < currentStageIdx || phase === "done" ? 1 : 0);
+    return { ...st, items, pct, state: phase === "done" ? "done" : (si < currentStageIdx ? "done" : si === currentStageIdx ? "active" : "pending"), done, total: items.length };
+  });
+
+  const overall = (idx + sub) / Math.max(plan.length, 1);
+  const doneMB = plan.slice(0, idx).filter((p) => p.kind === "xfer").reduce((s, p) => s + (p.size ? parseFloat(p.size) : 0), 0);
+
+  if (phase === "done") {
+    // Success transform
+    return <SuccessScreen queue={queue} totalMB={totalMB} onDone={onDone} videoCount={videoCount} removed={removedFiles} audioFromVideo={audioFromVideo} />;
+  }
+
+  if (phase === "idle") {
+    return (
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}
+        data-screen-label="04 Sync (idle)">
+        <Toolbar
+          label={`Sync · ${queue.length} queued · ready`}
+          title="Ready when you are."
+          subtitle={`${totalMB.toFixed(1)}MB across ${queue.length} file${queue.length!==1?"s":""} · ${removedFiles.length} will be removed · ${videoCount} video→audio`}
+          actions={<>
+            <Btn variant="ghost" onClick={onBack}>back to today</Btn>
+            <Btn variant="cta" onClick={() => { onArm && onArm(); setPhase("running"); }} disabled={!queue.length}>
+              {queue.length ? `START SYNC · ${queue.length} EP` : "NOTHING QUEUED"}
+            </Btn>
+          </>}
+        />
+        <div style={{ flex: 1, display: "grid", gridTemplateColumns: "300px 1fr", minHeight: 0 }}>
+          <div style={{ borderRight: "1px solid var(--rule)", padding: "10px 0" }}>
+            {STAGES.map((st, si) => {
+              const stageItems = plan.filter((p) => p.stage === st.id);
+              return (
+                <div key={st.id} className="stage" data-state="pending">
+                  <div className="stage__bullet">{si + 1}</div>
+                  <div style={{ minWidth: 0 }}>
+                    <div className="stage__label">{st.label}</div>
+                    <div className="stage__label stage__detail" style={{ marginTop: 3 }}>
+                      {stageItems.length ? `${stageItems.length} pending` : "—"}
+                    </div>
+                  </div>
+                  <div className="stage__right"></div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ padding: "24px 28px", display: "flex", flexDirection: "column",
+            alignItems: "flex-start", justifyContent: "center", gap: 16 }}>
+            <div className="ct-label">awaiting start</div>
+            <div className="ct-subhead" style={{ maxWidth: 440 }}>
+              Five stages. Finalise the queue, delete yesterday's files, convert video audio, transfer, verify.
+            </div>
+            <div className="ct-meta" style={{ color: "var(--fg-dim)", maxWidth: 440, lineHeight: 1.8 }}>
+              Nothing is written to OpenSwim Pro until you press <span style={{ color: "var(--ct-amber)", fontWeight: 600 }}>START SYNC</span>.
+              Estimated {Math.round(totalMB / 1.8)}s at 1.8MB/s.
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}
+      data-screen-label="04 Sync">
+      <Toolbar
+        label={`Sync · stage ${currentStageIdx + 1}/5 · ${STAGES[currentStageIdx].id}`}
+        title="Sending to OpenSwim Pro."
+        subtitle={`${doneMB.toFixed(1)}MB / ${totalMB.toFixed(1)}MB · ${(overall * 100).toFixed(0)}% · 1.8MB/s`}
+        actions={<Btn variant="ghost" onClick={onBack}>cancel</Btn>}
+      />
+      <div style={{ padding: "0 20px" }}>
+        <Progress value={overall * 100} />
+      </div>
+
+      <div style={{ flex: 1, display: "grid", gridTemplateColumns: "300px 1fr",
+        minHeight: 0, borderTop: "1px solid var(--rule)" }}>
+        {/* Left: stages */}
+        <div style={{ borderRight: "1px solid var(--rule)", overflow: "auto", padding: "10px 0" }}>
+          {stageProgress.map((st, si) => (
+            <div key={st.id} className="stage" data-state={st.state}>
+              <div className="stage__bullet">
+                {st.state === "done" ? "✓" : st.state === "active" ? "▸" : si + 1}
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <div className="stage__label">{st.label}</div>
+                <div className="stage__label stage__detail" style={{ marginTop: 3 }}>
+                  {st.state === "done" ? `done · ${st.total}` :
+                   st.state === "active" ? `${st.detail} · ${st.done}/${st.total}` :
+                   st.total ? `${st.total} pending` : "skipped"}
+                </div>
+              </div>
+              <div className="stage__right">
+                {st.state !== "pending" && (
+                  <div style={{ width: 40, height: 2, background: "var(--rule)", position: "relative" }}>
+                    <div style={{ position: "absolute", inset: 0, width: `${st.pct * 100}%`,
+                      background: st.state === "done" ? "var(--ct-tea)" : "var(--ct-amber)" }} />
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Right: log */}
+        <div style={{ padding: "16px 20px", overflow: "auto", background: "var(--ct-coffee-deep)" }}>
+          <div className="ct-log">
+            {plan.map((p, i) => {
+              const cls = i < idx ? "ct-log__line--done"
+                : i === idx ? "ct-log__line--active"
+                : "ct-log__line--pending";
+              const prefix = i < idx ? "✓" : i === idx ? "▸" : "·";
+              const right = p.kind === "xfer" && i === idx
+                ? `${(parseFloat(p.size) * sub).toFixed(1)}M / ${p.size}`
+                : i < idx ? (p.size || "") : (p.size || "");
+              return (
+                <div key={i} className={cls} style={{ display: "grid",
+                  gridTemplateColumns: "18px 1fr auto", gap: 10 }}>
+                  <span>{prefix}</span>
+                  <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {p.txt}
+                    {p.kind === "del" && <span style={{ color: "var(--ct-error)", marginLeft: 6 }}>removed</span>}
+                  </span>
+                  <span style={{ color: "var(--fg-muted)" }}>{right}</span>
+                </div>
+              );
+            })}
+            <div style={{ marginTop: 10, color: "var(--fg-muted)" }}>
+              <span className="ct-cursor">▍</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SuccessScreen({ queue, totalMB, onDone, videoCount, removed, audioFromVideo }) {
+  const totalMin = queue.reduce((s, x) => s + x.durMin, 0);
+  const totalHM = `${Math.floor(totalMin / 60)}h ${Math.floor(totalMin % 60)}m`;
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}
+      data-screen-label="05 Success" className="ct-slide-in">
+      <Toolbar
+        label="sync complete · safe to unplug"
+        title="On your headset."
+        subtitle="seven episodes renamed, converted, transferred, verified."
+        actions={<>
+          <Btn variant="secondary" onClick={onDone}>Back to Up Next</Btn>
+          <Btn variant="cta" onClick={onDone}>EJECT</Btn>
+        </>}
+      />
+      <div style={{ padding: "20px", display: "grid", gap: 16, overflow: "auto" }}>
+        <div className="stats">
+          <div className="stats__cell">
+            <div className="stats__label">Files</div>
+            <div className="stats__value">{queue.length}</div>
+            <div className="stats__sub">{removed.length} removed · {queue.length} written</div>
+          </div>
+          <div className="stats__cell">
+            <div className="stats__label">Listen time</div>
+            <div className="stats__value">{totalHM}</div>
+            <div className="stats__sub">≈ 2–3 swims</div>
+          </div>
+          <div className="stats__cell">
+            <div className="stats__label">Transferred</div>
+            <div className="stats__value">{totalMB.toFixed(0)}<span style={{ fontSize: 14, color: "var(--fg-muted)", marginLeft: 4 }}>MB</span></div>
+            <div className="stats__sub">at 1.8MB/s</div>
+          </div>
+          <div className="stats__cell">
+            <div className="stats__label">Converted</div>
+            <div className="stats__value">{videoCount}</div>
+            <div className="stats__sub">video → audio</div>
+          </div>
+        </div>
+
+        {/* Device silhouette with files landed */}
+        <div style={{ border: "1px solid var(--rule)", padding: "28px 20px",
+          display: "grid", gridTemplateColumns: "1fr 280px", gap: 28, alignItems: "center",
+          background: "var(--ct-coffee-deep)" }}>
+          <div>
+            <div className="ct-label">on device</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 2, marginTop: 10 }}>
+              {queue.map((it, i) => {
+                const fname = fnameFor(it.show, i + 1, it.kind === "VIDEO" && audioFromVideo ? "mp3" : it.kind === "VIDEO" ? "mp4" : "mp3");
+                return (
+                  <div key={it.id} style={{ display: "grid", gridTemplateColumns: "24px 1fr auto",
+                    gap: 10, padding: "6px 0", alignItems: "center",
+                    borderBottom: "1px solid var(--rule)" }}>
+                    <CoverArt show={it.show} size={20} />
+                    <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--fg)" }}>
+                      {fname}
+                    </div>
+                    <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--fg-muted)" }}>
+                      {it.dur}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <svg width="240" height="140" viewBox="0 0 240 140">
+              <g fill="none" stroke="var(--ct-tea)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M 30 70 Q 120 10 210 70" />
+                <path d="M 30 70 Q 26 90 40 100 L 60 100 Q 72 100 72 88 L 72 74" />
+                <path d="M 210 70 Q 214 90 200 100 L 180 100 Q 168 100 168 88 L 168 74" />
+              </g>
+              <g fill="rgba(221,244,201,0.22)">
+                <rect x="44" y="80" width="16" height="12" />
+                <rect x="180" y="80" width="16" height="12" />
+              </g>
+              <circle cx="120" cy="42" r="3" fill="var(--ct-amber)">
+                <animate attributeName="opacity" values="1;.4;1" dur="2s" repeatCount="indefinite" />
+              </circle>
+              <text x="120" y="120" textAnchor="middle" fill="var(--fg-dim)"
+                fontFamily="var(--font-mono)" fontSize="10" letterSpacing="1.5">OPENSWIM PRO</text>
+            </svg>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MountDialog({ state, free, used, onClose, onForce }) {
+  return (
+    <div className="ct-overlay" onClick={onClose}>
+      <div className="ct-dialog" onClick={(e) => e.stopPropagation()}>
+        <div className="ct-dialog__head">
+          <div>
+            <div className="ct-label">OpenSwim Pro · /Volumes/OPENSWIM</div>
+            <div className="ct-subhead" style={{ marginTop: 4 }}>Eject device</div>
+          </div>
+          <div style={{ width: 8, height: 8, borderRadius: "50%",
+            background: state === "busy" ? "var(--ct-amber)" : "var(--ct-tea)" }}></div>
+        </div>
+        <div className="ct-dialog__body">
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+            <div>
+              <div className="ct-label">Used</div>
+              <div className="ct-title" style={{ marginTop: 4, color: "var(--fg)" }}>{used.toFixed(0)}MB</div>
+            </div>
+            <div>
+              <div className="ct-label">Free</div>
+              <div className="ct-title" style={{ marginTop: 4, color: "var(--fg)" }}>{free.toFixed(0)}MB</div>
+            </div>
+          </div>
+          <div className="ct-meta" style={{ color: state === "busy" ? "var(--ct-amber)" : "var(--fg-dim)" }}>
+            {state === "busy" ? "⚠ writing files — force eject will corrupt the last transfer." : "safe to eject · no pending writes."}
+          </div>
+        </div>
+        <div className="ct-dialog__actions">
+          <Btn variant="ghost" onClick={onClose}>cancel</Btn>
+          {state === "busy" && <Btn variant="destructive" onClick={onForce}>Force eject</Btn>}
+          <Btn variant="primary" onClick={onClose} disabled={state === "busy"}>Eject</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+Object.assign(window, { SyncScreen, SuccessScreen, MountDialog, STAGES });
+
+</script>
+<script type="text/babel" data-presets="react">
+/* global React, ReactDOM, Btn */
+const { useState, useEffect } = React;
+
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "rowFateVariant": "tag",
+  "syncLayoutVariant": "stages"
+}/*EDITMODE-END*/;
+
+function Tweaks({ tweaks, setTweaks, onClose }) {
+  const set = (k, v) => {
+    const n = { ...tweaks, [k]: v };
+    setTweaks(n);
+    window.parent.postMessage({ type: "__edit_mode_set_keys", edits: { [k]: v } }, "*");
+  };
+  return (
+    <div className="ct-tweaks">
+      <div className="ct-tweaks__head">
+        <div className="ct-label" style={{ color: "var(--fg)" }}>Tweaks</div>
+        <button className="ct-btn ct-btn--ghost ct-btn--sm" onClick={onClose}>✕</button>
+      </div>
+      <div className="ct-tweaks__body">
+        <div className="ct-tweaks__group">
+          <div className="ct-label">Today row-fate</div>
+          <div className="ct-tweaks__opts">
+            {["arrow", "tag", "stripe"].map((v) => (
+              <button key={v} className="ct-tweaks__opt"
+                data-active={tweaks.rowFateVariant === v}
+                onClick={() => set("rowFateVariant", v)}>{v}</button>
+            ))}
+          </div>
+        </div>
+        <div className="ct-tweaks__group">
+          <div className="ct-label">Sync layout</div>
+          <div className="ct-tweaks__opts">
+            {["stages", "log-only"].map((v) => (
+              <button key={v} className="ct-tweaks__opt"
+                data-active={tweaks.syncLayoutVariant === v}
+                onClick={() => set("syncLayoutVariant", v)}>{v}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [tweaks] = useState(TWEAK_DEFAULTS);
+  const items = window.APP_DATA.upNext;
+  const onDevice = window.APP_DATA.onDevice;
+  const deviceCapacityMB = window.APP_DATA.deviceCapacityMB;
+
+  // Build a realistic queue: 7 episodes
+  const queueIds = [1, 2, 4, 5, 6, 14, 22];
+  const selected = queueIds;
+  const order = queueIds;
+  const onDeviceIds = onDevice.map((d) => items.find((x) => x.show === d.show)?.id).filter(Boolean);
+  const queue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
+  const removedFiles = onDevice.filter((d) => !queue.some((q) => q.show === d.show));
+  const videoCount = queue.filter((x) => x.kind === "VIDEO").length;
+  const totalMB = queue.reduce((s, x) => s + x.sizeMB, 0);
+  const usedMB = onDevice.reduce((s, x) => s + x.sizeMB, 0);
+
+  const noop = () => {};
+  const nostate = () => {};
+
+  // Page wrapper that mirrors live app layout
+  const Page = ({ label, title, children }) => (
+    <div className="print-page">
+      <div className="print-cap">{label}</div>
+      <div style={{ width: "100%", height: "100%", padding: 18, boxSizing: "border-box" }}>
+        <Window title={title}>{children}</Window>
+      </div>
+    </div>
+  );
+
+  const ShellWith = ({ route, todayCount, children }) => (
+    <div style={{ flex: 1, display: "flex", minHeight: 0, position: "relative" }}>
+      <Sidebar route={route} setRoute={noop} todayCount={todayCount}
+        mountState="mounted" setShowMountDialog={noop} />
+      <main style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, position: "relative" }}>
+        {children}
+      </main>
+    </div>
+  );
+
+  return (
+    <>
+      {/* Page 1 — Login */}
+      <Page label="01 · Sign in" title="openswim · sign in">
+        <LoginScreen onConnect={noop} />
+      </Page>
+
+      {/* Page 2 — Up Next */}
+      <Page label="02 · Up Next" title="openswim · up-next">
+        <ShellWith route="up-next" todayCount={selected.length}>
+          <UpNextScreen items={items} selected={selected} setSelected={nostate}
+            goToday={noop} onDeviceIds={onDeviceIds} mountState="mounted" order={order} />
+        </ShellWith>
+      </Page>
+
+      {/* Page 3 — Today */}
+      <Page label="03 · Today (review + reorder)" title="openswim · today">
+        <ShellWith route="today" todayCount={selected.length}>
+          <TodayScreen items={items} onDevice={onDevice} selected={selected} setSelected={nostate}
+            order={order} setOrder={nostate}
+            goSync={noop} goUpNext={noop}
+            audioFromVideo={true} setAudioFromVideo={nostate}
+            deviceCapacityMB={deviceCapacityMB}
+            rowFateVariant={tweaks.rowFateVariant} />
+        </ShellWith>
+      </Page>
+
+      {/* Page 4 — Sync running */}
+      <Page label="04 · Sync (running)" title="openswim · syncing">
+        <ShellWith route="syncing" todayCount={selected.length}>
+          <SyncScreen items={items} order={order} onDevice={onDevice}
+            audioFromVideo={true} armed={true} onArm={noop}
+            onDone={noop} onBack={noop}
+            syncLayoutVariant={tweaks.syncLayoutVariant}
+            setMountState={nostate} />
+        </ShellWith>
+      </Page>
+
+      {/* Page 5 — Success */}
+      <Page label="05 · Sync complete" title="openswim · syncing">
+        <ShellWith route="syncing" todayCount={selected.length}>
+          <SuccessScreen queue={queue} totalMB={totalMB} onDone={noop}
+            videoCount={videoCount} removed={removedFiles} audioFromVideo={true} />
+        </ShellWith>
+      </Page>
+
+      {/* Page 6 — Eject dialog (on Today) */}
+      <Page label="06 · Eject dialog" title="openswim · today">
+        <ShellWith route="today" todayCount={selected.length}>
+          <TodayScreen items={items} onDevice={onDevice} selected={selected} setSelected={nostate}
+            order={order} setOrder={nostate}
+            goSync={noop} goUpNext={noop}
+            audioFromVideo={true} setAudioFromVideo={nostate}
+            deviceCapacityMB={deviceCapacityMB}
+            rowFateVariant={tweaks.rowFateVariant} />
+          <MountDialog state="mounted" free={deviceCapacityMB - usedMB} used={usedMB}
+            onClose={noop} onForce={noop} />
+        </ShellWith>
+      </Page>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+// Auto-print: wait for fonts + render + small buffer
+(async () => {
+  try { await document.fonts.ready; } catch (_) {}
+  await new Promise((r) => setTimeout(r, 800));
+  window.print();
+})();
+
+</script>
+
+</body>
+</html>

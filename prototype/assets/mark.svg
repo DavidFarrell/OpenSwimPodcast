@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96">
+  <rect width="96" height="96" fill="#3E2723"></rect>
+  <rect x="0.5" y="0.5" width="95" height="95" fill="none" stroke="rgba(221,244,201,0.22)"></rect>
+  <g font-family="&#39;Space Grotesk&#39;, system-ui, sans-serif" font-size="38" font-weight="600" letter-spacing="-2" fill="#DDF4C9">
+    <text x="14" y="58">OS</text>
+  </g>
+  <circle cx="76" cy="24" r="4" fill="#E8B44F"></circle>
+</svg>
