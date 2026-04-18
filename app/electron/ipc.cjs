@@ -3,6 +3,7 @@ const path = require("node:path");
 const pc = require("./pocketcasts.cjs");
 const { DownloadManager } = require("./downloader.cjs");
 const { createDeviceWatcher } = require("./device.cjs");
+const { runSync } = require("./sync.cjs");
 
 function serializeError(e) {
   return { message: e.message || String(e), code: e.code, status: e.status };
@@ -29,6 +30,35 @@ function getWatcher() {
   watcher.on((state) => broadcast("device:state", state));
   watcher.start();
   return watcher;
+}
+
+let syncController = null;
+
+async function startSync(spec) {
+  if (syncController) throw Object.assign(new Error("sync already in progress"), { code: "SYNC_IN_PROGRESS" });
+  syncController = new AbortController();
+  const cacheDir = path.join(app.getPath("userData"), "cache", "episodes");
+  try {
+    const res = await runSync({
+      devicePath: spec.devicePath,
+      queue: spec.queue,
+      cacheDir,
+      signal: syncController.signal,
+      onEvent: (e) => broadcast("sync:event", e),
+    });
+    broadcast("sync:event", { type: "finished", ok: true });
+    return res;
+  } catch (e) {
+    broadcast("sync:event", { type: "finished", ok: false, error: { message: e.message, code: e.code, name: e.name } });
+    throw e;
+  } finally {
+    syncController = null;
+  }
+}
+
+function cancelSync() {
+  if (syncController) { syncController.abort(); return true; }
+  return false;
 }
 
 function getManager() {
@@ -69,11 +99,15 @@ function registerAll() {
     },
     "downloads:cancel": (_, uuid) => getManager().cancel(uuid),
     "downloads:list": () => getManager().list(),
+    "downloads:reconcile": (_, uuids) => getManager().reconcile(new Set(uuids || [])),
 
     "device:current": () => getWatcher().current(),
     "device:listVolumes": () => getWatcher().listVolumes(),
     "device:claim": (_, path) => getWatcher().claim(path),
     "device:eject": (_, path) => getWatcher().eject(path),
+
+    "sync:start": (_, spec) => startSync(spec),
+    "sync:cancel": () => cancelSync(),
   };
   for (const [ch, fn] of Object.entries(handlers)) {
     ipcMain.handle(ch, async (ev, arg) => {

@@ -23,7 +23,7 @@ export default function App() {
   const [items, setItems] = useState([]);
   const [feedState, setFeedState] = useState("idle");
   const [feedError, setFeedError] = useState(null);
-  const { byUuid: downloadByUuid, ensure: ensureDownload } = useDownloads();
+  const { byUuid: downloadByUuid, ensure: ensureDownload, reconcile: reconcileDownloads } = useDownloads();
 
   useEffect(() => { localStorage.setItem("os_route", route); }, [route]);
 
@@ -93,6 +93,14 @@ export default function App() {
       }
     }
   }, [route, order, items]);
+
+  useEffect(() => {
+    if (!items.length || !order.length) return;
+    const keepUuids = order
+      .map((id) => items.find((x) => x.id === id)?.uuid)
+      .filter(Boolean);
+    reconcileDownloads(keepUuids);
+  }, [order, items]);
 
   useEffect(() => {
     setOrder((prev) => {
@@ -170,14 +178,17 @@ export default function App() {
                 goSync={() => { setSyncArmed(true); setRouteRaw("syncing"); }}
                 goUpNext={() => setRoute("up-next")}
                 deviceCapacityMB={deviceCapacityMB}
-                downloadByUuid={downloadByUuid} />
+                downloadByUuid={downloadByUuid}
+                onRetryDownload={(it) => ensureDownload(it.uuid, it.url)} />
             )}
             {route === "syncing" && (
               <SyncScreen items={items} order={order} onDevice={onDevice}
                 armed={syncArmed} onArm={() => setSyncArmed(true)}
                 onDone={() => { setSelected([]); setOrder([]); setSyncArmed(false); setRouteRaw("up-next"); }}
                 onBack={() => { setSyncArmed(false); setRouteRaw("today"); }}
-                setMountState={(s) => setSyncBusy(s === "busy")} />
+                setMountState={(s) => setSyncBusy(s === "busy")}
+                devicePath={device.mounted ? device.path : null}
+                downloadByUuid={downloadByUuid} />
             )}
           </main>
           {showMountDialog && device.mounted && (

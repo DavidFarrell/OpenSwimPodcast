@@ -12,115 +12,153 @@ const STAGES = [
   { id: "verify",   label: "Verify",        detail: "checksum + eject-safe" },
 ];
 
-export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onArm, setMountState }) {
-  const queue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
-  const removedFiles = onDevice.filter((d) => !queue.some((q) => q.show === d.show));
-  const videoCount = queue.filter((x) => x.kind === "VIDEO").length;
-  const totalMB = queue.reduce((s, x) => s + x.sizeMB, 0);
+function logKey(evt) {
+  return evt.uuid ? `${evt.stage}:${evt.uuid}` : `${evt.stage}:${evt.text}`;
+}
 
-  const plan = useMemo(() => {
-    const out = [];
-    out.push({ stage: "finalise", kind: "info", txt: `order locked · ${queue.length} slots` });
-    removedFiles.forEach((d) => out.push({ stage: "delete", kind: "del", txt: `rm ${d.fname}`, size: d.size }));
-    queue.forEach((it, i) => {
-      if (it.kind === "VIDEO") {
-        out.push({ stage: "convert", kind: "conv", txt: `${it.show.toLowerCase().split(" ")[0]} · extract audio`, size: it.size, it, slot: i + 1 });
-      }
-    });
-    queue.forEach((it, i) => {
-      const fname = fnameFor(it.show, i + 1, "mp3");
-      out.push({ stage: "transfer", kind: "xfer", txt: fname, size: it.size, it, slot: i + 1 });
-    });
-    out.push({ stage: "verify", kind: "info", txt: `checksum ${queue.length} files · eject-safe` });
-    return out;
-  }, [queue, removedFiles]);
+export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onArm, setMountState, devicePath, downloadByUuid = {} }) {
+  const fullQueue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
+  const readyQueue = fullQueue.filter((it) => downloadByUuid[it.uuid]?.state === "ready");
+  const skipped = fullQueue.filter((it) => !readyQueue.includes(it));
+  const videoCount = readyQueue.filter((x) => x.kind === "VIDEO").length;
+  const totalMB = readyQueue.reduce((s, x) => s + x.sizeMB, 0);
+  const queue = readyQueue;
 
-  const [idx, setIdx] = useState(0);
-  const [sub, setSub] = useState(0);
+  const spec = useMemo(() => ({
+    devicePath,
+    queue: readyQueue.map((it, i) => ({
+      uuid: it.uuid,
+      url: it.url,
+      show: it.show,
+      title: it.title,
+      slot: i + 1,
+      filename: fnameFor(it.show, i + 1, "mp3"),
+      ext: it.kind === "VIDEO" ? "mp4" : "mp3",
+    })),
+  }), [readyQueue, devicePath]);
+
   const [phase, setPhase] = useState(armed ? "running" : "idle");
+  const [serverPlan, setServerPlan] = useState([]);
+  const [stageState, setStageState] = useState({});
+  const [logByKey, setLogByKey] = useState({});
+  const [error, setError] = useState(null);
 
   useEffect(() => {
-    if (phase === "idle") { setMountState && setMountState("mounted"); return; }
-    setMountState && setMountState("busy");
-    return () => setMountState && setMountState("mounted");
+    if (phase === "running") setMountState && setMountState("busy");
+    if (phase === "done" || phase === "error" || phase === "idle") setMountState && setMountState("mounted");
   }, [phase, setMountState]);
 
   useEffect(() => {
     if (phase !== "running") return;
-    const tick = setInterval(() => {
-      setSub((s) => {
-        const step = plan[idx] && plan[idx].kind === "xfer" ? 0.18 : 0.45;
-        const n = s + step;
-        if (n >= 1) {
-          setIdx((i) => {
-            if (i + 1 >= plan.length) { setPhase("done"); return i; }
-            return i + 1;
-          });
-          return 0;
-        }
-        return n;
-      });
-    }, 200);
-    return () => clearInterval(tick);
-  }, [phase, idx, plan]);
+    const api = window.openswim && window.openswim.sync;
+    if (!api) { setError("sync bridge unavailable"); setPhase("error"); return; }
+    if (!devicePath) { setError("no device mounted"); setPhase("error"); return; }
 
-  const stageIdxMap = Object.fromEntries(STAGES.map((s, i) => [s.id, i]));
-  const currentStage = plan[idx] ? plan[idx].stage : "verify";
-  const currentStageIdx = stageIdxMap[currentStage] ?? 0;
+    const off = api.onEvent((evt) => {
+      if (evt.type === "plan") setServerPlan(evt.plan);
+      else if (evt.type === "stage") setStageState((m) => ({ ...m, [evt.stage]: evt.state }));
+      else if (evt.type === "log") setLogByKey((m) => ({ ...m, [logKey(evt)]: evt }));
+      else if (evt.type === "finished") {
+        if (evt.ok) setPhase("done");
+        else { setError(evt.error?.message || "sync failed"); setPhase("error"); }
+      }
+    });
 
-  const stageProgress = STAGES.map((st, si) => {
-    const stageItems = plan.map((p, i) => ({ ...p, i })).filter((p) => p.stage === st.id);
-    const done = stageItems.filter((p) => p.i < idx).length;
-    const active = stageItems.some((p) => p.i === idx);
-    const pct = stageItems.length ? (done + (active ? sub : 0)) / stageItems.length : (si < currentStageIdx || phase === "done" ? 1 : 0);
+    api.start(spec).catch(() => {});
+    return () => off && off();
+  }, [phase, devicePath]);
+
+  const cancel = async () => {
+    const api = window.openswim && window.openswim.sync;
+    if (api) await api.cancel();
+    onBack();
+  };
+
+  const stageCounts = STAGES.map((st) => ({
+    ...st,
+    count: serverPlan.filter((p) => p.stage === st.id).length,
+  }));
+
+  const planWithLog = serverPlan.map((p) => ({ ...p, log: logByKey[logKey(p)] }));
+  const doneCount = planWithLog.filter((p) => p.log?.state === "done").length;
+  const overall = planWithLog.length ? doneCount / planWithLog.length : 0;
+
+  const currentStage = (() => {
+    for (const st of STAGES) {
+      if (stageState[st.id] === "active") return st.id;
+    }
+    return STAGES.find((st) => stageState[st.id] !== "done")?.id || "verify";
+  })();
+  const currentStageIdx = STAGES.findIndex((s) => s.id === currentStage);
+
+  const stageProgress = STAGES.map((st) => {
+    const stageItems = planWithLog.filter((p) => p.stage === st.id);
+    const done = stageItems.filter((p) => p.log?.state === "done").length;
+    const active = stageItems.some((p) => p.log?.state === "active");
+    const pct = stageItems.length ? (done + (active ? 0.3 : 0)) / stageItems.length
+      : (stageState[st.id] === "done" ? 1 : 0);
     return {
-      ...st,
-      items: stageItems,
-      pct,
-      state: phase === "done" ? "done" : (si < currentStageIdx ? "done" : si === currentStageIdx ? "active" : "pending"),
-      done,
-      total: stageItems.length,
+      ...st, items: stageItems, pct,
+      state: stageState[st.id] || "pending",
+      done, total: stageItems.length,
     };
   });
 
-  const overall = (idx + sub) / Math.max(plan.length, 1);
-  const doneMB = plan.slice(0, idx).filter((p) => p.kind === "xfer").reduce((s, p) => s + (p.size ? parseFloat(p.size) : 0), 0);
-
   if (phase === "done") {
-    return <SuccessScreen queue={queue} totalMB={totalMB} onDone={onDone} videoCount={videoCount} removed={removedFiles} />;
+    return <SuccessScreen queue={queue} totalMB={totalMB} onDone={onDone} videoCount={videoCount} skippedCount={skipped.length} />;
   }
 
-  if (phase === "idle") {
+  if (phase === "error") {
     return (
       <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
         <Toolbar
-          label={`Sync · ${queue.length} queued · ready`}
-          title="Ready when you are."
-          subtitle={`${totalMB.toFixed(1)}MB across ${queue.length} file${queue.length !== 1 ? "s" : ""} · ${removedFiles.length} will be removed · ${videoCount} video→audio`}
+          label="sync failed"
+          title="Something went wrong."
+          subtitle={error || "unknown error"}
           actions={<>
             <Btn variant="ghost" onClick={onBack}>back to today</Btn>
-            <Btn variant="cta" onClick={() => { onArm && onArm(); setPhase("running"); }} disabled={!queue.length}>
-              {queue.length ? `START SYNC · ${queue.length} EP` : "NOTHING QUEUED"}
+            <Btn variant="cta" onClick={() => { setError(null); setLogByKey({}); setStageState({}); setServerPlan([]); setPhase("running"); }}>
+              RETRY
+            </Btn>
+          </>}
+        />
+        <div style={{ padding: 24, color: "var(--ct-error)", fontFamily: "var(--font-mono)", fontSize: 12, whiteSpace: "pre-wrap" }}>
+          ✗ {error}
+        </div>
+      </div>
+    );
+  }
+
+  if (phase === "idle") {
+    const removedPreview = onDevice.filter((d) => !queue.some((q) => q.show === d.show)).length;
+    const skipNote = skipped.length ? ` · ${skipped.length} skipped (unreachable)` : "";
+    return (
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+        <Toolbar
+          label={`Sync · ${queue.length} ready${skipped.length ? ` · ${skipped.length} skipped` : ""}`}
+          title={devicePath ? "Ready when you are." : "No device mounted."}
+          subtitle={devicePath
+            ? `${totalMB.toFixed(1)}MB across ${queue.length} file${queue.length !== 1 ? "s" : ""} · ~${removedPreview} to remove · ${videoCount} video→audio${skipNote}`
+            : "Plug in OpenSwim Pro before syncing."}
+          actions={<>
+            <Btn variant="ghost" onClick={onBack}>back to today</Btn>
+            <Btn variant="cta" onClick={() => { onArm && onArm(); setPhase("running"); }} disabled={!queue.length || !devicePath}>
+              {!devicePath ? "NO DEVICE" : queue.length ? `START SYNC · ${queue.length} EP` : "NOTHING READY"}
             </Btn>
           </>}
         />
         <div style={{ flex: 1, display: "grid", gridTemplateColumns: "300px 1fr", minHeight: 0 }}>
           <div style={{ borderRight: "1px solid var(--rule)", padding: "10px 0" }}>
-            {STAGES.map((st, si) => {
-              const stageItems = plan.filter((p) => p.stage === st.id);
-              return (
-                <div key={st.id} className="stage" data-state="pending">
-                  <div className="stage__bullet">{si + 1}</div>
-                  <div style={{ minWidth: 0 }}>
-                    <div className="stage__label">{st.label}</div>
-                    <div className="stage__label stage__detail" style={{ marginTop: 3 }}>
-                      {stageItems.length ? `${stageItems.length} pending` : "—"}
-                    </div>
-                  </div>
-                  <div className="stage__right"></div>
+            {STAGES.map((st, si) => (
+              <div key={st.id} className="stage" data-state="pending">
+                <div className="stage__bullet">{si + 1}</div>
+                <div style={{ minWidth: 0 }}>
+                  <div className="stage__label">{st.label}</div>
+                  <div className="stage__label stage__detail" style={{ marginTop: 3 }}>{st.detail}</div>
                 </div>
-              );
-            })}
+                <div className="stage__right"></div>
+              </div>
+            ))}
           </div>
           <div style={{ padding: "24px 28px", display: "flex", flexDirection: "column",
             alignItems: "flex-start", justifyContent: "center", gap: 16 }}>
@@ -129,8 +167,8 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
               Five stages. Finalise the queue, delete yesterday's files, convert video audio, transfer, verify.
             </div>
             <div className="ct-meta" style={{ color: "var(--fg-dim)", maxWidth: 440, lineHeight: 1.8 }}>
-              Nothing is written to OpenSwim Pro until you press <span style={{ color: "var(--ct-amber)", fontWeight: 600 }}>START SYNC</span>.
-              Estimated {Math.round(totalMB / 1.8)}s at 1.8MB/s.
+              Nothing is written to OpenSwim Pro until you press{" "}
+              <span style={{ color: "var(--ct-amber)", fontWeight: 600 }}>START SYNC</span>.
             </div>
           </div>
         </div>
@@ -141,10 +179,10 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
       <Toolbar
-        label={`Sync · stage ${currentStageIdx + 1}/5 · ${STAGES[currentStageIdx].id}`}
+        label={`Sync · stage ${Math.max(1, currentStageIdx + 1)}/5 · ${STAGES[Math.max(0, currentStageIdx)].id}`}
         title="Sending to OpenSwim Pro."
-        subtitle={`${doneMB.toFixed(1)}MB / ${totalMB.toFixed(1)}MB · ${(overall * 100).toFixed(0)}% · 1.8MB/s`}
-        actions={<Btn variant="ghost" onClick={onBack}>cancel</Btn>}
+        subtitle={`${doneCount}/${planWithLog.length} · ${(overall * 100).toFixed(0)}%`}
+        actions={<Btn variant="ghost" onClick={cancel}>cancel</Btn>}
       />
       <div style={{ padding: "0 20px" }}>
         <Progress value={overall * 100} />
@@ -163,7 +201,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
                 <div className="stage__label stage__detail" style={{ marginTop: 3 }}>
                   {st.state === "done" ? `done · ${st.total}` :
                    st.state === "active" ? `${st.detail} · ${st.done}/${st.total}` :
-                   st.total ? `${st.total} pending` : "skipped"}
+                   st.total ? `${st.total} pending` : st.detail}
                 </div>
               </div>
               <div className="stage__right">
@@ -180,21 +218,28 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
 
         <div style={{ padding: "16px 20px", overflow: "auto", background: "var(--ct-coffee-deep)" }}>
           <div className="ct-log">
-            {plan.map((p, i) => {
-              const cls = i < idx ? "ct-log__line--done"
-                : i === idx ? "ct-log__line--active"
+            {planWithLog.length === 0 && (
+              <div className="ct-log__line--active">▸ preparing sync…</div>
+            )}
+            {planWithLog.map((p, i) => {
+              const state = p.log?.state || "pending";
+              const cls = state === "done" ? "ct-log__line--done"
+                : state === "active" ? "ct-log__line--active"
+                : state === "error" ? "ct-log__line--pending"
                 : "ct-log__line--pending";
-              const prefix = i < idx ? "✓" : i === idx ? "▸" : "·";
-              const right = p.kind === "xfer" && i === idx
-                ? `${(parseFloat(p.size) * sub).toFixed(1)}M / ${p.size}`
-                : i < idx ? (p.size || "") : (p.size || "");
+              const prefix = state === "done" ? "✓" : state === "active" ? "▸" : state === "error" ? "✗" : "·";
+              let right = "";
+              if (p.log && p.log.total && p.log.bytes != null) {
+                if (p.stage === "convert") right = `${p.log.bytes.toFixed(1)}s / ${p.log.total.toFixed(1)}s`;
+                else if (p.stage === "transfer") right = `${formatMB(p.log.bytes / (1024 * 1024))} / ${formatMB(p.log.total / (1024 * 1024))}`;
+              }
               return (
                 <div key={i} className={cls} style={{ display: "grid",
-                  gridTemplateColumns: "18px 1fr auto", gap: 10 }}>
+                  gridTemplateColumns: "18px 1fr auto", gap: 10,
+                  color: state === "error" ? "var(--ct-error)" : undefined }}>
                   <span>{prefix}</span>
                   <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                    {p.txt}
-                    {p.kind === "del" && <span style={{ color: "var(--ct-error)", marginLeft: 6 }}>removed</span>}
+                    {p.log?.text || p.text}
                   </span>
                   <span style={{ color: "var(--fg-muted)" }}>{right}</span>
                 </div>
@@ -210,18 +255,19 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   );
 }
 
-function SuccessScreen({ queue, totalMB, onDone, videoCount, removed }) {
+function SuccessScreen({ queue, totalMB, onDone, videoCount, skippedCount = 0 }) {
   const totalMin = queue.reduce((s, x) => s + x.durMin, 0);
   const totalHM = `${Math.floor(totalMin / 60)}h ${Math.floor(totalMin % 60)}m`;
+  const skipNote = skippedCount ? ` · ${skippedCount} skipped (unreachable)` : "";
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }} className="ct-slide-in">
       <Toolbar
         label="sync complete · safe to unplug"
         title="On your headset."
-        subtitle={`${queue.length} episode${queue.length !== 1 ? "s" : ""} renamed, converted, transferred, verified.`}
+        subtitle={`${queue.length} episode${queue.length !== 1 ? "s" : ""} renamed, converted, transferred, verified${skipNote}.`}
         actions={<>
           <Btn variant="secondary" onClick={onDone}>Back to Up Next</Btn>
-          <Btn variant="cta" onClick={onDone}>EJECT</Btn>
+          <Btn variant="cta" onClick={onDone}>DONE</Btn>
         </>}
       />
       <div style={{ padding: "20px", display: "grid", gap: 16, overflow: "auto" }}>
@@ -229,7 +275,7 @@ function SuccessScreen({ queue, totalMB, onDone, videoCount, removed }) {
           <div className="stats__cell">
             <div className="stats__label">Files</div>
             <div className="stats__value">{queue.length}</div>
-            <div className="stats__sub">{removed.length} removed · {queue.length} written</div>
+            <div className="stats__sub">{queue.length} written</div>
           </div>
           <div className="stats__cell">
             <div className="stats__label">Listen time</div>
@@ -239,7 +285,7 @@ function SuccessScreen({ queue, totalMB, onDone, videoCount, removed }) {
           <div className="stats__cell">
             <div className="stats__label">Transferred</div>
             <div className="stats__value">{totalMB.toFixed(0)}<span style={{ fontSize: 14, color: "var(--fg-muted)", marginLeft: 4 }}>MB</span></div>
-            <div className="stats__sub">at 1.8MB/s</div>
+            <div className="stats__sub">on device</div>
           </div>
           <div className="stats__cell">
             <div className="stats__label">Converted</div>

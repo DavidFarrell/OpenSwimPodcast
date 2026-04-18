@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld("openswim", {
     ensure: (uuid, url, ext) => invoke("downloads:ensure", { uuid, url, ext }),
     cancel: (uuid) => invoke("downloads:cancel", uuid),
     list: () => invoke("downloads:list"),
+    reconcile: (uuids) => invoke("downloads:reconcile", uuids),
     onProgress: (cb) => {
       const listener = (_e, evt) => cb(evt);
       ipcRenderer.on("downloads:progress", listener);
@@ -33,6 +34,15 @@ contextBridge.exposeInMainWorld("openswim", {
       const listener = (_e, state) => cb(state);
       ipcRenderer.on("device:state", listener);
       return () => ipcRenderer.removeListener("device:state", listener);
+    },
+  },
+  sync: {
+    start: (spec) => invoke("sync:start", spec),
+    cancel: () => invoke("sync:cancel"),
+    onEvent: (cb) => {
+      const listener = (_e, evt) => cb(evt);
+      ipcRenderer.on("sync:event", listener);
+      return () => ipcRenderer.removeListener("sync:event", listener);
     },
   },
 });

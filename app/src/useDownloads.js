@@ -30,5 +30,19 @@ export function useDownloads() {
     });
   };
 
-  return { byUuid, ensure };
+  const reconcile = (uuids) => {
+    const dl = api();
+    if (!dl) return;
+    dl.reconcile(uuids).then((r) => {
+      if (r.ok && r.data.removed && r.data.removed.length) {
+        setByUuid((prev) => {
+          const next = { ...prev };
+          for (const uuid of r.data.removed) delete next[uuid];
+          return next;
+        });
+      }
+    });
+  };
+
+  return { byUuid, ensure, reconcile };
 }

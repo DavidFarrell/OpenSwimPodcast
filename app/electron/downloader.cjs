@@ -117,6 +117,10 @@ class DownloadManager {
     return path.join(this.cacheDir, `${uuid}.${ext}`);
   }
 
+  ensureCacheDir() {
+    try { fs.mkdirSync(this.cacheDir, { recursive: true }); } catch {}
+  }
+
   list() {
     return [...this.entries.values()].map((e) => ({
       uuid: e.uuid, state: e.state, bytes: e.bytes, total: e.total, error: e.error,
@@ -152,6 +156,40 @@ class DownloadManager {
     return true;
   }
 
+  reconcile(keepUuids) {
+    const keep = keepUuids instanceof Set ? keepUuids : new Set(keepUuids || []);
+    const removed = [];
+
+    for (const [uuid, entry] of this.entries) {
+      if (keep.has(uuid)) continue;
+      if (entry.state === "queued" || entry.state === "downloading") {
+        entry.controller.abort();
+        entry.state = "cancelled";
+        this.emit(entry);
+      }
+      this.entries.delete(uuid);
+    }
+
+    let entries = [];
+    try { entries = fs.readdirSync(this.cacheDir, { withFileTypes: true }); }
+    catch { return { removed }; }
+
+    const mediaExt = /\.(mp3|mp4|m4a|m4v|mov|ogg|aac|wav|webm)(\.part)?$/i;
+    for (const ent of entries) {
+      if (!ent.isFile()) continue;
+      const name = ent.name;
+      if (!mediaExt.test(name)) continue;
+      const uuid = name.replace(mediaExt, "");
+      if (keep.has(uuid)) continue;
+      try { fs.unlinkSync(path.join(this.cacheDir, name)); }
+      catch {}
+      if (!removed.includes(uuid)) removed.push(uuid);
+    }
+
+    this.onEvent({ type: "reconcile", removed });
+    return { removed };
+  }
+
   emit(e) {
     this.onEvent({ uuid: e.uuid, state: e.state, bytes: e.bytes, total: e.total, error: e.error });
   }
@@ -185,6 +223,7 @@ class DownloadManager {
       } else {
         e.state = "error";
         e.error = err.message || String(err);
+        console.error(`[download] ${e.uuid} (${e.url}) failed:`, err.status || "", e.error);
       }
       this.emit(e);
     }

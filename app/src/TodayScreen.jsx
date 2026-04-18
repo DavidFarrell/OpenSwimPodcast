@@ -11,14 +11,37 @@ export function fnameFor(show, slot, ext = "mp3") {
   return `${String(slot).padStart(2, "0")}_${slugShow(show)}.${ext}`;
 }
 
-function DownloadBadge({ state }) {
+function shortenError(msg) {
+  if (!msg) return "error";
+  if (/404/.test(msg)) return "404 not found";
+  if (/403/.test(msg)) return "403 forbidden";
+  if (/5\d\d/.test(msg)) return "server error";
+  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(msg)) return "dns failed";
+  if (/ECONNREFUSED|ECONNRESET/i.test(msg)) return "connection refused";
+  if (/timeout/i.test(msg)) return "timeout";
+  return msg.length > 28 ? msg.slice(0, 28) + "…" : msg;
+}
+
+function DownloadBadge({ state, onRetry }) {
   if (!state) return null;
-  const { state: s, bytes = 0, total } = state;
+  const { state: s, bytes = 0, total, error } = state;
   if (s === "ready") {
     return <span style={{ marginLeft: 8, color: "var(--ct-tea)", fontSize: 10 }}>✓ cached</span>;
   }
   if (s === "error") {
-    return <span style={{ marginLeft: 8, color: "var(--ct-error)", fontSize: 10 }}>✗ error</span>;
+    return (
+      <span style={{ marginLeft: 8, display: "inline-flex", alignItems: "center", gap: 6 }} title={error || "download failed"}>
+        <span style={{ color: "var(--ct-error)", fontSize: 10 }}>✗ {shortenError(error)}</span>
+        {onRetry && (
+          <button onClick={(e) => { e.stopPropagation(); onRetry(); }}
+            style={{
+              fontFamily: "var(--font-mono)", fontSize: 9, letterSpacing: ".5px",
+              color: "var(--ct-amber)", background: "transparent",
+              border: "1px solid var(--rule)", padding: "1px 5px", cursor: "pointer",
+            }}>RETRY</button>
+        )}
+      </span>
+    );
   }
   if (s === "cancelled") {
     return <span style={{ marginLeft: 8, color: "var(--fg-muted)", fontSize: 10 }}>cancelled</span>;
@@ -35,7 +58,7 @@ function DownloadBadge({ state }) {
 }
 
 export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
-  goSync, goUpNext, deviceCapacityMB, downloadByUuid = {} }) {
+  goSync, goUpNext, deviceCapacityMB, downloadByUuid = {}, onRetryDownload }) {
 
   const queue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
   const totalMin = queue.reduce((s, x) => s + x.durMin, 0);
@@ -176,7 +199,8 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
               <div style={{ fontFamily: "var(--font-mono)", fontSize: 11,
                 color: "var(--fg-muted)", textAlign: "right" }}>
                 {it.size}
-                <DownloadBadge state={downloadByUuid[it.uuid]} />
+                <DownloadBadge state={downloadByUuid[it.uuid]}
+                  onRetry={onRetryDownload ? () => onRetryDownload(it) : null} />
               </div>
               <div style={{ display: "flex", gap: 2, justifyContent: "flex-end" }}>
                 <button className="ct-btn ct-btn--ghost ct-btn--sm" onClick={() => remove(it.id)}

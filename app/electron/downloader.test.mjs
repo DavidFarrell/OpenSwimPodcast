@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createRequire } from "node:module";
 import http from "node:http";
 import fs from "node:fs";
@@ -6,7 +6,7 @@ import path from "node:path";
 import os from "node:os";
 
 const require = createRequire(import.meta.url);
-const { download } = require("./downloader.cjs");
+const { download, DownloadManager } = require("./downloader.cjs");
 
 function makeServer(handler) {
   return new Promise((resolve) => {
@@ -129,6 +129,67 @@ describe("download()", () => {
     const dest = path.join(tmp, "missing.mp3");
     await expect(download({ url: `${baseUrl}/missing.mp3`, dest })).rejects.toMatchObject({ status: 404 });
     expect(fs.existsSync(dest)).toBe(false);
+  });
+
+  it("reconcile deletes cache files whose uuid isn't in keepUuids and leaves kept files alone", async () => {
+    const mgr = new DownloadManager({ cacheDir: tmp, concurrency: 1, onEvent: () => {} });
+    fs.writeFileSync(path.join(tmp, "keep-this.mp3"), "keeper-mp3");
+    fs.writeFileSync(path.join(tmp, "keep-this.mp4"), "keeper-mp4");
+    fs.writeFileSync(path.join(tmp, "drop-me.mp3"), "droppable");
+    fs.writeFileSync(path.join(tmp, "drop-me.mp4"), "droppable");
+    fs.writeFileSync(path.join(tmp, "half-download.mp3.part"), "partial");
+    fs.writeFileSync(path.join(tmp, "keep-partial.mp3.part"), "partial keeper");
+
+    const result = mgr.reconcile(new Set(["keep-this", "keep-partial"]));
+
+    expect(fs.existsSync(path.join(tmp, "keep-this.mp3"))).toBe(true);
+    expect(fs.existsSync(path.join(tmp, "keep-this.mp4"))).toBe(true);
+    expect(fs.existsSync(path.join(tmp, "keep-partial.mp3.part"))).toBe(true);
+    expect(fs.existsSync(path.join(tmp, "drop-me.mp3"))).toBe(false);
+    expect(fs.existsSync(path.join(tmp, "drop-me.mp4"))).toBe(false);
+    expect(fs.existsSync(path.join(tmp, "half-download.mp3.part"))).toBe(false);
+    expect(result.removed.sort()).toEqual(["drop-me", "half-download"]);
+  });
+
+  it("reconcile cancels an in-flight download for a dropped uuid and clears its entry", async () => {
+    const payload = Buffer.alloc(1024 * 32, 0x42);
+    let serverHits = 0;
+    ({ srv: server, url: baseUrl } = await makeServer((req, res) => {
+      serverHits++;
+      if (req.method === "HEAD") {
+        res.writeHead(200, { "Content-Length": payload.length, "Accept-Ranges": "bytes" });
+        return res.end();
+      }
+      res.writeHead(200, { "Content-Type": "audio/mpeg", "Content-Length": payload.length });
+      res.write(payload.slice(0, 1024));
+    }));
+
+    const events = [];
+    const mgr = new DownloadManager({ cacheDir: tmp, concurrency: 1, onEvent: (e) => events.push(e) });
+    mgr.ensure({ uuid: "drop-active", url: `${baseUrl}/ep.mp3`, ext: "mp3" });
+
+    await new Promise((r) => setTimeout(r, 150));
+    expect(mgr.list().some((e) => e.uuid === "drop-active" && e.state === "downloading")).toBe(true);
+
+    mgr.reconcile(new Set([]));
+
+    await new Promise((r) => setTimeout(r, 200));
+    expect(mgr.list().some((e) => e.uuid === "drop-active")).toBe(false);
+    expect(fs.existsSync(path.join(tmp, "drop-active.mp3"))).toBe(false);
+    expect(fs.existsSync(path.join(tmp, "drop-active.mp3.part"))).toBe(false);
+  });
+
+  it("reconcile leaves non-uuid files alone (doesn't nuke unrelated files in the cache dir)", async () => {
+    const mgr = new DownloadManager({ cacheDir: tmp, concurrency: 1, onEvent: () => {} });
+    fs.writeFileSync(path.join(tmp, "README.txt"), "hello");
+    fs.mkdirSync(path.join(tmp, "subfolder"));
+    fs.writeFileSync(path.join(tmp, "something.mp3"), "looks like ours but uuid could be anything");
+
+    mgr.reconcile(new Set(["keeper"]));
+
+    expect(fs.existsSync(path.join(tmp, "README.txt"))).toBe(true);
+    expect(fs.existsSync(path.join(tmp, "subfolder"))).toBe(true);
+    expect(fs.existsSync(path.join(tmp, "something.mp3"))).toBe(false);
   });
 
   it("aborts mid-stream and preserves the .part file so the next call can resume", async () => {
