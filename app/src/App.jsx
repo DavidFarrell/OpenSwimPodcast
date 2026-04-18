@@ -6,6 +6,7 @@ import { TodayScreen } from "./TodayScreen.jsx";
 import { SyncScreen, MountDialog } from "./SyncScreen.jsx";
 import { upNext as mockUpNext, onDevice, deviceCapacityMB } from "./data.js";
 import { adaptUpNext, enrichFromPodcastFull } from "./pocketcastsAdapter.js";
+import { useDownloads } from "./useDownloads.js";
 
 const pc = () => (typeof window !== "undefined" && window.openswim && window.openswim.pocketcasts) || null;
 
@@ -20,6 +21,7 @@ export default function App() {
   const [items, setItems] = useState([]);
   const [feedState, setFeedState] = useState("idle");
   const [feedError, setFeedError] = useState(null);
+  const { byUuid: downloadByUuid, ensure: ensureDownload } = useDownloads();
 
   useEffect(() => { localStorage.setItem("os_route", route); }, [route]);
 
@@ -77,6 +79,18 @@ export default function App() {
       setSelected(items.slice(0, 7).map((x) => x.id));
     }
   }, [connected, items]);
+
+  useEffect(() => {
+    if (route !== "today") return;
+    for (const id of order) {
+      const it = items.find((x) => x.id === id);
+      if (!it || !it.url || !it.uuid) continue;
+      const state = downloadByUuid[it.uuid];
+      if (!state || state.state === "error" || state.state === "cancelled") {
+        ensureDownload(it.uuid, it.url);
+      }
+    }
+  }, [route, order, items]);
 
   useEffect(() => {
     setOrder((prev) => {
@@ -145,7 +159,8 @@ export default function App() {
                 order={order} setOrder={setOrder}
                 goSync={() => { setSyncArmed(true); setRouteRaw("syncing"); }}
                 goUpNext={() => setRoute("up-next")}
-                deviceCapacityMB={deviceCapacityMB} />
+                deviceCapacityMB={deviceCapacityMB}
+                downloadByUuid={downloadByUuid} />
             )}
             {route === "syncing" && (
               <SyncScreen items={items} order={order} onDevice={onDevice}

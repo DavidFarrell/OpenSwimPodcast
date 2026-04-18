@@ -14,4 +14,14 @@ contextBridge.exposeInMainWorld("openswim", {
     history: () => invoke("pc:history"),
     podcastFull: (uuid) => invoke("pc:podcastFull", uuid),
   },
+  downloads: {
+    ensure: (uuid, url, ext) => invoke("downloads:ensure", { uuid, url, ext }),
+    cancel: (uuid) => invoke("downloads:cancel", uuid),
+    list: () => invoke("downloads:list"),
+    onProgress: (cb) => {
+      const listener = (_e, evt) => cb(evt);
+      ipcRenderer.on("downloads:progress", listener);
+      return () => ipcRenderer.removeListener("downloads:progress", listener);
+    },
+  },
 });

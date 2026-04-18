@@ -11,8 +11,31 @@ export function fnameFor(show, slot, ext = "mp3") {
   return `${String(slot).padStart(2, "0")}_${slugShow(show)}.${ext}`;
 }
 
+function DownloadBadge({ state }) {
+  if (!state) return null;
+  const { state: s, bytes = 0, total } = state;
+  if (s === "ready") {
+    return <span style={{ marginLeft: 8, color: "var(--ct-tea)", fontSize: 10 }}>✓ cached</span>;
+  }
+  if (s === "error") {
+    return <span style={{ marginLeft: 8, color: "var(--ct-error)", fontSize: 10 }}>✗ error</span>;
+  }
+  if (s === "cancelled") {
+    return <span style={{ marginLeft: 8, color: "var(--fg-muted)", fontSize: 10 }}>cancelled</span>;
+  }
+  const pct = total ? Math.min(100, Math.round((bytes / total) * 100)) : 0;
+  return (
+    <span style={{ marginLeft: 8, display: "inline-flex", alignItems: "center", gap: 6 }}>
+      <span style={{ width: 40, height: 3, background: "var(--rule)", position: "relative", display: "inline-block" }}>
+        <span style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${pct}%`, background: "var(--ct-amber)" }} />
+      </span>
+      <span style={{ color: "var(--ct-amber)", fontSize: 10 }}>{s === "queued" ? "queued" : `${pct}%`}</span>
+    </span>
+  );
+}
+
 export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
-  goSync, goUpNext, deviceCapacityMB }) {
+  goSync, goUpNext, deviceCapacityMB, downloadByUuid = {} }) {
 
   const queue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
   const totalMin = queue.reduce((s, x) => s + x.durMin, 0);
@@ -151,7 +174,10 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
               <div style={{ fontFamily: "var(--font-mono)", fontSize: 11,
                 color: "var(--fg-dim)", textAlign: "right" }}>{it.dur}</div>
               <div style={{ fontFamily: "var(--font-mono)", fontSize: 11,
-                color: "var(--fg-muted)", textAlign: "right" }}>{it.size}</div>
+                color: "var(--fg-muted)", textAlign: "right" }}>
+                {it.size}
+                <DownloadBadge state={downloadByUuid[it.uuid]} />
+              </div>
               <div style={{ display: "flex", gap: 2, justifyContent: "flex-end" }}>
                 <button className="ct-btn ct-btn--ghost ct-btn--sm" onClick={() => remove(it.id)}
                   style={{ color: "var(--destructive)" }} title="remove">✕</button>
