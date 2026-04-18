@@ -45,7 +45,8 @@ export default function App() {
   if (!connected) {
     return (
       <div style={{ width: "100%", height: "100%", boxSizing: "border-box" }}>
-        <Window title="openswim · sign in">
+        <Window>
+          <div className="os-titlebar" />
           <LoginScreen onConnect={() => setConnected(true)} />
         </Window>
       </div>
@@ -54,7 +55,8 @@ export default function App() {
 
   return (
     <div style={{ width: "100%", height: "100%", boxSizing: "border-box" }}>
-      <Window title={`openswim · ${route}`}>
+      <Window>
+        <div className="os-titlebar" />
         <div style={{ flex: 1, display: "flex", minHeight: 0, position: "relative" }}>
           <Sidebar route={route} setRoute={setRoute} todayCount={selected.length}
             mountState={mountState} setShowMountDialog={setShowMountDialog} />

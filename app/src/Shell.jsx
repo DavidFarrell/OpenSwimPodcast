@@ -1,17 +1,8 @@
 import { MountPill } from "./Atoms.jsx";
 
-export function Window({ title, children, badge }) {
+export function Window({ children }) {
   return (
     <div className="ct-window" style={{ width: "100%", height: "100%" }}>
-      <div className="ct-window__chrome">
-        <div className="ct-window__dots">
-          <div className="ct-window__dot ct-window__dot--r"></div>
-          <div className="ct-window__dot ct-window__dot--y"></div>
-          <div className="ct-window__dot ct-window__dot--g"></div>
-        </div>
-        <div className="ct-window__title">{title}</div>
-        <div style={{ width: 54 }}>{badge}</div>
-      </div>
       <div className="ct-window__body">{children}</div>
     </div>
   );

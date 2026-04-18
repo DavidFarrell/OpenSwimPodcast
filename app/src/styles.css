@@ -48,10 +48,9 @@
   --radius:0;--stroke:1px;--dur-fast:100ms;--dur-base:160ms;--dur-slow:280ms;--ease:cubic-bezier(.2,.8,.2,1);
   --row-h:44px;--row-pad-y:11px;--row-pad-x:16px;--thumb-sz:28px;--chrome-h:30px;
 }
-html,body{margin:0;padding:0;height:100%;background:#08050400;}
-body.openswim{background:#0a0605;color:var(--fg);font-family:var(--font-sans);font-size:var(--fs-body);line-height:var(--lh-body);-webkit-font-smoothing:antialiased;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;overflow:auto;}
-#root{width:1120px;height:720px;max-width:100%;flex-shrink:0;}
-@media (max-height: 760px){ body.openswim{align-items:flex-start;} }
+html,body{margin:0;padding:0;height:100%;background:var(--ct-coffee-ink);overflow:hidden;}
+body.openswim{background:var(--ct-coffee-ink);color:var(--fg);font-family:var(--font-sans);font-size:var(--fs-body);line-height:var(--lh-body);-webkit-font-smoothing:antialiased;}
+#root{width:100vw;height:100vh;}
 .openswim *{box-sizing:border-box}
 ::selection{background:var(--ct-amber);color:var(--ct-coffee-ink)}
 .openswim ::-webkit-scrollbar{width:10px;height:10px}
@@ -127,16 +126,12 @@ body.openswim{background:#0a0605;color:var(--fg);font-family:var(--font-sans);fo
 .ct-progress{height:2px;background:var(--rule);position:relative;overflow:hidden}
 .ct-progress__fill{height:100%;background:var(--accent);transition:width var(--dur-slow) var(--ease)}
 
-/* Window */
-.ct-window{background:var(--ct-coffee-ink);display:flex;flex-direction:column;box-shadow:0 30px 80px rgba(0,0,0,.5),0 8px 20px rgba(0,0,0,.3);border:1px solid var(--ct-coffee-mid)}
-.ct-window__chrome{height:var(--chrome-h);display:flex;align-items:center;padding:0 12px;background:#0F0807;border-bottom:1px solid var(--rule);user-select:none;flex-shrink:0}
-.ct-window__dots{display:flex;gap:6px}
-.ct-window__dot{width:10px;height:10px;border-radius:50%}
-.ct-window__dot--r{background:#FF5F57}
-.ct-window__dot--y{background:#FEBC2E}
-.ct-window__dot--g{background:#28C840}
-.ct-window__title{flex:1;text-align:center;font-family:var(--font-mono);font-size:var(--fs-caption);color:var(--fg-muted);letter-spacing:.3px}
+/* Window (host chrome comes from the OS; this is just the body frame) */
+.ct-window{background:var(--ct-coffee-ink);display:flex;flex-direction:column;height:100%}
 .ct-window__body{flex:1;overflow:hidden;background:var(--bg);display:flex;flex-direction:column;min-height:0}
+/* Draggable titlebar strip along the top edge of the sidebar - houses macOS traffic lights */
+.os-titlebar{-webkit-app-region:drag;height:28px;flex-shrink:0}
+.os-titlebar *, .ct-btn, button, input, [role=button]{-webkit-app-region:no-drag}
 
 /* Toolbar */
 .ct-toolbar{display:flex;align-items:flex-end;justify-content:space-between;padding:20px var(--sp-5) 14px;border-bottom:1px solid var(--rule);gap:16px}
