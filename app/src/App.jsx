@@ -63,24 +63,24 @@ export default function App() {
         .filter((it) => !it.durMin || !it.sizeMB)
         .map((it) => it.podcastUuid)
         .filter(Boolean))];
-      let enriched = base;
-      for (const puuid of missingPodcastUuids.slice(0, 20)) {
-        const r = await api.podcastFull(puuid);
-        if (cancelled) return;
-        if (r.ok && r.data.podcast) {
-          enriched = enrichFromPodcastFull(enriched, r.data);
-          setItems(enriched);
+      const CONCURRENCY = 6;
+      const queueP = [...missingPodcastUuids];
+      let working = base;
+      const worker = async () => {
+        while (queueP.length && !cancelled) {
+          const puuid = queueP.shift();
+          const r = await api.podcastFull(puuid);
+          if (cancelled) return;
+          if (r.ok && r.data.podcast) {
+            working = enrichFromPodcastFull(working, r.data);
+            setItems(working);
+          }
         }
-      }
+      };
+      await Promise.all(Array.from({ length: CONCURRENCY }, worker));
     })();
     return () => { cancelled = true; };
   }, [connected]);
-
-  useEffect(() => {
-    if (connected && items.length && !selected.length) {
-      setSelected(items.slice(0, 7).map((x) => x.id));
-    }
-  }, [connected, items]);
 
   useEffect(() => {
     if (route !== "today") return;

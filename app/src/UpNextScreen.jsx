@@ -15,19 +15,21 @@ export function UpNextScreen({ items, selected, setSelected, goToday, onDeviceId
 
   const toggle = (id) => setSelected((s) => s.includes(id) ? s.filter((x) => x !== id) : [...s, id]);
 
-  const totalSelMin = selected.reduce((s, id) => {
-    const it = items.find((x) => x.id === id); return s + (it ? it.durMin : 0);
-  }, 0);
-  const totalSelMB = selected.reduce((s, id) => {
-    const it = items.find((x) => x.id === id); return s + (it ? it.sizeMB : 0);
-  }, 0);
+  const selectedItems = selected.map((id) => items.find((x) => x.id === id)).filter(Boolean);
+  const knownItems = selectedItems.filter((it) => it.durMin > 0 || it.sizeMB > 0);
+  const unknownCount = selectedItems.length - knownItems.length;
+  const totalSelMin = knownItems.reduce((s, it) => s + it.durMin, 0);
+  const totalSelMB = knownItems.reduce((s, it) => s + it.sizeMB, 0);
   const totalHM = `${Math.floor(totalSelMin / 60)}h ${Math.floor(totalSelMin % 60)}m`;
+  const pendingNote = unknownCount ? ` (+${unknownCount} pending)` : "";
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
       <Toolbar
         label={`Up Next · ${items.length} episodes`}
-        title={selected.length ? `${selected.length} selected · ${totalHM} · ${totalSelMB.toFixed(1)}MB` : "Pick what you want on the headset today."}
+        title={selected.length
+          ? `${selected.length} selected · ${totalHM} · ${totalSelMB.toFixed(1)}MB${pendingNote}`
+          : "Pick what you want on the headset today."}
         actions={<>
           <Btn variant="secondary" onClick={() => setSelected([])} disabled={!selected.length}>Clear</Btn>
           <Btn variant="primary" onClick={goToday} disabled={!selected.length}>

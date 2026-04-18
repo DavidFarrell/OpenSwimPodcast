@@ -40,7 +40,7 @@ export function LoginScreen({ onConnect }) {
           borderRadius: "50%", background: "var(--ct-amber)",
           boxShadow: "0 0 0 3px rgba(232,180,79,.15)" }}></span>
       </div>
-      <div className="ct-hero" style={{ textAlign: "center" }}>OpenSwim Podcast.</div>
+      <div className="ct-hero" style={{ textAlign: "center" }}>Open Swimcast.</div>
       <div className="ct-hero" style={{ textAlign: "center", opacity: .55, fontWeight: 300 }}>Sign in to Pocket Casts.</div>
 
       <div style={{ width: 440, marginTop: 38 }}>

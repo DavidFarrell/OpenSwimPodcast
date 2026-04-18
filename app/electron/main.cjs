@@ -1,5 +1,8 @@
 const { app, BrowserWindow, shell } = require("electron");
 const path = require("node:path");
+
+app.setPath("userData", path.join(app.getPath("appData"), "openswim-podcast"));
+
 const { registerPocketCasts } = require("./ipc.cjs");
 
 const isDev = !app.isPackaged;
@@ -12,6 +15,7 @@ function createWindow() {
     minHeight: 560,
     titleBarStyle: "hiddenInset",
     backgroundColor: "#1C110E",
+    icon: path.join(__dirname, "..", "public", "icon.png"),
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,

@@ -12,9 +12,9 @@ function Wordmark() {
   return (
     <div style={{ display: "flex", alignItems: "baseline", fontFamily: "var(--font-sans)",
       fontWeight: 600, fontSize: 15, letterSpacing: "-0.3px", color: "var(--fg)", lineHeight: 1 }}>
-      <span>OpenSwim</span>
+      <span>Open</span>
       <span style={{ color: "var(--ct-amber)", margin: "0 4px", fontSize: 12 }}>·</span>
-      <span style={{ color: "var(--fg-dim)", fontWeight: 400 }}>Podcast</span>
+      <span style={{ color: "var(--fg-dim)", fontWeight: 400 }}>Swimcast</span>
     </div>
   );
 }

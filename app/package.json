@@ -29,7 +29,7 @@
   },
   "build": {
     "appId": "com.paidia.openswim-podcast",
-    "productName": "OpenSwim Podcast",
+    "productName": "Open Swimcast",
     "files": [
       "electron/**",
       "dist/**",
@@ -43,7 +43,8 @@
     },
     "mac": {
       "category": "public.app-category.music",
-      "target": "dmg"
+      "target": "dmg",
+      "icon": "public/icon.icns"
     }
   }
 }
