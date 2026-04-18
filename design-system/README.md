@@ -24,10 +24,7 @@ syncs Pocket Casts episodes to a Shokz OpenSwim Pro.
 ## Quick start
 
 ```html
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
-
+<link rel="stylesheet" href="design-system/fonts/fonts.css">
 <link rel="stylesheet" href="design-system/tokens.css">
 <link rel="stylesheet" href="design-system/components.css">
 
@@ -35,6 +32,8 @@ syncs Pocket Casts episodes to a Shokz OpenSwim Pro.
   <button class="ct-btn ct-btn--cta">Sync 7 episodes</button>
 </body>
 ```
+
+Fonts are self-hosted in `design-system/fonts/` (variable woff2, latin + latin-ext subsets). No external CDN needed.
 
 The `openswim` class on `<body>` applies the base font, color, and background.
 
