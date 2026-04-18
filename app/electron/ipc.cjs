@@ -2,12 +2,34 @@ const { ipcMain, app, BrowserWindow } = require("electron");
 const path = require("node:path");
 const pc = require("./pocketcasts.cjs");
 const { DownloadManager } = require("./downloader.cjs");
+const { createDeviceWatcher } = require("./device.cjs");
 
 function serializeError(e) {
   return { message: e.message || String(e), code: e.code, status: e.status };
 }
 
 let manager = null;
+let watcher = null;
+
+function broadcast(channel, payload) {
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) w.webContents.send(channel, payload);
+  }
+}
+
+function getWatcher() {
+  if (watcher) return watcher;
+  watcher = createDeviceWatcher({
+    volumesRoot: "/Volumes",
+    labelPattern: /^openswim/i,
+    markerFile: ".openswim-podcast",
+    pollMs: 2000,
+    debounceMs: 200,
+  });
+  watcher.on((state) => broadcast("device:state", state));
+  watcher.start();
+  return watcher;
+}
 
 function getManager() {
   if (manager) return manager;
@@ -16,9 +38,7 @@ function getManager() {
     cacheDir,
     concurrency: 2,
     onEvent: (evt) => {
-      for (const w of BrowserWindow.getAllWindows()) {
-        if (!w.isDestroyed()) w.webContents.send("downloads:progress", evt);
-      }
+      broadcast("downloads:progress", evt);
     },
   });
   return manager;
@@ -49,6 +69,11 @@ function registerAll() {
     },
     "downloads:cancel": (_, uuid) => getManager().cancel(uuid),
     "downloads:list": () => getManager().list(),
+
+    "device:current": () => getWatcher().current(),
+    "device:listVolumes": () => getWatcher().listVolumes(),
+    "device:claim": (_, path) => getWatcher().claim(path),
+    "device:eject": (_, path) => getWatcher().eject(path),
   };
   for (const [ch, fn] of Object.entries(handlers)) {
     ipcMain.handle(ch, async (ev, arg) => {

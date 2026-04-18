@@ -63,7 +63,7 @@ export function CoverArt({ show, size = 28 }) {
 
 export function MountPill({ state = "mounted", label, free, onClick }) {
   const labels = {
-    mounted: ["OpenSwim Pro", `${free || "6.2GB"} free`],
+    mounted: ["OpenSwim Pro", free ? `${free} free` : "mounted"],
     busy: ["OpenSwim Pro", "syncing…"],
     unmounted: ["No device", "plug in to sync"],
     warning: ["OpenSwim Pro", label || "low space"],

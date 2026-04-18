@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Btn, CoverArt, Progress } from "./Atoms.jsx";
 import { Toolbar } from "./Shell.jsx";
 import { fnameFor } from "./TodayScreen.jsx";
+import { formatMB } from "./useDevice.js";
 
 const STAGES = [
   { id: "finalise", label: "Finalise order", detail: "locking slot numbers" },
@@ -295,13 +296,113 @@ function SuccessScreen({ queue, totalMB, onDone, videoCount, removed }) {
   );
 }
 
-export function MountDialog({ state, free, used, onClose, onForce }) {
+export function VolumePicker({ onClose, onPicked }) {
+  const [vols, setVols] = useState(null);
+  const [error, setError] = useState(null);
+  const [claiming, setClaiming] = useState(null);
+
+  const refresh = async () => {
+    const api = window.openswim && window.openswim.device;
+    if (!api) { setError("device bridge unavailable"); return; }
+    const r = await api.listVolumes();
+    if (r.ok) setVols(r.data); else setError(r.error?.message || "failed to list volumes");
+  };
+
+  useEffect(() => { refresh(); }, []);
+
+  const pick = async (v) => {
+    setClaiming(v.path);
+    const api = window.openswim.device;
+    const r = await api.claim(v.path);
+    setClaiming(null);
+    if (r.ok) { onPicked && onPicked(v); onClose && onClose(); }
+    else setError(r.error?.message || "couldn't claim volume");
+  };
+
+  return (
+    <div className="ct-overlay" onClick={onClose}>
+      <div className="ct-dialog" onClick={(e) => e.stopPropagation()} style={{ minWidth: 460 }}>
+        <div className="ct-dialog__head">
+          <div>
+            <div className="ct-label">Pick your OpenSwim</div>
+            <div className="ct-subhead" style={{ marginTop: 4 }}>Which volume is it?</div>
+          </div>
+          <div onClick={refresh} style={{ cursor: "pointer", fontFamily: "var(--font-mono)", fontSize: 10,
+            color: "var(--fg-muted)", letterSpacing: "1.2px" }}>REFRESH</div>
+        </div>
+        <div className="ct-dialog__body">
+          {error && <div className="ct-meta" style={{ color: "var(--ct-error)", marginBottom: 8 }}>✗ {error}</div>}
+          {vols === null && <div className="ct-meta" style={{ color: "var(--fg-muted)" }}>scanning /Volumes…</div>}
+          {vols && vols.length === 0 && (
+            <div className="ct-meta" style={{ color: "var(--fg-muted)" }}>
+              no volumes found. plug in the OpenSwim and hit REFRESH.
+            </div>
+          )}
+          {vols && vols.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              {vols.map((v) => (
+                <div key={v.path}
+                  onClick={() => pick(v)}
+                  style={{
+                    display: "grid", gridTemplateColumns: "1fr auto auto",
+                    alignItems: "center", gap: 14, padding: "10px 12px",
+                    cursor: claiming ? "wait" : "pointer",
+                    border: "1px solid var(--rule)",
+                    background: v.matches ? "var(--ct-tea-ghost)" : "transparent",
+                    opacity: claiming && claiming !== v.path ? 0.4 : 1,
+                  }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ color: "var(--fg)", fontSize: 13 }}>
+                      {v.label}
+                      {v.matches && <span style={{ marginLeft: 8, color: "var(--ct-tea)", fontSize: 10 }}>· detected</span>}
+                    </div>
+                    <div className="ct-meta" style={{ color: "var(--fg-muted)", marginTop: 2 }}>{v.path}</div>
+                  </div>
+                  <div className="ct-meta" style={{ color: "var(--fg-dim)", fontFamily: "var(--font-mono)" }}>
+                    {v.capacityMB != null ? formatMB(v.capacityMB) : "—"}
+                  </div>
+                  <div className="ct-meta" style={{ color: "var(--fg-muted)", fontFamily: "var(--font-mono)" }}>
+                    {v.freeMB != null ? `${formatMB(v.freeMB)} free` : ""}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="ct-meta" style={{ color: "var(--fg-muted)", marginTop: 14 }}>
+            Picking a volume writes <code>.openswim-podcast</code> to its root so we recognise it next time.
+          </div>
+        </div>
+        <div className="ct-dialog__actions">
+          <Btn variant="ghost" onClick={onClose}>cancel</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function MountDialog({ state, free, used, path, onClose, onForce }) {
+  const pathLabel = path || (state === "unmounted" ? "(not mounted)" : "/Volumes/OPENSWIM");
+  const [ejecting, setEjecting] = useState(false);
+  const [error, setError] = useState(null);
+
+  const doEject = async () => {
+    setError(null);
+    const api = window.openswim && window.openswim.device;
+    if (!api) { setError("device bridge unavailable"); return; }
+    if (!path) { setError("no device path"); return; }
+    setEjecting(true);
+    const r = await api.eject(path);
+    setEjecting(false);
+    if (r.ok) onClose && onClose();
+    else setError(r.error?.message || "eject failed");
+  };
+
   return (
     <div className="ct-overlay" onClick={onClose}>
       <div className="ct-dialog" onClick={(e) => e.stopPropagation()}>
         <div className="ct-dialog__head">
           <div>
-            <div className="ct-label">OpenSwim Pro · /Volumes/OPENSWIM</div>
+            <div className="ct-label">OpenSwim Pro · {pathLabel}</div>
             <div className="ct-subhead" style={{ marginTop: 4 }}>Eject device</div>
           </div>
           <div style={{ width: 8, height: 8, borderRadius: "50%",
@@ -321,11 +422,18 @@ export function MountDialog({ state, free, used, onClose, onForce }) {
           <div className="ct-meta" style={{ color: state === "busy" ? "var(--ct-amber)" : "var(--fg-dim)" }}>
             {state === "busy" ? "⚠ writing files — force eject will corrupt the last transfer." : "safe to eject · no pending writes."}
           </div>
+          {error && (
+            <div className="ct-meta" style={{ color: "var(--ct-error)", marginTop: 10, whiteSpace: "pre-wrap" }}>
+              ✗ {error}
+            </div>
+          )}
         </div>
         <div className="ct-dialog__actions">
-          <Btn variant="ghost" onClick={onClose}>cancel</Btn>
-          {state === "busy" && <Btn variant="destructive" onClick={onForce}>Force eject</Btn>}
-          <Btn variant="primary" onClick={onClose} disabled={state === "busy"}>Eject</Btn>
+          <Btn variant="ghost" onClick={onClose} disabled={ejecting}>cancel</Btn>
+          {state === "busy" && <Btn variant="destructive" onClick={onForce} disabled={ejecting}>Force eject</Btn>}
+          <Btn variant="primary" onClick={doEject} disabled={state === "busy" || ejecting}>
+            {ejecting ? "Ejecting…" : "Eject"}
+          </Btn>
         </div>
       </div>
     </div>

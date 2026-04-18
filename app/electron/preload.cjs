@@ -24,4 +24,15 @@ contextBridge.exposeInMainWorld("openswim", {
       return () => ipcRenderer.removeListener("downloads:progress", listener);
     },
   },
+  device: {
+    current: () => invoke("device:current"),
+    listVolumes: () => invoke("device:listVolumes"),
+    claim: (path) => invoke("device:claim", path),
+    eject: (path) => invoke("device:eject", path),
+    onChange: (cb) => {
+      const listener = (_e, state) => cb(state);
+      ipcRenderer.on("device:state", listener);
+      return () => ipcRenderer.removeListener("device:state", listener);
+    },
+  },
 });

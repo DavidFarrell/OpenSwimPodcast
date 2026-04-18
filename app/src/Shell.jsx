@@ -19,7 +19,7 @@ function Wordmark() {
   );
 }
 
-export function Sidebar({ route, setRoute, todayCount, mountState, setShowMountDialog, onLogout }) {
+export function Sidebar({ route, setRoute, todayCount, mountState, mountFree, setShowMountDialog, onLogout }) {
   const items = [
     { id: "up-next", label: "Up Next", meta: "POCKET CASTS" },
     { id: "today", label: "Today", meta: todayCount ? `${todayCount} QUEUED` : "QUEUE" },
@@ -54,7 +54,7 @@ export function Sidebar({ route, setRoute, todayCount, mountState, setShowMountD
         })}
       </nav>
       <div style={{ padding: "14px 14px 16px", borderTop: "1px solid var(--rule)" }}>
-        <MountPill state={mountState} onClick={() => setShowMountDialog && setShowMountDialog(true)} />
+        <MountPill state={mountState} free={mountFree} onClick={() => setShowMountDialog && setShowMountDialog(true)} />
         {onLogout && (
           <div onClick={onLogout} style={{ marginTop: 10, cursor: "pointer",
             fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--fg-muted)",
