@@ -1,5 +1,6 @@
 const { app, BrowserWindow, shell } = require("electron");
 const path = require("node:path");
+const { registerPocketCasts } = require("./ipc.cjs");
 
 const isDev = !app.isPackaged;
 
@@ -31,7 +32,10 @@ function createWindow() {
   }
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  registerPocketCasts();
+  createWindow();
+});
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();

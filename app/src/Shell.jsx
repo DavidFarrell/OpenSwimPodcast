@@ -19,7 +19,7 @@ function Wordmark() {
   );
 }
 
-export function Sidebar({ route, setRoute, todayCount, mountState, setShowMountDialog }) {
+export function Sidebar({ route, setRoute, todayCount, mountState, setShowMountDialog, onLogout }) {
   const items = [
     { id: "up-next", label: "Up Next", meta: "POCKET CASTS" },
     { id: "today", label: "Today", meta: todayCount ? `${todayCount} QUEUED` : "QUEUE" },
@@ -55,6 +55,13 @@ export function Sidebar({ route, setRoute, todayCount, mountState, setShowMountD
       </nav>
       <div style={{ padding: "14px 14px 16px", borderTop: "1px solid var(--rule)" }}>
         <MountPill state={mountState} onClick={() => setShowMountDialog && setShowMountDialog(true)} />
+        {onLogout && (
+          <div onClick={onLogout} style={{ marginTop: 10, cursor: "pointer",
+            fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--fg-muted)",
+            letterSpacing: "1.2px", textAlign: "center" }}>
+            SIGN OUT
+          </div>
+        )}
       </div>
     </aside>
   );

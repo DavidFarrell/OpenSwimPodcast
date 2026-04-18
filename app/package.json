@@ -9,7 +9,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "electron:dev": "concurrently -k -n vite,electron -c auto \"vite\" \"wait-on tcp:5173 && electron .\"",
-    "electron:build": "vite build && electron-builder"
+    "electron:build": "vite build && electron-builder",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -21,6 +23,7 @@
     "electron": "^41.2.1",
     "electron-builder": "^26.8.1",
     "vite": "^5.4.10",
+    "vitest": "^4.1.4",
     "wait-on": "^9.0.5"
   },
   "build": {
