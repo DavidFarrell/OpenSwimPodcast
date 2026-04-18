@@ -1,0 +1,132 @@
+/* ============================================================
+   OpenSwim Podcast — Design tokens
+   Variant: Workbench (flat, dense, hairline rules, amber accent)
+
+   Every visual decision in the app comes from one of these
+   variables. Never hard-code colors, sizes, or fonts elsewhere.
+   ============================================================ */
+
+:root {
+  /* ─── Palette ─────────────────────────────────────────── */
+  --ct-coffee:       #3E2723;  /* primary surface (app background)   */
+  --ct-coffee-deep:  #2A1A16;  /* inset surface (inputs, panels)     */
+  --ct-coffee-mid:   #4E342E;  /* striped texture, raised element    */
+  --ct-coffee-soft:  #5D3F39;  /* hover on coffee                    */
+  --ct-coffee-ink:   #1C110E;  /* window chrome, deepest shadow well */
+
+  --ct-tea:          #DDF4C9;  /* primary foreground, primary CTA    */
+  --ct-tea-dim:      rgba(221, 244, 201, 0.68); /* secondary text    */
+  --ct-tea-muted:    rgba(221, 244, 201, 0.42); /* tertiary / placeholder */
+  --ct-tea-faint:    rgba(221, 244, 201, 0.22); /* bordered button   */
+  --ct-tea-hair:     rgba(221, 244, 201, 0.12); /* hairline rules    */
+  --ct-tea-ghost:    rgba(221, 244, 201, 0.08); /* subtle fill       */
+
+  --ct-amber:        #E8B44F;  /* ACTIVE / IN-PROGRESS only          */
+  --ct-amber-dim:    rgba(232, 180, 79, 0.18);  /* amber tag bg      */
+
+  --ct-error:        #C96F4A;  /* reserved for destructive/failure   */
+
+  /* ─── Semantic aliases (use these in components) ──────── */
+  --bg:              var(--ct-coffee);
+  --bg-inset:        var(--ct-coffee-deep);
+  --fg:              var(--ct-tea);
+  --fg-dim:          var(--ct-tea-dim);
+  --fg-muted:        var(--ct-tea-muted);
+  --rule:            var(--ct-tea-hair);
+  --rule-strong:     var(--ct-tea-faint);
+  --accent:          var(--ct-amber);
+  --destructive:     var(--ct-error);
+
+  /* ─── Type ────────────────────────────────────────────── */
+  --font-sans: "Space Grotesk", ui-sans-serif, system-ui, -apple-system,
+               BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas,
+               "Liberation Mono", monospace;
+
+  /* Scale — 6 sizes, each with a clear role */
+  --fs-caption:  10px;   /* mono labels, tags                        */
+  --fs-meta:     11px;   /* mono metadata, sizes, timestamps         */
+  --fs-body:     13px;   /* default text                             */
+  --fs-title:    15px;   /* row titles                               */
+  --fs-subhead:  22px;   /* screen headings                          */
+  --fs-hero:     44px;   /* single hero moments (login, success)     */
+
+  /* Weights — keep Space Grotesk's character; rarely go bolder */
+  --fw-light:    300;
+  --fw-regular:  400;
+  --fw-medium:   500;  /* row titles, buttons */
+  --fw-semibold: 600;  /* headings, primary CTA */
+  --fw-bold:     700;  /* amber CTA only */
+
+  /* Tracking — tighten displays, open mono labels */
+  --tracking-hero:    -1.5px;
+  --tracking-subhead: -0.5px;
+  --tracking-mono:     1.5px;   /* caption/meta ALL-CAPS */
+
+  /* Line height */
+  --lh-tight:  1.0;
+  --lh-snug:   1.25;
+  --lh-body:   1.55;
+  --lh-loose:  1.9;
+
+  /* ─── Spacing scale (4-based) ─────────────────────────── */
+  --sp-1:   4px;
+  --sp-2:   8px;
+  --sp-3:   12px;
+  --sp-4:   16px;
+  --sp-5:   20px;
+  --sp-6:   24px;
+  --sp-7:   32px;
+  --sp-8:   48px;
+  --sp-9:   64px;
+
+  /* ─── Shape ──────────────────────────────────────────── */
+  --radius: 0;            /* Workbench is flat. Never use non-zero.  */
+
+  /* ─── Strokes ────────────────────────────────────────── */
+  --stroke: 1px;
+
+  /* ─── Motion ─────────────────────────────────────────── */
+  --dur-fast:  100ms;
+  --dur-base:  160ms;
+  --dur-slow:  280ms;
+  --ease:      cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  /* ─── Layout ─────────────────────────────────────────── */
+  --row-h:       44px;   /* dense list row target height             */
+  --row-pad-y:   11px;
+  --row-pad-x:   16px;
+  --thumb-sz:    28px;   /* striped neutral thumb on list rows       */
+  --chrome-h:    30px;   /* window chrome height                     */
+
+  /* ─── z-index tiers ──────────────────────────────────── */
+  --z-base:    1;
+  --z-sticky:  10;
+  --z-overlay: 100;
+  --z-modal:   1000;
+}
+
+/* ─── Global reset (scoped to app) ─────────────────────── */
+html, body { margin: 0; padding: 0; }
+body.openswim {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+.openswim * { box-sizing: border-box; }
+
+/* Selection */
+.openswim ::selection {
+  background: var(--ct-amber);
+  color: var(--ct-coffee-ink);
+}
+
+/* Scrollbars — narrow, tea-on-coffee */
+.openswim ::-webkit-scrollbar { width: 10px; height: 10px; }
+.openswim ::-webkit-scrollbar-track { background: transparent; }
+.openswim ::-webkit-scrollbar-thumb { background: var(--ct-tea-hair); }
+.openswim ::-webkit-scrollbar-thumb:hover { background: var(--ct-tea-faint); }

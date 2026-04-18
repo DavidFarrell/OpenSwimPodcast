@@ -1,0 +1,359 @@
+/* ============================================================
+   OpenSwim Podcast — Components
+   Workbench variant. All classnames are `ct-*` (café terminal).
+   Requires tokens.css to be loaded first.
+   ============================================================ */
+
+/* ─── Typography helpers ──────────────────────────────── */
+.ct-hero {
+  font-family: var(--font-sans);
+  font-size: var(--fs-hero);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--tracking-hero);
+  line-height: var(--lh-tight);
+}
+.ct-subhead {
+  font-family: var(--font-sans);
+  font-size: var(--fs-subhead);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--tracking-subhead);
+}
+.ct-title {
+  font-family: var(--font-sans);
+  font-size: var(--fs-title);
+  font-weight: var(--fw-medium);
+}
+.ct-body { font-size: var(--fs-body); }
+
+.ct-label {                         /* mono ALL-CAPS screen labels */
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  letter-spacing: var(--tracking-mono);
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.ct-meta {                          /* mono numeric/meta */
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  color: var(--fg-dim);
+}
+
+/* ─── Rules / dividers ────────────────────────────────── */
+.ct-rule      { height: 1px; background: var(--rule); width: 100%; }
+.ct-rule-strong { height: 1px; background: var(--rule-strong); width: 100%; }
+
+/* ─── Surface panels ──────────────────────────────────── */
+.ct-panel {
+  background: var(--bg);
+  border: var(--stroke) solid var(--rule);
+}
+.ct-panel--inset {
+  background: var(--bg-inset);
+  border: var(--stroke) solid var(--rule);
+}
+
+/* ─── Buttons ─────────────────────────────────────────── */
+.ct-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 9px 14px;
+  border: none;
+  border-radius: var(--radius);
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  font-weight: var(--fw-medium);
+  letter-spacing: 0.2px;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease),
+              color var(--dur-fast) var(--ease);
+  user-select: none;
+}
+.ct-btn:focus-visible {
+  outline: 2px solid var(--ct-amber);
+  outline-offset: 2px;
+}
+
+/* Primary — tea on coffee, common actions */
+.ct-btn--primary {
+  background: var(--ct-tea);
+  color: var(--ct-coffee);
+  font-weight: var(--fw-semibold);
+}
+.ct-btn--primary:hover { background: #EBFADB; }
+.ct-btn--primary:active { background: #C9E4B3; }
+
+/* Secondary — bordered */
+.ct-btn--secondary {
+  background: transparent;
+  color: var(--fg);
+  border: var(--stroke) solid var(--rule-strong);
+}
+.ct-btn--secondary:hover { background: var(--ct-tea-ghost); }
+
+/* CTA — amber, reserved for SYNC / start-an-action moments */
+.ct-btn--cta {
+  background: var(--ct-amber);
+  color: var(--ct-coffee-ink);
+  font-weight: var(--fw-bold);
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  padding: 11px 14px;
+}
+.ct-btn--cta:hover { background: #F1C36C; }
+
+/* Ghost / cancel */
+.ct-btn--ghost {
+  background: transparent;
+  color: var(--fg-muted);
+  padding: 9px 10px;
+}
+.ct-btn--ghost:hover { color: var(--fg-dim); }
+
+/* Destructive — terracotta. Rare. */
+.ct-btn--destructive {
+  background: transparent;
+  color: var(--destructive);
+  border: var(--stroke) solid var(--destructive);
+}
+.ct-btn--destructive:hover {
+  background: var(--destructive);
+  color: var(--ct-coffee-ink);
+}
+
+/* Size modifiers */
+.ct-btn--sm { padding: 7px 11px; font-size: var(--fs-meta); }
+.ct-btn--lg { padding: 13px 18px; font-size: var(--fs-title); }
+
+/* ─── Tags / chips ────────────────────────────────────── */
+.ct-tag {
+  display: inline-block;
+  padding: 3px 8px;
+  background: var(--ct-tea-hair);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  border-radius: var(--radius);
+}
+.ct-tag--active {                  /* DOWNLOADING — amber */
+  background: var(--ct-amber-dim);
+  color: var(--ct-amber);
+}
+.ct-tag--on-device {
+  background: rgba(221,244,201,0.18);
+  color: var(--fg);
+}
+.ct-tag--error {
+  color: var(--destructive);
+  background: rgba(201,111,74,0.16);
+}
+
+/* ─── Inputs ──────────────────────────────────────────── */
+.ct-input {
+  background: transparent;
+  color: var(--fg);
+  border: var(--stroke) solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 9px 12px;
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  width: 100%;
+  outline: none;
+  transition: border-color var(--dur-fast) var(--ease);
+}
+.ct-input::placeholder { color: var(--fg-muted); }
+.ct-input:focus { border-color: var(--ct-amber); }
+
+.ct-input-group {
+  display: flex; align-items: center; gap: var(--sp-2);
+  border: var(--stroke) solid var(--rule-strong);
+  padding: 9px 12px;
+}
+.ct-input-group input {
+  flex: 1; background: none; border: none; outline: none;
+  color: var(--fg); font-family: inherit; font-size: inherit;
+}
+.ct-input-group .ct-kbd { color: var(--fg-muted); }
+
+/* Keyboard hint */
+.ct-kbd {
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  color: var(--fg-muted);
+  letter-spacing: 0.5px;
+}
+
+/* ─── Toggle (flat rectangle) ─────────────────────────── */
+.ct-toggle {
+  display: inline-flex; align-items: center; gap: var(--sp-3);
+  cursor: pointer; user-select: none;
+}
+.ct-toggle__track {
+  width: 32px; height: 18px;
+  background: var(--ct-coffee-mid);
+  position: relative;
+  transition: background var(--dur-base) var(--ease);
+}
+.ct-toggle__thumb {
+  position: absolute; top: 2px; left: 2px;
+  width: 14px; height: 14px;
+  background: var(--ct-tea-muted);
+  transition: transform var(--dur-base) var(--ease),
+              background var(--dur-base) var(--ease);
+}
+.ct-toggle[aria-checked="true"] .ct-toggle__track { background: var(--ct-tea); }
+.ct-toggle[aria-checked="true"] .ct-toggle__thumb {
+  background: var(--ct-coffee-deep);
+  transform: translateX(14px);
+}
+
+/* ─── List row (dense Up Next / device queue) ─────────── */
+.ct-row {
+  display: grid;
+  grid-template-columns: 26px var(--thumb-sz) 1fr 70px 56px 14px;
+  gap: var(--sp-3);
+  padding: var(--row-pad-y) var(--row-pad-x);
+  align-items: center;
+  border-bottom: var(--stroke) solid var(--rule);
+  background: transparent;
+  transition: background var(--dur-fast) var(--ease);
+}
+.ct-row:hover { background: var(--ct-tea-ghost); }
+.ct-row[data-state="active"] {
+  background: rgba(232,180,79,0.06);
+}
+.ct-row[data-state="selected"] {
+  background: rgba(221,244,201,0.04);
+}
+.ct-row__n {
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  color: var(--fg-muted);
+}
+.ct-row__thumb {
+  width: var(--thumb-sz);
+  height: var(--thumb-sz);
+  background: repeating-linear-gradient(
+    45deg,
+    var(--ct-coffee-mid) 0 4px,
+    var(--ct-coffee-deep) 4px 8px
+  );
+}
+.ct-row__main { overflow: hidden; }
+.ct-row__title {
+  font-size: var(--fs-body);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ct-row__show {
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  color: var(--fg-muted);
+  letter-spacing: 0.3px;
+  text-transform: uppercase;      /* Workbench: ALLCAPS show names */
+  margin-top: 2px;
+}
+.ct-row__dur, .ct-row__size {
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  color: var(--fg-dim);
+  text-align: right;
+}
+.ct-row__size { color: var(--fg-muted); }
+.ct-row__dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--fg-muted);
+  justify-self: end;
+}
+.ct-row[data-state="active"]   .ct-row__dot { background: var(--accent); }
+.ct-row[data-state="done"]     .ct-row__dot { background: var(--fg); }
+.ct-row[data-state="selected"] .ct-row__dot { background: var(--fg); }
+
+/* ─── Progress bar ────────────────────────────────────── */
+.ct-progress {
+  height: 3px;                    /* Workbench is flat, so a thin bar */
+  background: var(--rule);
+  position: relative;
+  overflow: hidden;
+}
+.ct-progress__fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width var(--dur-slow) var(--ease);
+}
+
+/* ─── Window chrome (macOS-like) ──────────────────────── */
+.ct-window {
+  background: var(--ct-coffee-ink);
+  display: flex; flex-direction: column;
+  box-shadow: 0 30px 60px rgba(0,0,0,0.18), 0 8px 20px rgba(0,0,0,0.10);
+}
+.ct-window__chrome {
+  height: var(--chrome-h);
+  display: flex; align-items: center; padding: 0 12px;
+  background: #0F0807;
+  border-bottom: var(--stroke) solid var(--rule);
+  user-select: none;
+}
+.ct-window__dots { display: flex; gap: 6px; }
+.ct-window__dot { width: 10px; height: 10px; border-radius: 50%; }
+.ct-window__dot--r { background: #FF5F57; }
+.ct-window__dot--y { background: #FEBC2E; }
+.ct-window__dot--g { background: #28C840; }
+.ct-window__title {
+  flex: 1; text-align: center;
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  color: var(--fg-muted);
+  letter-spacing: 0.3px;
+}
+.ct-window__body { flex: 1; overflow: hidden; background: var(--bg); }
+
+/* ─── Toolbar ─────────────────────────────────────────── */
+.ct-toolbar {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  padding: 18px var(--sp-5) 14px;
+  border-bottom: var(--stroke) solid var(--rule);
+}
+.ct-toolbar__actions { display: flex; gap: var(--sp-2); }
+
+/* ─── Log lines (sync screen) ─────────────────────────── */
+.ct-log {
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-loose);
+}
+.ct-log__line--done    { color: var(--fg); opacity: 0.85; }
+.ct-log__line--active  { color: var(--accent); font-weight: var(--fw-semibold); }
+.ct-log__line--pending { color: var(--fg); opacity: 0.38; }
+
+/* ─── Keyframes ───────────────────────────────────────── */
+@keyframes ct-blink {
+  0%, 50%   { opacity: 1; }
+  51%, 100% { opacity: 0.35; }
+}
+.ct-cursor { animation: ct-blink 1s steps(1) infinite; }
+
+@keyframes ct-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+.ct-anim-in { animation: ct-fade-in var(--dur-base) var(--ease) both; }
+
+/* ─── Utilities ───────────────────────────────────────── */
+.ct-stack { display: flex; flex-direction: column; }
+.ct-row-x { display: flex; align-items: center; }
+.ct-grow  { flex: 1; }
+.ct-gap-1 { gap: var(--sp-1); }
+.ct-gap-2 { gap: var(--sp-2); }
+.ct-gap-3 { gap: var(--sp-3); }
+.ct-gap-4 { gap: var(--sp-4); }
+.ct-gap-6 { gap: var(--sp-6); }
+.ct-pad-5 { padding: var(--sp-5); }
+.ct-pad-6 { padding: var(--sp-6); }

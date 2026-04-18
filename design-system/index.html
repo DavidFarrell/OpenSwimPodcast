@@ -1,0 +1,807 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>OpenSwim Podcast — Design System (Workbench)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet" />
+<style>
+/* ============================================================
+   OpenSwim Podcast — Design tokens
+   Variant: Workbench (flat, dense, hairline rules, amber accent)
+
+   Every visual decision in the app comes from one of these
+   variables. Never hard-code colors, sizes, or fonts elsewhere.
+   ============================================================ */
+
+:root {
+  /* ─── Palette ─────────────────────────────────────────── */
+  --ct-coffee:       #3E2723;  /* primary surface (app background)   */
+  --ct-coffee-deep:  #2A1A16;  /* inset surface (inputs, panels)     */
+  --ct-coffee-mid:   #4E342E;  /* striped texture, raised element    */
+  --ct-coffee-soft:  #5D3F39;  /* hover on coffee                    */
+  --ct-coffee-ink:   #1C110E;  /* window chrome, deepest shadow well */
+
+  --ct-tea:          #DDF4C9;  /* primary foreground, primary CTA    */
+  --ct-tea-dim:      rgba(221, 244, 201, 0.68); /* secondary text    */
+  --ct-tea-muted:    rgba(221, 244, 201, 0.42); /* tertiary / placeholder */
+  --ct-tea-faint:    rgba(221, 244, 201, 0.22); /* bordered button   */
+  --ct-tea-hair:     rgba(221, 244, 201, 0.12); /* hairline rules    */
+  --ct-tea-ghost:    rgba(221, 244, 201, 0.08); /* subtle fill       */
+
+  --ct-amber:        #E8B44F;  /* ACTIVE / IN-PROGRESS only          */
+  --ct-amber-dim:    rgba(232, 180, 79, 0.18);  /* amber tag bg      */
+
+  --ct-error:        #C96F4A;  /* reserved for destructive/failure   */
+
+  /* ─── Semantic aliases (use these in components) ──────── */
+  --bg:              var(--ct-coffee);
+  --bg-inset:        var(--ct-coffee-deep);
+  --fg:              var(--ct-tea);
+  --fg-dim:          var(--ct-tea-dim);
+  --fg-muted:        var(--ct-tea-muted);
+  --rule:            var(--ct-tea-hair);
+  --rule-strong:     var(--ct-tea-faint);
+  --accent:          var(--ct-amber);
+  --destructive:     var(--ct-error);
+
+  /* ─── Type ────────────────────────────────────────────── */
+  --font-sans: "Space Grotesk", ui-sans-serif, system-ui, -apple-system,
+               BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas,
+               "Liberation Mono", monospace;
+
+  /* Scale — 6 sizes, each with a clear role */
+  --fs-caption:  10px;   /* mono labels, tags                        */
+  --fs-meta:     11px;   /* mono metadata, sizes, timestamps         */
+  --fs-body:     13px;   /* default text                             */
+  --fs-title:    15px;   /* row titles                               */
+  --fs-subhead:  22px;   /* screen headings                          */
+  --fs-hero:     44px;   /* single hero moments (login, success)     */
+
+  /* Weights — keep Space Grotesk's character; rarely go bolder */
+  --fw-light:    300;
+  --fw-regular:  400;
+  --fw-medium:   500;  /* row titles, buttons */
+  --fw-semibold: 600;  /* headings, primary CTA */
+  --fw-bold:     700;  /* amber CTA only */
+
+  /* Tracking — tighten displays, open mono labels */
+  --tracking-hero:    -1.5px;
+  --tracking-subhead: -0.5px;
+  --tracking-mono:     1.5px;   /* caption/meta ALL-CAPS */
+
+  /* Line height */
+  --lh-tight:  1.0;
+  --lh-snug:   1.25;
+  --lh-body:   1.55;
+  --lh-loose:  1.9;
+
+  /* ─── Spacing scale (4-based) ─────────────────────────── */
+  --sp-1:   4px;
+  --sp-2:   8px;
+  --sp-3:   12px;
+  --sp-4:   16px;
+  --sp-5:   20px;
+  --sp-6:   24px;
+  --sp-7:   32px;
+  --sp-8:   48px;
+  --sp-9:   64px;
+
+  /* ─── Shape ──────────────────────────────────────────── */
+  --radius: 0;            /* Workbench is flat. Never use non-zero.  */
+
+  /* ─── Strokes ────────────────────────────────────────── */
+  --stroke: 1px;
+
+  /* ─── Motion ─────────────────────────────────────────── */
+  --dur-fast:  100ms;
+  --dur-base:  160ms;
+  --dur-slow:  280ms;
+  --ease:      cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  /* ─── Layout ─────────────────────────────────────────── */
+  --row-h:       44px;   /* dense list row target height             */
+  --row-pad-y:   11px;
+  --row-pad-x:   16px;
+  --thumb-sz:    28px;   /* striped neutral thumb on list rows       */
+  --chrome-h:    30px;   /* window chrome height                     */
+
+  /* ─── z-index tiers ──────────────────────────────────── */
+  --z-base:    1;
+  --z-sticky:  10;
+  --z-overlay: 100;
+  --z-modal:   1000;
+}
+
+/* ─── Global reset (scoped to app) ─────────────────────── */
+html, body { margin: 0; padding: 0; }
+body.openswim {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+.openswim * { box-sizing: border-box; }
+
+/* Selection */
+.openswim ::selection {
+  background: var(--ct-amber);
+  color: var(--ct-coffee-ink);
+}
+
+/* Scrollbars — narrow, tea-on-coffee */
+.openswim ::-webkit-scrollbar { width: 10px; height: 10px; }
+.openswim ::-webkit-scrollbar-track { background: transparent; }
+.openswim ::-webkit-scrollbar-thumb { background: var(--ct-tea-hair); }
+.openswim ::-webkit-scrollbar-thumb:hover { background: var(--ct-tea-faint); }
+
+</style>
+<style>
+/* ============================================================
+   OpenSwim Podcast — Components
+   Workbench variant. All classnames are `ct-*` (café terminal).
+   Requires tokens.css to be loaded first.
+   ============================================================ */
+
+/* ─── Typography helpers ──────────────────────────────── */
+.ct-hero {
+  font-family: var(--font-sans);
+  font-size: var(--fs-hero);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--tracking-hero);
+  line-height: var(--lh-tight);
+}
+.ct-subhead {
+  font-family: var(--font-sans);
+  font-size: var(--fs-subhead);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--tracking-subhead);
+}
+.ct-title {
+  font-family: var(--font-sans);
+  font-size: var(--fs-title);
+  font-weight: var(--fw-medium);
+}
+.ct-body { font-size: var(--fs-body); }
+
+.ct-label {                         /* mono ALL-CAPS screen labels */
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  letter-spacing: var(--tracking-mono);
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.ct-meta {                          /* mono numeric/meta */
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  color: var(--fg-dim);
+}
+
+/* ─── Rules / dividers ────────────────────────────────── */
+.ct-rule      { height: 1px; background: var(--rule); width: 100%; }
+.ct-rule-strong { height: 1px; background: var(--rule-strong); width: 100%; }
+
+/* ─── Surface panels ──────────────────────────────────── */
+.ct-panel {
+  background: var(--bg);
+  border: var(--stroke) solid var(--rule);
+}
+.ct-panel--inset {
+  background: var(--bg-inset);
+  border: var(--stroke) solid var(--rule);
+}
+
+/* ─── Buttons ─────────────────────────────────────────── */
+.ct-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 9px 14px;
+  border: none;
+  border-radius: var(--radius);
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  font-weight: var(--fw-medium);
+  letter-spacing: 0.2px;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease),
+              color var(--dur-fast) var(--ease);
+  user-select: none;
+}
+.ct-btn:focus-visible {
+  outline: 2px solid var(--ct-amber);
+  outline-offset: 2px;
+}
+
+/* Primary — tea on coffee, common actions */
+.ct-btn--primary {
+  background: var(--ct-tea);
+  color: var(--ct-coffee);
+  font-weight: var(--fw-semibold);
+}
+.ct-btn--primary:hover { background: #EBFADB; }
+.ct-btn--primary:active { background: #C9E4B3; }
+
+/* Secondary — bordered */
+.ct-btn--secondary {
+  background: transparent;
+  color: var(--fg);
+  border: var(--stroke) solid var(--rule-strong);
+}
+.ct-btn--secondary:hover { background: var(--ct-tea-ghost); }
+
+/* CTA — amber, reserved for SYNC / start-an-action moments */
+.ct-btn--cta {
+  background: var(--ct-amber);
+  color: var(--ct-coffee-ink);
+  font-weight: var(--fw-bold);
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  padding: 11px 14px;
+}
+.ct-btn--cta:hover { background: #F1C36C; }
+
+/* Ghost / cancel */
+.ct-btn--ghost {
+  background: transparent;
+  color: var(--fg-muted);
+  padding: 9px 10px;
+}
+.ct-btn--ghost:hover { color: var(--fg-dim); }
+
+/* Destructive — terracotta. Rare. */
+.ct-btn--destructive {
+  background: transparent;
+  color: var(--destructive);
+  border: var(--stroke) solid var(--destructive);
+}
+.ct-btn--destructive:hover {
+  background: var(--destructive);
+  color: var(--ct-coffee-ink);
+}
+
+/* Size modifiers */
+.ct-btn--sm { padding: 7px 11px; font-size: var(--fs-meta); }
+.ct-btn--lg { padding: 13px 18px; font-size: var(--fs-title); }
+
+/* ─── Tags / chips ────────────────────────────────────── */
+.ct-tag {
+  display: inline-block;
+  padding: 3px 8px;
+  background: var(--ct-tea-hair);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  border-radius: var(--radius);
+}
+.ct-tag--active {                  /* DOWNLOADING — amber */
+  background: var(--ct-amber-dim);
+  color: var(--ct-amber);
+}
+.ct-tag--on-device {
+  background: rgba(221,244,201,0.18);
+  color: var(--fg);
+}
+.ct-tag--error {
+  color: var(--destructive);
+  background: rgba(201,111,74,0.16);
+}
+
+/* ─── Inputs ──────────────────────────────────────────── */
+.ct-input {
+  background: transparent;
+  color: var(--fg);
+  border: var(--stroke) solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 9px 12px;
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  width: 100%;
+  outline: none;
+  transition: border-color var(--dur-fast) var(--ease);
+}
+.ct-input::placeholder { color: var(--fg-muted); }
+.ct-input:focus { border-color: var(--ct-amber); }
+
+.ct-input-group {
+  display: flex; align-items: center; gap: var(--sp-2);
+  border: var(--stroke) solid var(--rule-strong);
+  padding: 9px 12px;
+}
+.ct-input-group input {
+  flex: 1; background: none; border: none; outline: none;
+  color: var(--fg); font-family: inherit; font-size: inherit;
+}
+.ct-input-group .ct-kbd { color: var(--fg-muted); }
+
+/* Keyboard hint */
+.ct-kbd {
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  color: var(--fg-muted);
+  letter-spacing: 0.5px;
+}
+
+/* ─── Toggle (flat rectangle) ─────────────────────────── */
+.ct-toggle {
+  display: inline-flex; align-items: center; gap: var(--sp-3);
+  cursor: pointer; user-select: none;
+}
+.ct-toggle__track {
+  width: 32px; height: 18px;
+  background: var(--ct-coffee-mid);
+  position: relative;
+  transition: background var(--dur-base) var(--ease);
+}
+.ct-toggle__thumb {
+  position: absolute; top: 2px; left: 2px;
+  width: 14px; height: 14px;
+  background: var(--ct-tea-muted);
+  transition: transform var(--dur-base) var(--ease),
+              background var(--dur-base) var(--ease);
+}
+.ct-toggle[aria-checked="true"] .ct-toggle__track { background: var(--ct-tea); }
+.ct-toggle[aria-checked="true"] .ct-toggle__thumb {
+  background: var(--ct-coffee-deep);
+  transform: translateX(14px);
+}
+
+/* ─── List row (dense Up Next / device queue) ─────────── */
+.ct-row {
+  display: grid;
+  grid-template-columns: 26px var(--thumb-sz) 1fr 70px 56px 14px;
+  gap: var(--sp-3);
+  padding: var(--row-pad-y) var(--row-pad-x);
+  align-items: center;
+  border-bottom: var(--stroke) solid var(--rule);
+  background: transparent;
+  transition: background var(--dur-fast) var(--ease);
+}
+.ct-row:hover { background: var(--ct-tea-ghost); }
+.ct-row[data-state="active"] {
+  background: rgba(232,180,79,0.06);
+}
+.ct-row[data-state="selected"] {
+  background: rgba(221,244,201,0.04);
+}
+.ct-row__n {
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  color: var(--fg-muted);
+}
+.ct-row__thumb {
+  width: var(--thumb-sz);
+  height: var(--thumb-sz);
+  background: repeating-linear-gradient(
+    45deg,
+    var(--ct-coffee-mid) 0 4px,
+    var(--ct-coffee-deep) 4px 8px
+  );
+}
+.ct-row__main { overflow: hidden; }
+.ct-row__title {
+  font-size: var(--fs-body);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ct-row__show {
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  color: var(--fg-muted);
+  letter-spacing: 0.3px;
+  text-transform: uppercase;      /* Workbench: ALLCAPS show names */
+  margin-top: 2px;
+}
+.ct-row__dur, .ct-row__size {
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  color: var(--fg-dim);
+  text-align: right;
+}
+.ct-row__size { color: var(--fg-muted); }
+.ct-row__dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--fg-muted);
+  justify-self: end;
+}
+.ct-row[data-state="active"]   .ct-row__dot { background: var(--accent); }
+.ct-row[data-state="done"]     .ct-row__dot { background: var(--fg); }
+.ct-row[data-state="selected"] .ct-row__dot { background: var(--fg); }
+
+/* ─── Progress bar ────────────────────────────────────── */
+.ct-progress {
+  height: 3px;                    /* Workbench is flat, so a thin bar */
+  background: var(--rule);
+  position: relative;
+  overflow: hidden;
+}
+.ct-progress__fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width var(--dur-slow) var(--ease);
+}
+
+/* ─── Window chrome (macOS-like) ──────────────────────── */
+.ct-window {
+  background: var(--ct-coffee-ink);
+  display: flex; flex-direction: column;
+  box-shadow: 0 30px 60px rgba(0,0,0,0.18), 0 8px 20px rgba(0,0,0,0.10);
+}
+.ct-window__chrome {
+  height: var(--chrome-h);
+  display: flex; align-items: center; padding: 0 12px;
+  background: #0F0807;
+  border-bottom: var(--stroke) solid var(--rule);
+  user-select: none;
+}
+.ct-window__dots { display: flex; gap: 6px; }
+.ct-window__dot { width: 10px; height: 10px; border-radius: 50%; }
+.ct-window__dot--r { background: #FF5F57; }
+.ct-window__dot--y { background: #FEBC2E; }
+.ct-window__dot--g { background: #28C840; }
+.ct-window__title {
+  flex: 1; text-align: center;
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  color: var(--fg-muted);
+  letter-spacing: 0.3px;
+}
+.ct-window__body { flex: 1; overflow: hidden; background: var(--bg); }
+
+/* ─── Toolbar ─────────────────────────────────────────── */
+.ct-toolbar {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  padding: 18px var(--sp-5) 14px;
+  border-bottom: var(--stroke) solid var(--rule);
+}
+.ct-toolbar__actions { display: flex; gap: var(--sp-2); }
+
+/* ─── Log lines (sync screen) ─────────────────────────── */
+.ct-log {
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-loose);
+}
+.ct-log__line--done    { color: var(--fg); opacity: 0.85; }
+.ct-log__line--active  { color: var(--accent); font-weight: var(--fw-semibold); }
+.ct-log__line--pending { color: var(--fg); opacity: 0.38; }
+
+/* ─── Keyframes ───────────────────────────────────────── */
+@keyframes ct-blink {
+  0%, 50%   { opacity: 1; }
+  51%, 100% { opacity: 0.35; }
+}
+.ct-cursor { animation: ct-blink 1s steps(1) infinite; }
+
+@keyframes ct-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+.ct-anim-in { animation: ct-fade-in var(--dur-base) var(--ease) both; }
+
+/* ─── Utilities ───────────────────────────────────────── */
+.ct-stack { display: flex; flex-direction: column; }
+.ct-row-x { display: flex; align-items: center; }
+.ct-grow  { flex: 1; }
+.ct-gap-1 { gap: var(--sp-1); }
+.ct-gap-2 { gap: var(--sp-2); }
+.ct-gap-3 { gap: var(--sp-3); }
+.ct-gap-4 { gap: var(--sp-4); }
+.ct-gap-6 { gap: var(--sp-6); }
+.ct-pad-5 { padding: var(--sp-5); }
+.ct-pad-6 { padding: var(--sp-6); }
+
+</style>
+<style>
+  /* Page-only styling for the style guide itself */
+  .sg-shell { max-width: 1120px; margin: 0 auto; padding: var(--sp-8) var(--sp-7); }
+  .sg-head { display: flex; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; gap: var(--sp-4); margin-bottom: var(--sp-8); }
+  .sg-head h1 { font-size: var(--fs-hero); font-weight: 600; letter-spacing: var(--tracking-hero); margin: 0; line-height: 1; }
+  .sg-head p { max-width: 520px; color: var(--fg-dim); margin: var(--sp-3) 0 0; font-size: var(--fs-title); line-height: var(--lh-body); }
+  .sg-section { margin-bottom: var(--sp-9); }
+  .sg-section h2 { font-family: var(--font-mono); font-size: var(--fs-caption); letter-spacing: 2px; color: var(--fg-muted); text-transform: uppercase; margin: 0 0 var(--sp-3); }
+  .sg-section h3 { font-size: var(--fs-subhead); font-weight: 600; letter-spacing: var(--tracking-subhead); margin: 0 0 var(--sp-5); }
+  .sg-grid { display: grid; gap: var(--sp-4); }
+  .sg-swatch { padding: var(--sp-6) var(--sp-4); display: flex; flex-direction: column; justify-content: space-between; min-height: 120px; }
+  .sg-swatch__n { font-size: var(--fs-title); font-weight: 600; }
+  .sg-swatch__v { font-family: var(--font-mono); font-size: var(--fs-caption); opacity: 0.75; margin-top: var(--sp-1); }
+  .sg-swatch__r { font-family: var(--font-mono); font-size: var(--fs-caption); opacity: 0.55; margin-top: var(--sp-6); }
+  .sg-card { border: 1px solid var(--rule); padding: var(--sp-5); }
+  .sg-kv { display: grid; grid-template-columns: 160px 1fr; gap: var(--sp-3) var(--sp-4); font-family: var(--font-mono); font-size: var(--fs-meta); }
+  .sg-kv dt { color: var(--fg-muted); }
+  .sg-kv dd { margin: 0; color: var(--fg); }
+  .sg-demo { background: var(--bg); border: 1px solid var(--rule); padding: var(--sp-6); }
+  .sg-demo + .sg-demo { margin-top: var(--sp-4); }
+  .sg-label { font-family: var(--font-mono); font-size: var(--fs-caption); color: var(--fg-muted); letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: var(--sp-3); }
+</style>
+</head>
+<body class="openswim">
+
+<div class="sg-shell">
+
+  <!-- HEADER -->
+  <header class="sg-head">
+    <div>
+      <div class="ct-label" style="margin-bottom: var(--sp-2)">OpenSwim Podcast · Design System v1 · Workbench</div>
+      <h1>Tokens,<br/>components,<br/>one app.</h1>
+      <p>The living reference for every color, size, and component used in the OpenSwim Podcast app. Everything below is a real class you can use in your HTML.</p>
+    </div>
+    <div class="sg-card" style="min-width: 300px">
+      <div class="ct-label" style="margin-bottom: var(--sp-2)">Quick start</div>
+      <pre style="margin: 0; font-family: var(--font-mono); font-size: var(--fs-meta); line-height: var(--lh-loose); color: var(--fg-dim); white-space: pre-wrap;">&lt;link rel="stylesheet" href="tokens.css"&gt;
+&lt;link rel="stylesheet" href="components.css"&gt;
+
+&lt;body class="openswim"&gt;
+  &lt;button class="ct-btn ct-btn--cta"&gt;
+    Sync 7 episodes
+  &lt;/button&gt;</pre>
+    </div>
+  </header>
+
+  <!-- COLOR -->
+  <section class="sg-section">
+    <h2>01 · Color</h2>
+    <h3>Palette</h3>
+    <div class="sg-grid" style="grid-template-columns: repeat(4, 1fr)">
+      <div class="sg-swatch" style="background: var(--ct-coffee); color: var(--fg)">
+        <div><div class="sg-swatch__n">coffee</div><div class="sg-swatch__v">#3E2723</div></div>
+        <div class="sg-swatch__r">--bg · primary surface</div>
+      </div>
+      <div class="sg-swatch" style="background: var(--ct-coffee-deep); color: var(--fg)">
+        <div><div class="sg-swatch__n">coffee-deep</div><div class="sg-swatch__v">#2A1A16</div></div>
+        <div class="sg-swatch__r">--bg-inset · inputs, panels</div>
+      </div>
+      <div class="sg-swatch" style="background: var(--ct-coffee-mid); color: var(--fg)">
+        <div><div class="sg-swatch__n">coffee-mid</div><div class="sg-swatch__v">#4E342E</div></div>
+        <div class="sg-swatch__r">striped texture, raised</div>
+      </div>
+      <div class="sg-swatch" style="background: var(--ct-coffee-ink); color: var(--fg)">
+        <div><div class="sg-swatch__n">coffee-ink</div><div class="sg-swatch__v">#1C110E</div></div>
+        <div class="sg-swatch__r">window chrome</div>
+      </div>
+      <div class="sg-swatch" style="background: var(--ct-tea); color: var(--ct-coffee)">
+        <div><div class="sg-swatch__n">tea</div><div class="sg-swatch__v">#DDF4C9</div></div>
+        <div class="sg-swatch__r">--fg · text, primary CTA</div>
+      </div>
+      <div class="sg-swatch" style="background: var(--ct-amber); color: var(--ct-coffee-ink)">
+        <div><div class="sg-swatch__n">amber</div><div class="sg-swatch__v">#E8B44F</div></div>
+        <div class="sg-swatch__r">--accent · active only</div>
+      </div>
+      <div class="sg-swatch" style="background: var(--ct-error); color: var(--ct-coffee-ink)">
+        <div><div class="sg-swatch__n">terracotta</div><div class="sg-swatch__v">#C96F4A</div></div>
+        <div class="sg-swatch__r">--destructive · errors</div>
+      </div>
+      <div class="sg-swatch" style="background: transparent; color: var(--fg); border: 1px dashed var(--rule-strong)">
+        <div><div class="sg-swatch__n">rules</div><div class="sg-swatch__v">tea @ 12% / 22%</div></div>
+        <div class="sg-swatch__r">--rule · --rule-strong</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TYPE -->
+  <section class="sg-section">
+    <h2>02 · Typography</h2>
+    <h3>Space Grotesk + JetBrains Mono</h3>
+
+    <div class="sg-demo">
+      <div class="ct-label">Hero / 44</div>
+      <div class="ct-hero" style="margin-top: var(--sp-3)">Morning swim.</div>
+      <div class="ct-hero" style="opacity: 0.6; font-weight: 300">Seven episodes.</div>
+    </div>
+
+    <div class="sg-demo">
+      <div class="ct-label">Subhead / 22</div>
+      <div class="ct-subhead" style="margin-top: var(--sp-3)">947 episodes</div>
+    </div>
+
+    <div class="sg-demo">
+      <div class="ct-label">Title / 15 · Body / 13</div>
+      <div class="ct-title" style="margin-top: var(--sp-3)">The fight over what counts as intelligence</div>
+      <div class="ct-body" style="color: var(--fg-dim); margin-top: var(--sp-2); max-width: 520px">
+        Pick what you want on the headset today. Drag to reorder. Sync when you're ready — files will land renamed in play order.
+      </div>
+    </div>
+
+    <div class="sg-demo">
+      <div class="ct-label">Label / 10 · Meta / 11 (JetBrains Mono)</div>
+      <div class="ct-meta" style="margin-top: var(--sp-3)">EP 2847 · 00:48:22 · 64kbps · audio/mpeg</div>
+      <div class="ct-meta">queued 14:02 · 47.2MB · will become 03_episode.mp3</div>
+    </div>
+  </section>
+
+  <!-- SPACING -->
+  <section class="sg-section">
+    <h2>03 · Spacing</h2>
+    <h3>4-based scale</h3>
+    <div class="sg-demo" style="display: flex; align-items: flex-end; gap: var(--sp-4); flex-wrap: wrap">
+      <!-- render each step as a vertical bar -->
+      <div style="text-align: center">
+        <div style="width: 32px; height: 4px; background: var(--fg)"></div>
+        <div class="ct-meta" style="margin-top: var(--sp-2)">sp-1 · 4</div>
+      </div>
+      <div style="text-align: center"><div style="width: 32px; height: 8px; background: var(--fg)"></div><div class="ct-meta" style="margin-top: var(--sp-2)">sp-2 · 8</div></div>
+      <div style="text-align: center"><div style="width: 32px; height: 12px; background: var(--fg)"></div><div class="ct-meta" style="margin-top: var(--sp-2)">sp-3 · 12</div></div>
+      <div style="text-align: center"><div style="width: 32px; height: 16px; background: var(--fg)"></div><div class="ct-meta" style="margin-top: var(--sp-2)">sp-4 · 16</div></div>
+      <div style="text-align: center"><div style="width: 32px; height: 20px; background: var(--fg)"></div><div class="ct-meta" style="margin-top: var(--sp-2)">sp-5 · 20</div></div>
+      <div style="text-align: center"><div style="width: 32px; height: 24px; background: var(--fg)"></div><div class="ct-meta" style="margin-top: var(--sp-2)">sp-6 · 24</div></div>
+      <div style="text-align: center"><div style="width: 32px; height: 32px; background: var(--fg)"></div><div class="ct-meta" style="margin-top: var(--sp-2)">sp-7 · 32</div></div>
+      <div style="text-align: center"><div style="width: 32px; height: 48px; background: var(--fg)"></div><div class="ct-meta" style="margin-top: var(--sp-2)">sp-8 · 48</div></div>
+      <div style="text-align: center"><div style="width: 32px; height: 64px; background: var(--fg)"></div><div class="ct-meta" style="margin-top: var(--sp-2)">sp-9 · 64</div></div>
+    </div>
+  </section>
+
+  <!-- BUTTONS -->
+  <section class="sg-section">
+    <h2>04 · Buttons</h2>
+    <h3>Five variants, one size default</h3>
+    <div class="sg-demo" style="display: flex; gap: var(--sp-3); flex-wrap: wrap; align-items: center">
+      <button class="ct-btn ct-btn--primary">Primary</button>
+      <button class="ct-btn ct-btn--secondary">Secondary</button>
+      <button class="ct-btn ct-btn--cta">SYNC NOW</button>
+      <button class="ct-btn ct-btn--ghost">cancel</button>
+      <button class="ct-btn ct-btn--destructive">Delete previous sync</button>
+    </div>
+    <div class="sg-demo" style="display: flex; gap: var(--sp-3); flex-wrap: wrap; align-items: center">
+      <button class="ct-btn ct-btn--primary ct-btn--sm">Small</button>
+      <button class="ct-btn ct-btn--primary">Default</button>
+      <button class="ct-btn ct-btn--primary ct-btn--lg">Large</button>
+    </div>
+  </section>
+
+  <!-- TAGS -->
+  <section class="sg-section">
+    <h2>05 · Tags</h2>
+    <h3>Status without a paragraph</h3>
+    <div class="sg-demo" style="display: flex; gap: var(--sp-2); flex-wrap: wrap">
+      <span class="ct-tag">AUDIO</span>
+      <span class="ct-tag">VIDEO</span>
+      <span class="ct-tag ct-tag--active">DOWNLOADING</span>
+      <span class="ct-tag ct-tag--on-device">ON DEVICE</span>
+      <span class="ct-tag ct-tag--error">FAILED</span>
+    </div>
+  </section>
+
+  <!-- INPUTS + TOGGLES -->
+  <section class="sg-section">
+    <h2>06 · Inputs &amp; toggles</h2>
+    <h3>Minimal chrome, clear focus</h3>
+    <div class="sg-demo" style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-4); max-width: 640px">
+      <div class="ct-input-group">
+        <input placeholder="search up next" />
+        <span class="ct-kbd">⌘K</span>
+      </div>
+      <input class="ct-input" placeholder="pocketcasts cookie…" />
+    </div>
+    <div class="sg-demo" style="display: flex; gap: var(--sp-6); flex-wrap: wrap">
+      <div class="ct-toggle" aria-checked="true" role="switch" tabindex="0" onclick="this.setAttribute('aria-checked', this.getAttribute('aria-checked')==='true'?'false':'true')">
+        <div class="ct-toggle__track"><div class="ct-toggle__thumb"></div></div>
+        <span>Auto-rename files</span>
+      </div>
+      <div class="ct-toggle" aria-checked="false" role="switch" tabindex="0" onclick="this.setAttribute('aria-checked', this.getAttribute('aria-checked')==='true'?'false':'true')">
+        <div class="ct-toggle__track"><div class="ct-toggle__thumb"></div></div>
+        <span style="color: var(--fg-dim)">Extract audio from video</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ROWS -->
+  <section class="sg-section">
+    <h2>07 · List row</h2>
+    <h3>The core of Up Next</h3>
+    <div class="sg-demo" style="padding: 0">
+      <div class="ct-row" data-state="active">
+        <div class="ct-row__n">01</div>
+        <div class="ct-row__thumb"></div>
+        <div class="ct-row__main">
+          <div class="ct-row__title">The fight over what counts as intelligence</div>
+          <div class="ct-row__show">The Daily · NY Times</div>
+        </div>
+        <div class="ct-row__dur">28:14</div>
+        <div class="ct-row__size">13.4M</div>
+        <div class="ct-row__dot"></div>
+      </div>
+      <div class="ct-row" data-state="selected">
+        <div class="ct-row__n">02</div>
+        <div class="ct-row__thumb"></div>
+        <div class="ct-row__main">
+          <div class="ct-row__title">The last lighthouse keeper</div>
+          <div class="ct-row__show">99% Invisible</div>
+        </div>
+        <div class="ct-row__dur">48:22</div>
+        <div class="ct-row__size">23.1M</div>
+        <div class="ct-row__dot"></div>
+      </div>
+      <div class="ct-row">
+        <div class="ct-row__n">03</div>
+        <div class="ct-row__thumb"></div>
+        <div class="ct-row__main">
+          <div class="ct-row__title">AI agents, copyright panic, and a hat</div>
+          <div class="ct-row__show">Hard Fork</div>
+        </div>
+        <div class="ct-row__dur">1:12:08</div>
+        <div class="ct-row__size">34.6M</div>
+        <div class="ct-row__dot"></div>
+      </div>
+      <div class="ct-row">
+        <div class="ct-row__n">04</div>
+        <div class="ct-row__thumb"></div>
+        <div class="ct-row__main">
+          <div class="ct-row__title">Why copper is the new oil</div>
+          <div class="ct-row__show">Odd Lots · Bloomberg</div>
+        </div>
+        <div class="ct-row__dur">54:01</div>
+        <div class="ct-row__size">25.9M</div>
+        <div class="ct-row__dot"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PROGRESS + LOG -->
+  <section class="sg-section">
+    <h2>08 · Progress &amp; log</h2>
+    <h3>What "syncing" looks like</h3>
+    <div class="sg-demo">
+      <div style="display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: var(--fs-meta); margin-bottom: var(--sp-2)">
+        <span style="color: var(--accent)">▸ 14.2MB / 34.6MB</span>
+        <span style="color: var(--fg-dim)">41% · 1.8MB/s</span>
+      </div>
+      <div class="ct-progress"><div class="ct-progress__fill" style="width: 41%"></div></div>
+
+      <div class="ct-log" style="margin-top: var(--sp-6)">
+        <div class="ct-log__line--done">✓ 01_the-daily.mp3 &nbsp;&nbsp;&nbsp; 13.4M</div>
+        <div class="ct-log__line--done">✓ 02_99pi.mp3 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 23.1M</div>
+        <div class="ct-log__line--active">▸ 03_hard-fork.mp3 &nbsp;&nbsp; 14.2M / 34.6M</div>
+        <div class="ct-log__line--pending">· 04_odd-lots.mp3</div>
+        <div class="ct-log__line--pending">· 05_radiolab.mp3</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- RULES -->
+  <section class="sg-section">
+    <h2>09 · Rules of the system</h2>
+    <h3>If you do nothing else, follow these</h3>
+    <div class="sg-grid" style="grid-template-columns: 1fr 1fr; gap: var(--sp-5)">
+      <div class="sg-card">
+        <div class="ct-label" style="margin-bottom: var(--sp-3)">Always</div>
+        <ul style="margin: 0; padding-left: var(--sp-5); font-size: var(--fs-body); line-height: var(--lh-body)">
+          <li>Use tokens. Never hard-code hex values, pixel sizes, or font names.</li>
+          <li>Metadata (durations, sizes, timestamps, counts) in mono.</li>
+          <li>Show names in ALL-CAPS mono. Episode titles in Sentence-case sans.</li>
+          <li>Layer with hairline rules or coffee tiers.</li>
+        </ul>
+      </div>
+      <div class="sg-card">
+        <div class="ct-label" style="margin-bottom: var(--sp-3); color: var(--destructive)">Never</div>
+        <ul style="margin: 0; padding-left: var(--sp-5); font-size: var(--fs-body); line-height: var(--lh-body)">
+          <li>Add rounded corners. <code style="font-family: var(--font-mono); color: var(--fg-muted)">--radius: 0</code> is non-negotiable.</li>
+          <li>Use amber for hover, selection, or decoration. Amber = right now.</li>
+          <li>Introduce a new color outside the token file.</li>
+          <li>Use shadows. Or light mode. Or Inter.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- FOOTER -->
+  <footer class="sg-section" style="border-top: 1px solid var(--rule); padding-top: var(--sp-6); display: flex; justify-content: space-between; flex-wrap: wrap; gap: var(--sp-4)">
+    <div class="ct-meta">design-system/ · v1 · workbench variant</div>
+    <div class="ct-meta">see README.md · DECISIONS.md · HANDOFF.md</div>
+  </footer>
+
+</div>
+
+</body>
+</html>
