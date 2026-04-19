@@ -196,7 +196,9 @@ export default function App() {
                 downloadByUuid={downloadByUuid}
                 onRetryDownload={(it) => ensureDownload(it.uuid, it.url)}
                 playbackSpeed={playbackSpeed}
-                setPlaybackSpeed={setPlaybackSpeed} />
+                setPlaybackSpeed={setPlaybackSpeed}
+                devicePath={device.mounted ? device.path : null}
+                setShowMountDialog={setShowMountDialog} />
             )}
             {route === "syncing" && (
               <SyncScreen items={items} order={order} onDevice={onDevice}

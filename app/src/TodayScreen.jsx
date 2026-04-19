@@ -81,7 +81,7 @@ function SpeedPicker({ value, onChange }) {
 
 export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   goSync, goUpNext, deviceCapacityMB, downloadByUuid = {}, onRetryDownload,
-  playbackSpeed = 1.0, setPlaybackSpeed }) {
+  playbackSpeed = 1.0, setPlaybackSpeed, devicePath, setShowMountDialog }) {
 
   const queue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
   const totalMin = queue.reduce((s, x) => s + x.durMin, 0);
@@ -132,12 +132,30 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   };
   const handleDragEnd = () => { setDragId(null); setDropTarget(null); };
 
+  if (!queue.length && !devicePath) {
+    return (
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center",
+        justifyContent: "center", gap: 16, padding: 40, textAlign: "center" }}>
+        <div className="ct-label" style={{ color: "var(--ct-amber)" }}>no headphones connected</div>
+        <div className="ct-subhead" style={{ color: "var(--fg-dim)", maxWidth: 360 }}>
+          Plug in your OpenSwim Pro to start sending episodes.
+        </div>
+        <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
+          {setShowMountDialog && (
+            <Btn variant="secondary" onClick={() => setShowMountDialog(true)}>Pick a volume</Btn>
+          )}
+          <Btn variant="cta" onClick={goUpNext}>Pick from queue</Btn>
+        </div>
+      </div>
+    );
+  }
+
   if (!queue.length) {
     return (
       <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center",
         justifyContent: "center", gap: 16 }}>
         <div className="ct-label">nothing lined up</div>
-        <div className="ct-subhead" style={{ color: "var(--fg-dim)" }}>Your headset is empty.</div>
+        <div className="ct-subhead" style={{ color: "var(--fg-dim)" }}>Line up some episodes to send to your headphones.</div>
         <div style={{ marginTop: 8 }}><Btn variant="cta" onClick={goUpNext}>Pick from queue</Btn></div>
       </div>
     );
