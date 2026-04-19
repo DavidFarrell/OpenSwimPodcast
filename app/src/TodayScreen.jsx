@@ -57,8 +57,37 @@ function DownloadBadge({ state, onRetry }) {
   );
 }
 
+const SPEED_OPTIONS = [1.0, 1.25, 1.5, 1.75, 2.0];
+
+function SpeedPicker({ value, onChange }) {
+  return (
+    <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+      <span className="ct-meta" style={{ color: "var(--fg-muted)", letterSpacing: "1.2px", textTransform: "uppercase" }}>Speed</span>
+      <div style={{ display: "flex", border: "1px solid var(--rule)" }}>
+        {SPEED_OPTIONS.map((s) => {
+          const active = Math.abs(s - value) < 0.001;
+          return (
+            <button key={s} onClick={() => onChange(s)}
+              className="ct-btn ct-btn--xs"
+              style={{
+                fontFamily: "var(--font-mono)", fontSize: 11, padding: "3px 8px",
+                background: active ? "var(--ct-tea-ghost)" : "transparent",
+                color: active ? "var(--fg)" : "var(--fg-muted)",
+                border: "none",
+                borderRight: s === SPEED_OPTIONS.at(-1) ? "none" : "1px solid var(--rule)",
+              }}>
+              {s}×
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
-  goSync, goUpNext, deviceCapacityMB, downloadByUuid = {}, onRetryDownload }) {
+  goSync, goUpNext, deviceCapacityMB, downloadByUuid = {}, onRetryDownload,
+  playbackSpeed = 1.0, setPlaybackSpeed }) {
 
   const queue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
   const totalMin = queue.reduce((s, x) => s + x.durMin, 0);
@@ -113,9 +142,9 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
     return (
       <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center",
         justifyContent: "center", gap: 16 }}>
-        <div className="ct-label">nothing queued</div>
+        <div className="ct-label">nothing lined up</div>
         <div className="ct-subhead" style={{ color: "var(--fg-dim)" }}>Your headset is empty.</div>
-        <div style={{ marginTop: 8 }}><Btn variant="cta" onClick={goUpNext}>Pull from up next</Btn></div>
+        <div style={{ marginTop: 8 }}><Btn variant="cta" onClick={goUpNext}>Pick from queue</Btn></div>
       </div>
     );
   }
@@ -123,13 +152,13 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
       <Toolbar
-        label={`Today · ${queue.length} episodes`}
+        label={`Ready · ${queue.length} episodes lined up`}
         title="Ready for your swim."
-        subtitle={`${totalHM} · ${totalMB.toFixed(1)}MB · will write ${queue.length} file${queue.length > 1 ? "s" : ""}, remove ${removed.length}`}
+        subtitle={`${totalHM} · ${totalMB.toFixed(1)}MB · will write ${queue.length} file${queue.length > 1 ? "s" : ""}, remove ${removed.length}${playbackSpeed !== 1.0 ? ` · will re-encode at ${playbackSpeed}× playback speed` : ""}`}
         actions={<>
           <Btn variant="secondary" onClick={goUpNext}>+ add more</Btn>
           <Btn variant="cta" onClick={goSync} disabled={overCap}>
-            {overCap ? "OVER CAPACITY" : `SYNC ${queue.length} EP`}
+            {overCap ? "OVER CAPACITY" : `SEND TO HEADPHONES · ${queue.length} EP`}
           </Btn>
         </>}
       />
@@ -148,7 +177,8 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
             transition: "width .28s var(--ease)" }} />
         </div>
         <div style={{ flex: 1 }}></div>
-        <div className="ct-meta" style={{ color: "var(--fg-muted)" }}>drag to reorder · video converts to MP3</div>
+        {setPlaybackSpeed && <SpeedPicker value={playbackSpeed} onChange={setPlaybackSpeed} />}
+        <div className="ct-meta" style={{ color: "var(--fg-muted)" }}>drag to reorder · video → MP3</div>
       </div>
 
       <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>

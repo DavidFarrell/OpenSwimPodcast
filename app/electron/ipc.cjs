@@ -42,6 +42,7 @@ async function startSync(spec) {
     const res = await runSync({
       devicePath: spec.devicePath,
       queue: spec.queue,
+      speed: spec.speed || 1.0,
       cacheDir,
       signal: syncController.signal,
       onEvent: (e) => broadcast("sync:event", e),

@@ -63,9 +63,9 @@ export function CoverArt({ show, size = 28 }) {
 
 export function MountPill({ state = "mounted", label, free, onClick }) {
   const labels = {
-    mounted: ["OpenSwim Pro", free ? `${free} free` : "mounted"],
-    busy: ["OpenSwim Pro", "syncing…"],
-    unmounted: ["No device", "plug in to sync"],
+    mounted: ["OpenSwim Pro", free ? `${free} free` : "connected"],
+    busy: ["OpenSwim Pro", "transferring…"],
+    unmounted: ["No headphones", "plug in to transfer"],
     warning: ["OpenSwim Pro", label || "low space"],
   };
   const [main, sub] = labels[state] || labels.mounted;

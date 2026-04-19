@@ -73,6 +73,37 @@ describe("convert()", () => {
     expect(result.bytes).toBe(fs.statSync(dest).size);
   });
 
+  it("passes -filter:a atempo=X when speed is set and != 1.0", async () => {
+    const src = path.join(tmp, "ep.mp4");
+    const dest = path.join(tmp, "ep.mp3");
+    fs.writeFileSync(src, "video");
+
+    const { spawn, calls } = fakeSpawn((child) => {
+      child.stderr.write("Duration: 00:00:10.00, start: 0\n");
+      fs.writeFileSync(calls[0].args.at(-1), "mp3");
+      child.emit("exit", 0);
+    });
+    await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, speed: 1.5 });
+    const args = calls[0].args;
+    const idx = args.indexOf("-filter:a");
+    expect(idx).toBeGreaterThan(-1);
+    expect(args[idx + 1]).toBe("atempo=1.5");
+  });
+
+  it("omits the atempo filter entirely at speed 1.0", async () => {
+    const src = path.join(tmp, "ep.mp4");
+    const dest = path.join(tmp, "ep.mp3");
+    fs.writeFileSync(src, "video");
+
+    const { spawn, calls } = fakeSpawn((child) => {
+      child.stderr.write("Duration: 00:00:10.00, start: 0\n");
+      fs.writeFileSync(calls[0].args.at(-1), "mp3");
+      child.emit("exit", 0);
+    });
+    await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, speed: 1.0 });
+    expect(calls[0].args.includes("-filter:a")).toBe(false);
+  });
+
   it("reports monotonic progress from stderr time= lines", async () => {
     const src = path.join(tmp, "ep.mp4");
     const dest = path.join(tmp, "ep.mp3");

@@ -28,7 +28,7 @@ class AbortError extends Error {
 
 async function convert({
   src, dest,
-  bitrate = "128k", mono = true,
+  bitrate = "128k", mono = true, speed = 1.0,
   ffmpegPath = defaultFfmpegPath,
   spawn = defaultSpawn,
   onProgress, signal,
@@ -56,6 +56,7 @@ async function convert({
     "-b:a", bitrate,
     "-f", "mp3",
   ];
+  if (speed && speed !== 1.0) args.push("-filter:a", `atempo=${speed}`);
   if (mono) args.push("-ac", "1");
   args.push(tmp);
 

@@ -80,6 +80,7 @@ function buildPlan({ queue, existingDeviceFiles = [] }) {
 
 async function runSync({
   devicePath, cacheDir, queue,
+  speed = 1.0,
   convertFn = defaultConvert,
   copyFn = defaultCopy,
   onEvent,
@@ -88,6 +89,7 @@ async function runSync({
   if (!devicePath) throw new Error("devicePath is required");
   if (!cacheDir) throw new Error("cacheDir is required");
   if (!Array.isArray(queue)) throw new Error("queue is required");
+  const needsEncode = speed && speed !== 1.0;
 
   const emit = (e) => { try { onEvent && onEvent(e); } catch {} };
   const throwIfAborted = () => {
@@ -123,15 +125,17 @@ async function runSync({
   // Stage: convert
   emit({ type: "stage", stage: "convert", state: "active" });
   const sources = new Array(queue.length);
+  const speedSuffix = needsEncode ? `-speed${String(speed).replace(".", "_")}` : "";
   for (let i = 0; i < queue.length; i++) {
     throwIfAborted();
     const it = queue[i];
     const downloadedPath = path.join(cacheDir, `${it.uuid}.${it.ext || "mp3"}`);
-    if (it.ext === "mp3") {
+    const isVideo = it.ext && it.ext !== "mp3";
+    if (!isVideo && !needsEncode) {
       sources[i] = downloadedPath;
       continue;
     }
-    const mp3Path = path.join(cacheDir, `${it.uuid}.mp3`);
+    const mp3Path = path.join(cacheDir, `${it.uuid}${speedSuffix}.mp3`);
     let cached = false;
     try { cached = (await fsp.stat(mp3Path)).size > 0; } catch {}
     if (cached) {
@@ -141,7 +145,7 @@ async function runSync({
     }
     emit({ type: "log", stage: "convert", state: "active", uuid: it.uuid, text: it.title });
     await convertFn({
-      src: downloadedPath, dest: mp3Path, signal,
+      src: downloadedPath, dest: mp3Path, speed, signal,
       onProgress: ({ seconds, durationSec }) => emit({
         type: "log", stage: "convert", state: "active", uuid: it.uuid, text: it.title,
         bytes: seconds, total: durationSec,

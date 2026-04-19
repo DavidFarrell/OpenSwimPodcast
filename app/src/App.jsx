@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Window, Sidebar } from "./Shell.jsx";
 import { LoginScreen } from "./LoginScreen.jsx";
 import { UpNextScreen } from "./UpNextScreen.jsx";
@@ -14,6 +14,14 @@ const pc = () => (typeof window !== "undefined" && window.openswim && window.ope
 export default function App() {
   const [connected, setConnected] = useState(false);
   const [route, setRouteRaw] = useState(() => localStorage.getItem("os_route") || "up-next");
+  const [playbackSpeed, setPlaybackSpeedRaw] = useState(() => {
+    const v = parseFloat(localStorage.getItem("os_playbackSpeed"));
+    return Number.isFinite(v) && v > 0 ? v : 1.0;
+  });
+  const setPlaybackSpeed = (v) => {
+    setPlaybackSpeedRaw(v);
+    localStorage.setItem("os_playbackSpeed", String(v));
+  };
   const [selected, setSelected] = useState([]);
   const [order, setOrder] = useState([]);
   const [syncArmed, setSyncArmed] = useState(false);
@@ -35,52 +43,58 @@ export default function App() {
     });
   }, []);
 
-  useEffect(() => {
-    if (!connected) { setItems([]); return; }
+  const fetchControllerRef = useRef({ cancelled: false });
+
+  const fetchUpNext = useCallback(async () => {
     const api = pc();
     if (!api) { setItems(mockUpNext); return; }
+    fetchControllerRef.current.cancelled = true;
+    const ctrl = { cancelled: false };
+    fetchControllerRef.current = ctrl;
 
-    let cancelled = false;
-    (async () => {
-      setFeedState("loading");
-      setFeedError(null);
-      const [upRes, podRes, histRes] = await Promise.all([api.upNext(), api.podcastList(), api.history()]);
-      if (cancelled) return;
-      if (!upRes.ok) {
-        setFeedError(upRes.error?.message || "failed to load up next");
-        setFeedState("error");
-        if (upRes.error?.code === "AUTH_EXPIRED") setConnected(false);
-        return;
-      }
-      const episodes = upRes.data.episodes || [];
-      const podcasts = podRes.ok ? (podRes.data.podcasts || []) : [];
-      const history = histRes.ok ? (histRes.data.episodes || []) : [];
-      const base = adaptUpNext({ upNext: episodes, podcasts, history });
-      setItems(base);
-      setFeedState("ready");
+    setFeedState("loading");
+    setFeedError(null);
+    const [upRes, podRes, histRes] = await Promise.all([api.upNext(), api.podcastList(), api.history()]);
+    if (ctrl.cancelled) return;
+    if (!upRes.ok) {
+      setFeedError(upRes.error?.message || "failed to load up next");
+      setFeedState("error");
+      if (upRes.error?.code === "AUTH_EXPIRED") setConnected(false);
+      return;
+    }
+    const episodes = upRes.data.episodes || [];
+    const podcasts = podRes.ok ? (podRes.data.podcasts || []) : [];
+    const history = histRes.ok ? (histRes.data.episodes || []) : [];
+    const base = adaptUpNext({ upNext: episodes, podcasts, history });
+    setItems(base);
+    setFeedState("ready");
 
-      const missingPodcastUuids = [...new Set(base
-        .filter((it) => !it.durMin || !it.sizeMB)
-        .map((it) => it.podcastUuid)
-        .filter(Boolean))];
-      const CONCURRENCY = 6;
-      const queueP = [...missingPodcastUuids];
-      let working = base;
-      const worker = async () => {
-        while (queueP.length && !cancelled) {
-          const puuid = queueP.shift();
-          const r = await api.podcastFull(puuid);
-          if (cancelled) return;
-          if (r.ok && r.data.podcast) {
-            working = enrichFromPodcastFull(working, r.data);
-            setItems(working);
-          }
+    const missingPodcastUuids = [...new Set(base
+      .filter((it) => !it.durMin || !it.sizeMB)
+      .map((it) => it.podcastUuid)
+      .filter(Boolean))];
+    const CONCURRENCY = 6;
+    const queueP = [...missingPodcastUuids];
+    let working = base;
+    const worker = async () => {
+      while (queueP.length && !ctrl.cancelled) {
+        const puuid = queueP.shift();
+        const r = await api.podcastFull(puuid);
+        if (ctrl.cancelled) return;
+        if (r.ok && r.data.podcast) {
+          working = enrichFromPodcastFull(working, r.data);
+          setItems(working);
         }
-      };
-      await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-    })();
-    return () => { cancelled = true; };
-  }, [connected]);
+      }
+    };
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  }, []);
+
+  useEffect(() => {
+    if (!connected) { setItems([]); return; }
+    fetchUpNext();
+    return () => { fetchControllerRef.current.cancelled = true; };
+  }, [connected, fetchUpNext]);
 
   useEffect(() => {
     if (route !== "today") return;
@@ -170,7 +184,8 @@ export default function App() {
             )}
             {route === "up-next" && feedState !== "error" && items.length > 0 && (
               <UpNextScreen items={items} selected={selected} setSelected={setSelected} order={order}
-                goToday={() => setRoute("today")} onDeviceIds={onDeviceIds} />
+                goToday={() => setRoute("today")} onDeviceIds={onDeviceIds}
+                onRefresh={fetchUpNext} refreshing={feedState === "loading"} />
             )}
             {route === "today" && (
               <TodayScreen items={items} onDevice={onDevice} selected={selected} setSelected={setSelected}
@@ -179,7 +194,9 @@ export default function App() {
                 goUpNext={() => setRoute("up-next")}
                 deviceCapacityMB={deviceCapacityMB}
                 downloadByUuid={downloadByUuid}
-                onRetryDownload={(it) => ensureDownload(it.uuid, it.url)} />
+                onRetryDownload={(it) => ensureDownload(it.uuid, it.url)}
+                playbackSpeed={playbackSpeed}
+                setPlaybackSpeed={setPlaybackSpeed} />
             )}
             {route === "syncing" && (
               <SyncScreen items={items} order={order} onDevice={onDevice}
@@ -188,7 +205,8 @@ export default function App() {
                 onBack={() => { setSyncArmed(false); setRouteRaw("today"); }}
                 setMountState={(s) => setSyncBusy(s === "busy")}
                 devicePath={device.mounted ? device.path : null}
-                downloadByUuid={downloadByUuid} />
+                downloadByUuid={downloadByUuid}
+                playbackSpeed={playbackSpeed} />
             )}
           </main>
           {showMountDialog && device.mounted && (

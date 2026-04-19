@@ -16,7 +16,7 @@ function logKey(evt) {
   return evt.uuid ? `${evt.stage}:${evt.uuid}` : `${evt.stage}:${evt.text}`;
 }
 
-export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onArm, setMountState, devicePath, downloadByUuid = {} }) {
+export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onArm, setMountState, devicePath, downloadByUuid = {}, playbackSpeed = 1.0 }) {
   const fullQueue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
   const readyQueue = fullQueue.filter((it) => downloadByUuid[it.uuid]?.state === "ready");
   const skipped = fullQueue.filter((it) => !readyQueue.includes(it));
@@ -26,6 +26,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
 
   const spec = useMemo(() => ({
     devicePath,
+    speed: playbackSpeed,
     queue: readyQueue.map((it, i) => ({
       uuid: it.uuid,
       url: it.url,
@@ -35,7 +36,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       filename: fnameFor(it.show, i + 1, "mp3"),
       ext: it.kind === "VIDEO" ? "mp4" : "mp3",
     })),
-  }), [readyQueue, devicePath]);
+  }), [readyQueue, devicePath, playbackSpeed]);
 
   const [phase, setPhase] = useState(armed ? "running" : "idle");
   const [serverPlan, setServerPlan] = useState([]);
@@ -135,15 +136,18 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     return (
       <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
         <Toolbar
-          label={`Sync · ${queue.length} ready${skipped.length ? ` · ${skipped.length} skipped` : ""}`}
-          title={devicePath ? "Ready when you are." : "No device mounted."}
+          label={`Transfer · ${queue.length} ready${skipped.length ? ` · ${skipped.length} skipped` : ""}`}
+          title={devicePath ? "Ready when you are." : "No headphones connected."}
           subtitle={devicePath
-            ? `${totalMB.toFixed(1)}MB across ${queue.length} file${queue.length !== 1 ? "s" : ""} · ~${removedPreview} to remove · ${videoCount} video→audio${skipNote}`
-            : "Plug in OpenSwim Pro before syncing."}
+            ? `${totalMB.toFixed(1)}MB across ${queue.length} file${queue.length !== 1 ? "s" : ""} · ~${removedPreview} to remove · ${videoCount} video→audio${playbackSpeed !== 1.0 ? ` · re-encoding at ${playbackSpeed}× speed` : ""}${skipNote}`
+            : "Plug in your OpenSwim Pro before transferring."}
           actions={<>
-            <Btn variant="ghost" onClick={onBack}>back to today</Btn>
+            <Btn variant="ghost" onClick={onBack}>back to line-up</Btn>
             <Btn variant="cta" onClick={() => { onArm && onArm(); setPhase("running"); }} disabled={!queue.length || !devicePath}>
-              {!devicePath ? "NO DEVICE" : queue.length ? `START SYNC · ${queue.length} EP` : "NOTHING READY"}
+              {!devicePath ? "NO HEADPHONES"
+                : queue.length ? `SEND · ${queue.length} EP`
+                : fullQueue.length ? "WAITING FOR DOWNLOADS"
+                : "NOTHING LINED UP"}
             </Btn>
           </>}
         />
@@ -164,11 +168,11 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
             alignItems: "flex-start", justifyContent: "center", gap: 16 }}>
             <div className="ct-label">awaiting start</div>
             <div className="ct-subhead" style={{ maxWidth: 440 }}>
-              Five stages. Finalise the queue, delete yesterday's files, convert video audio, transfer, verify.
+              Five stages. Lock the line-up, remove yesterday's files, convert any video, copy to the headphones, verify.
             </div>
             <div className="ct-meta" style={{ color: "var(--fg-dim)", maxWidth: 440, lineHeight: 1.8 }}>
-              Nothing is written to OpenSwim Pro until you press{" "}
-              <span style={{ color: "var(--ct-amber)", fontWeight: 600 }}>START SYNC</span>.
+              Nothing is written to your headphones until you press{" "}
+              <span style={{ color: "var(--ct-amber)", fontWeight: 600 }}>SEND</span>.
             </div>
           </div>
         </div>
@@ -179,8 +183,8 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
       <Toolbar
-        label={`Sync · stage ${Math.max(1, currentStageIdx + 1)}/5 · ${STAGES[Math.max(0, currentStageIdx)].id}`}
-        title="Sending to OpenSwim Pro."
+        label={`Transfer · stage ${Math.max(1, currentStageIdx + 1)}/5 · ${STAGES[Math.max(0, currentStageIdx)].id}`}
+        title="Sending to your headphones."
         subtitle={`${doneCount}/${planWithLog.length} · ${(overall * 100).toFixed(0)}%`}
         actions={<Btn variant="ghost" onClick={cancel}>cancel</Btn>}
       />
@@ -262,11 +266,11 @@ function SuccessScreen({ queue, totalMB, onDone, videoCount, skippedCount = 0 })
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }} className="ct-slide-in">
       <Toolbar
-        label="sync complete · safe to unplug"
-        title="On your headset."
+        label="transfer complete · safe to unplug"
+        title="On your headphones."
         subtitle={`${queue.length} episode${queue.length !== 1 ? "s" : ""} renamed, converted, transferred, verified${skipNote}.`}
         actions={<>
-          <Btn variant="secondary" onClick={onDone}>Back to Up Next</Btn>
+          <Btn variant="secondary" onClick={onDone}>Back to queue</Btn>
           <Btn variant="cta" onClick={onDone}>DONE</Btn>
         </>}
       />
@@ -449,7 +453,7 @@ export function MountDialog({ state, free, used, path, onClose, onForce }) {
         <div className="ct-dialog__head">
           <div>
             <div className="ct-label">OpenSwim Pro · {pathLabel}</div>
-            <div className="ct-subhead" style={{ marginTop: 4 }}>Eject device</div>
+            <div className="ct-subhead" style={{ marginTop: 4 }}>Safely unplug</div>
           </div>
           <div style={{ width: 8, height: 8, borderRadius: "50%",
             background: state === "busy" ? "var(--ct-amber)" : "var(--ct-tea)" }}></div>
@@ -466,7 +470,7 @@ export function MountDialog({ state, free, used, path, onClose, onForce }) {
             </div>
           </div>
           <div className="ct-meta" style={{ color: state === "busy" ? "var(--ct-amber)" : "var(--fg-dim)" }}>
-            {state === "busy" ? "⚠ writing files — force eject will corrupt the last transfer." : "safe to eject · no pending writes."}
+            {state === "busy" ? "⚠ writing files — force unplug will corrupt the last transfer." : "safe to unplug · no pending writes."}
           </div>
           {error && (
             <div className="ct-meta" style={{ color: "var(--ct-error)", marginTop: 10, whiteSpace: "pre-wrap" }}>
@@ -476,9 +480,9 @@ export function MountDialog({ state, free, used, path, onClose, onForce }) {
         </div>
         <div className="ct-dialog__actions">
           <Btn variant="ghost" onClick={onClose} disabled={ejecting}>cancel</Btn>
-          {state === "busy" && <Btn variant="destructive" onClick={onForce} disabled={ejecting}>Force eject</Btn>}
+          {state === "busy" && <Btn variant="destructive" onClick={onForce} disabled={ejecting}>Force unplug</Btn>}
           <Btn variant="primary" onClick={doEject} disabled={state === "busy" || ejecting}>
-            {ejecting ? "Ejecting…" : "Eject"}
+            {ejecting ? "Unplugging…" : "Unplug safely"}
           </Btn>
         </div>
       </div>

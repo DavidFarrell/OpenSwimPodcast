@@ -21,9 +21,9 @@ function Wordmark() {
 
 export function Sidebar({ route, setRoute, todayCount, mountState, mountFree, setShowMountDialog, onLogout }) {
   const items = [
-    { id: "up-next", label: "Up Next", meta: "POCKET CASTS" },
-    { id: "today", label: "Today", meta: todayCount ? `${todayCount} QUEUED` : "QUEUE" },
-    { id: "syncing", label: "Sync", meta: "DEVICE" },
+    { id: "up-next", label: "Queue", meta: "POCKET CASTS" },
+    { id: "today", label: "Ready", meta: todayCount ? `${todayCount} LINED UP` : "LINE UP" },
+    { id: "syncing", label: "Transfer", meta: "TO HEADPHONES" },
   ];
   return (
     <aside style={{ width: 196, borderRight: "1px solid var(--rule)", padding: "18px 0 0",

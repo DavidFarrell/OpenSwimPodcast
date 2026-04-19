@@ -155,6 +155,7 @@ body.openswim{background:var(--ct-coffee-ink);color:var(--fg);font-family:var(--
 .ct-pulse{animation:ct-pulse-amber 1.6s ease-in-out infinite}
 @keyframes ct-march{from{background-position:0 0}to{background-position:16px 0}}
 .ct-march{background-image:repeating-linear-gradient(90deg,var(--ct-amber-dim) 0 6px,transparent 6px 12px);animation:ct-march 1s linear infinite}
+@keyframes os-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
 
 /* Mount pill */
 .ct-mount{display:inline-flex;align-items:center;gap:8px;padding:7px 11px;font-family:var(--font-mono);font-size:var(--fs-caption);letter-spacing:1.2px;text-transform:uppercase;color:var(--fg);border:1px solid var(--rule);cursor:pointer;transition:background var(--dur-fast) var(--ease),border-color var(--dur-fast) var(--ease);user-select:none}

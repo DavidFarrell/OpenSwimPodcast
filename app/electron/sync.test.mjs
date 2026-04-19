@@ -124,6 +124,36 @@ describe("runSync happy path", () => {
     expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
   });
 
+  it("runs the converter at speed != 1.0 even for mp3 sources (atempo re-encode)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("original audio"));
+
+    const convertFn = vi.fn(async ({ src, dest, speed }) => {
+      expect(speed).toBeCloseTo(1.5, 3);
+      fs.writeFileSync(dest, Buffer.from("sped up mp3"));
+      return { bytes: 11, durationSec: 60, fromCache: false };
+    });
+
+    const queue = [makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" })];
+
+    await runSync({ devicePath, cacheDir, queue, convertFn, speed: 1.5, onEvent: () => {} });
+
+    expect(convertFn).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).toString()).toBe("sped up mp3");
+  });
+
+  it("at speed 1.0 an mp3 source is copied directly without invoking the converter", async () => {
+    const payload = Buffer.from("pristine mp3");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);
+
+    const convertFn = vi.fn();
+    const queue = [makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" })];
+
+    await runSync({ devicePath, cacheDir, queue, convertFn, speed: 1.0, onEvent: () => {} });
+
+    expect(convertFn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
+  });
+
   it("skips conversion when the converted mp3 already exists in the cache", async () => {
     const cachedMp3 = Buffer.from("already converted");
     fs.writeFileSync(path.join(cacheDir, "b.mp4"), Buffer.from("video"));
