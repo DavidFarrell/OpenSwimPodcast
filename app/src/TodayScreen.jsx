@@ -2,14 +2,8 @@ import { useState } from "react";
 import { Btn, CoverArt, DragHandle } from "./Atoms.jsx";
 import { Toolbar } from "./Shell.jsx";
 
-function slugShow(show) {
-  const toks = show.toLowerCase().split(/[·\s]+/).map((t) => t.replace(/[^a-z]/g, "")).filter(Boolean);
-  return (toks[0] || "show").slice(0, 8);
-}
-
-export function fnameFor(show, slot, ext = "mp3") {
-  return `${String(slot).padStart(2, "0")}_${slugShow(show)}.${ext}`;
-}
+import { fnameFor } from "./slugShow.js";
+export { fnameFor };
 
 function shortenError(msg) {
   if (!msg) return "error";
