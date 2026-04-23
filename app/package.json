@@ -2,6 +2,8 @@
   "name": "openswim-podcast",
   "private": true,
   "version": "0.1.0",
+  "description": "Podcast sync for swimming headphones",
+  "author": "Paidia",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {

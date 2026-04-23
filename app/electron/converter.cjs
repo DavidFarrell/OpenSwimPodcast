@@ -4,7 +4,14 @@ const path = require("node:path");
 const { spawn: defaultSpawn } = require("node:child_process");
 
 let defaultFfmpegPath = null;
-try { defaultFfmpegPath = require("ffmpeg-static"); } catch {}
+try {
+  defaultFfmpegPath = require("ffmpeg-static");
+  // In a packaged Electron app, asarUnpack puts the binary in app.asar.unpacked/
+  // but require() still returns the app.asar path - fix it so spawn() can find it.
+  if (defaultFfmpegPath) {
+    defaultFfmpegPath = defaultFfmpegPath.replace(/app\.asar([/\\])/, "app.asar.unpacked$1");
+  }
+} catch {}
 
 function parseDuration(stderr) {
   const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(stderr);
