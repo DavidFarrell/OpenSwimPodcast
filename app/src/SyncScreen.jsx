@@ -35,6 +35,8 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       slot: i + 1,
       filename: fnameFor(it.show, i + 1, "mp3"),
       ext: it.kind === "VIDEO" ? "mp4" : "mp3",
+      sizeMB: it.sizeMB,
+      durMin: it.durMin,
     })),
   }), [readyQueue, devicePath, playbackSpeed]);
 
@@ -131,7 +133,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   }
 
   if (phase === "idle") {
-    const removedPreview = onDevice.filter((d) => !queue.some((q) => q.show === d.show)).length;
+    const removedPreview = onDevice.filter((d) => !queue.some((q) => (d.uuid && q.uuid === d.uuid) || q.show === d.show)).length;
     const skipNote = skipped.length ? ` · ${skipped.length} skipped (unreachable)` : "";
     return (
       <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>

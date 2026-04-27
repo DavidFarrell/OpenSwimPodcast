@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 
 const require = createRequire(import.meta.url);
-const { runSync, isOurFilename, sha256File, buildPlan } = require("./sync.cjs");
+const { runSync, isOurFilename, sha256File, buildPlan, readManifest, writeManifest, MANIFEST_FILE } = require("./sync.cjs");
 
 function mkTmp(label = "os-sync-") { return fs.mkdtempSync(path.join(os.tmpdir(), label)); }
 function rmTmp(d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
@@ -109,7 +109,7 @@ describe("runSync happy path", () => {
     await runSync({ devicePath, cacheDir, queue, convertFn: async () => {}, onEvent: (e) => events.push(e) });
 
     const remaining = fs.readdirSync(devicePath).sort();
-    expect(remaining).toEqual(["01_hardfork.mp3", "notes.txt", "photo.jpg"]);
+    expect(remaining).toEqual([".openswim-manifest.json", "01_hardfork.mp3", "notes.txt", "photo.jpg"]);
   });
 
   it("does not re-delete a file whose slot is being reused (same filename new content)", async () => {
@@ -224,5 +224,40 @@ describe("runSync failures", () => {
 
     const verifyStarted = events.find((e) => e.type === "stage" && e.stage === "verify" && e.state === "active");
     expect(verifyStarted).toBeUndefined();
+  });
+});
+
+describe("readManifest", () => {
+  let dir;
+  beforeEach(() => { dir = mkTmp("os-manifest-"); });
+  afterEach(() => rmTmp(dir));
+
+  it("returns [] when device has no files", async () => {
+    expect(await readManifest(dir)).toEqual([]);
+  });
+
+  it("synthesises stub entries from disk when no manifest is present", async () => {
+    fs.writeFileSync(path.join(dir, "01_hardfork.mp3"), Buffer.alloc(1024 * 100));
+    fs.writeFileSync(path.join(dir, "02_radiolab.mp3"), Buffer.alloc(1024 * 200));
+    fs.writeFileSync(path.join(dir, "notes.txt"), "not ours");
+    const r = await readManifest(dir);
+    expect(r.map((e) => e.fname)).toEqual(["01_hardfork.mp3", "02_radiolab.mp3"]);
+    expect(r[0].uuid).toBeNull();
+    expect(r[0].show).toBe("HARDFORK");
+  });
+
+  it("returns manifest entries verbatim, dropping ones whose file is missing", async () => {
+    fs.writeFileSync(path.join(dir, "01_hardfork.mp3"), "x");
+    await writeManifest(dir, [
+      { uuid: "a", title: "Ep A", show: "HARD FORK", filename: "01_hardfork.mp3", sizeMB: 1, durMin: 30, ext: "mp3", slot: 1 },
+      { uuid: "b", title: "Ep B", show: "RADIOLAB",  filename: "02_radiolab.mp3", sizeMB: 2, durMin: 40, ext: "mp3", slot: 2 },
+    ]);
+    const r = await readManifest(dir);
+    expect(r.map((e) => e.uuid)).toEqual(["a"]);
+  });
+
+  it("written manifest is at .openswim-manifest.json", async () => {
+    await writeManifest(dir, [{ uuid: "a", title: "t", show: "S", filename: "01_s.mp3", sizeMB: 1, durMin: 1, ext: "mp3", slot: 1 }]);
+    expect(fs.existsSync(path.join(dir, MANIFEST_FILE))).toBe(true);
   });
 });

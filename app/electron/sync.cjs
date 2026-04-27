@@ -12,6 +12,90 @@ function isOurFilename(name) {
   return /^\d{2}_[a-z]+\.mp3$/.test(name);
 }
 
+function computeRemovals({ queue, existingDeviceFiles = [], existingManifest = [] }) {
+  const newNames = new Set(queue.map((q) => q.filename));
+  const newUuids = new Set(queue.map((q) => q.uuid).filter(Boolean));
+  const out = [];
+  const seen = new Set();
+
+  for (const m of existingManifest) {
+    if (!m || !m.fname) continue;
+    if (m.uuid && newUuids.has(m.uuid)) continue;
+    const replaced = newNames.has(m.fname);
+    out.push({ filename: m.fname, replaced });
+    seen.add(m.fname);
+  }
+
+  for (const name of existingDeviceFiles) {
+    if (!isOurFilename(name)) continue;
+    if (newNames.has(name)) continue;
+    if (seen.has(name)) continue;
+    out.push({ filename: name, replaced: false });
+    seen.add(name);
+  }
+  return out;
+}
+
+const MANIFEST_FILE = ".openswim-manifest.json";
+
+async function readManifest(devicePath) {
+  if (!devicePath) return [];
+  const manifestPath = path.join(devicePath, MANIFEST_FILE);
+
+  let dirNames = [];
+  try { dirNames = await fsp.readdir(devicePath); } catch { return []; }
+  const dirSet = new Set(dirNames);
+
+  let entries = null;
+  try {
+    const raw = await fsp.readFile(manifestPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed?.entries)) entries = parsed.entries;
+  } catch {}
+
+  if (entries) {
+    return entries.filter((e) => e && e.fname && dirSet.has(e.fname));
+  }
+
+  const stubs = [];
+  for (const name of dirNames) {
+    if (!isOurFilename(name)) continue;
+    const m = /^(\d{2})_([a-z]+)\.mp3$/.exec(name);
+    if (!m) continue;
+    let sizeMB;
+    try { sizeMB = (await fsp.stat(path.join(devicePath, name))).size / (1024 * 1024); }
+    catch {}
+    stubs.push({
+      uuid: null,
+      title: name,
+      show: m[2].toUpperCase(),
+      fname: name,
+      sizeMB: sizeMB != null ? Number(sizeMB.toFixed(1)) : 0,
+      slot: parseInt(m[1], 10),
+      ext: "mp3",
+    });
+  }
+  stubs.sort((a, b) => a.slot - b.slot);
+  return stubs;
+}
+
+async function writeManifest(devicePath, queue) {
+  if (!devicePath) return;
+  const entries = queue.map((it, i) => ({
+    uuid: it.uuid,
+    title: it.title,
+    show: it.show,
+    fname: it.filename,
+    sizeMB: it.sizeMB,
+    durMin: it.durMin,
+    ext: it.ext || "mp3",
+    slot: it.slot != null ? it.slot : i + 1,
+  }));
+  const payload = { version: 1, writtenAt: new Date().toISOString(), entries };
+  const manifestPath = path.join(devicePath, MANIFEST_FILE);
+  await fsp.writeFile(manifestPath, JSON.stringify(payload, null, 2));
+}
+
 async function sha256File(p) {
   const hash = crypto.createHash("sha256");
   const stream = fs.createReadStream(p);
@@ -53,15 +137,16 @@ async function defaultCopy(src, dest, { onProgress, signal } = {}) {
   return { bytes: totalBytes };
 }
 
-function buildPlan({ queue, existingDeviceFiles = [] }) {
+function buildPlan({ queue, existingDeviceFiles = [], existingManifest = [] }) {
   const plan = [];
   plan.push({ stage: "finalise", kind: "info", text: `order locked · ${queue.length} slots` });
 
   const newNames = new Set(queue.map((q) => q.filename));
-  for (const name of existingDeviceFiles) {
-    if (isOurFilename(name) && !newNames.has(name)) {
-      plan.push({ stage: "delete", kind: "del", text: `rm ${name}`, filename: name });
-    }
+  const newUuids = new Set(queue.map((q) => q.uuid).filter(Boolean));
+  const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
+  for (const r of removals) {
+    const verb = r.replaced ? "replace" : "rm";
+    plan.push({ stage: "delete", kind: "del", text: `${verb} ${r.filename}`, filename: r.filename, replaced: r.replaced });
   }
 
   for (const it of queue) {
@@ -98,8 +183,9 @@ async function runSync({
 
   let existingDeviceFiles = [];
   try { existingDeviceFiles = await fsp.readdir(devicePath); } catch {}
+  const existingManifest = await readManifest(devicePath);
 
-  const plan = buildPlan({ queue, existingDeviceFiles });
+  const plan = buildPlan({ queue, existingDeviceFiles, existingManifest });
   emit({ type: "plan", plan });
 
   // Stage: finalise
@@ -108,17 +194,19 @@ async function runSync({
 
   // Stage: delete
   emit({ type: "stage", stage: "delete", state: "active" });
-  const newNames = new Set(queue.map((q) => q.filename));
-  for (const name of existingDeviceFiles) {
+  const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
+  for (const r of removals) {
     throwIfAborted();
-    if (!isOurFilename(name) || newNames.has(name)) continue;
-    emit({ type: "log", stage: "delete", state: "active", text: `rm ${name}` });
-    try { await fsp.unlink(path.join(devicePath, name)); }
-    catch (e) {
-      emit({ type: "log", stage: "delete", state: "error", text: `rm ${name}: ${e.message}` });
-      throw e;
+    const verb = r.replaced ? "replace" : "rm";
+    emit({ type: "log", stage: "delete", state: "active", text: `${verb} ${r.filename}` });
+    if (!r.replaced) {
+      try { await fsp.unlink(path.join(devicePath, r.filename)); }
+      catch (e) {
+        emit({ type: "log", stage: "delete", state: "error", text: `rm ${r.filename}: ${e.message}` });
+        throw e;
+      }
     }
-    emit({ type: "log", stage: "delete", state: "done", text: `rm ${name}` });
+    emit({ type: "log", stage: "delete", state: "done", text: `${verb} ${r.filename}` });
   }
   emit({ type: "stage", stage: "delete", state: "done" });
 
@@ -197,8 +285,11 @@ async function runSync({
   }
   emit({ type: "stage", stage: "verify", state: "done" });
 
+  try { await writeManifest(devicePath, queue); }
+  catch (e) { emit({ type: "log", stage: "verify", state: "error", text: `manifest: ${e.message}` }); }
+
   emit({ type: "complete", summary: { count: queue.length } });
   return { ok: true, files: dests };
 }
 
-module.exports = { runSync, buildPlan, isOurFilename, sha256File, AbortError };
+module.exports = { runSync, buildPlan, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE };

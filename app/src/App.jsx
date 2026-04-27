@@ -4,7 +4,7 @@ import { LoginScreen } from "./LoginScreen.jsx";
 import { UpNextScreen } from "./UpNextScreen.jsx";
 import { TodayScreen } from "./TodayScreen.jsx";
 import { SyncScreen, MountDialog, VolumePicker } from "./SyncScreen.jsx";
-import { upNext as mockUpNext, onDevice, deviceCapacityMB } from "./data.js";
+import { upNext as mockUpNext, deviceCapacityMB } from "./data.js";
 import { adaptUpNext, enrichFromPodcastFull } from "./pocketcastsAdapter.js";
 import { useDownloads } from "./useDownloads.js";
 import { useDevice, formatMB } from "./useDevice.js";
@@ -29,6 +29,7 @@ export default function App() {
   const [showMountDialog, setShowMountDialog] = useState(false);
   const device = useDevice();
   const [items, setItems] = useState([]);
+  const [onDevice, setOnDevice] = useState([]);
   const [feedState, setFeedState] = useState("idle");
   const [feedError, setFeedError] = useState(null);
   const { byUuid: downloadByUuid, ensure: ensureDownload, reconcile: reconcileDownloads } = useDownloads();
@@ -129,8 +130,21 @@ export default function App() {
     setRouteRaw(r);
   };
 
-  const onDeviceIds = onDevice.map((d) => items.find((x) => x.show === d.show)?.id).filter(Boolean);
-  const usedMB = onDevice.reduce((s, x) => s + x.sizeMB, 0);
+  const onDeviceIds = onDevice
+    .map((d) => items.find((x) => (d.uuid && x.uuid === d.uuid) || x.show === d.show)?.id)
+    .filter(Boolean);
+  const usedMB = onDevice.reduce((s, x) => s + (x.sizeMB || 0), 0);
+
+  const refreshManifest = useCallback(() => {
+    const api = typeof window !== "undefined" && window.openswim && window.openswim.device;
+    if (!api || !api.readManifest) { setOnDevice([]); return; }
+    if (!device.mounted || !device.path) { setOnDevice([]); return; }
+    api.readManifest(device.path).then((r) => {
+      setOnDevice(r && r.ok && Array.isArray(r.data) ? r.data : []);
+    });
+  }, [device.mounted, device.path]);
+
+  useEffect(() => { refreshManifest(); }, [refreshManifest]);
 
   const pillState = !device.available ? "unmounted"
     : !device.mounted ? "unmounted"
@@ -203,7 +217,7 @@ export default function App() {
             {route === "syncing" && (
               <SyncScreen items={items} order={order} onDevice={onDevice}
                 armed={syncArmed} onArm={() => setSyncArmed(true)}
-                onDone={() => { setSelected([]); setOrder([]); setSyncArmed(false); setRouteRaw("up-next"); }}
+                onDone={() => { refreshManifest(); setSelected([]); setOrder([]); setSyncArmed(false); setRouteRaw("up-next"); }}
                 onBack={() => { setSyncArmed(false); setRouteRaw("today"); }}
                 setMountState={(s) => setSyncBusy(s === "busy")}
                 devicePath={device.mounted ? device.path : null}

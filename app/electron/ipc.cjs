@@ -3,7 +3,7 @@ const path = require("node:path");
 const pc = require("./pocketcasts.cjs");
 const { DownloadManager } = require("./downloader.cjs");
 const { createDeviceWatcher } = require("./device.cjs");
-const { runSync } = require("./sync.cjs");
+const { runSync, readManifest } = require("./sync.cjs");
 
 function serializeError(e) {
   return { message: e.message || String(e), code: e.code, status: e.status };
@@ -106,6 +106,7 @@ function registerAll() {
     "device:listVolumes": () => getWatcher().listVolumes(),
     "device:claim": (_, path) => getWatcher().claim(path),
     "device:eject": (_, path) => getWatcher().eject(path),
+    "device:readManifest": (_, devicePath) => readManifest(devicePath),
 
     "sync:start": (_, spec) => startSync(spec),
     "sync:cancel": () => cancelSync(),

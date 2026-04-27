@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld("openswim", {
     listVolumes: () => invoke("device:listVolumes"),
     claim: (path) => invoke("device:claim", path),
     eject: (path) => invoke("device:eject", path),
+    readManifest: (path) => invoke("device:readManifest", path),
     onChange: (cb) => {
       const listener = (_e, state) => cb(state);
       ipcRenderer.on("device:state", listener);
