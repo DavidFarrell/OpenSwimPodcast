@@ -22,6 +22,11 @@ export default function App() {
     setPlaybackSpeedRaw(v);
     localStorage.setItem("os_playbackSpeed", String(v));
   };
+  const [boost, setBoostRaw] = useState(() => localStorage.getItem("os_boost") === "1");
+  const setBoost = (v) => {
+    setBoostRaw(!!v);
+    localStorage.setItem("os_boost", v ? "1" : "0");
+  };
   const [selected, setSelected] = useState([]);
   const [order, setOrder] = useState([]);
   const [syncArmed, setSyncArmed] = useState(false);
@@ -211,6 +216,8 @@ export default function App() {
                 onRetryDownload={(it) => ensureDownload(it.uuid, it.url)}
                 playbackSpeed={playbackSpeed}
                 setPlaybackSpeed={setPlaybackSpeed}
+                boost={boost}
+                setBoost={setBoost}
                 devicePath={device.mounted ? device.path : null}
                 setShowMountDialog={setShowMountDialog} />
             )}
@@ -222,7 +229,8 @@ export default function App() {
                 setMountState={(s) => setSyncBusy(s === "busy")}
                 devicePath={device.mounted ? device.path : null}
                 downloadByUuid={downloadByUuid}
-                playbackSpeed={playbackSpeed} />
+                playbackSpeed={playbackSpeed}
+                boost={boost} />
             )}
           </main>
           {showMountDialog && device.mounted && (

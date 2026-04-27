@@ -47,6 +47,17 @@ describe("buildPlan", () => {
     expect(byStage.transfer.map((p) => p.uuid)).toEqual(["a", "b"]);
     expect(byStage.verify).toHaveLength(1);
   });
+
+  it("emits a convert entry for every queue item when needsEncode is true (e.g. boost or speed change)", () => {
+    const queue = [
+      makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" }),
+      makeItem({ uuid: "b", show: "RADIOLAB",  slot: 2, ext: "mp3", filename: "02_radiolab.mp3" }),
+    ];
+    const plan = buildPlan({ queue, needsEncode: true });
+    const convertItems = plan.filter((p) => p.stage === "convert");
+    expect(convertItems).toHaveLength(2);
+    expect(convertItems.map((p) => p.uuid)).toEqual(["a", "b"]);
+  });
 });
 
 describe("runSync happy path", () => {

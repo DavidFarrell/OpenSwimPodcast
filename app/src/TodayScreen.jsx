@@ -79,9 +79,28 @@ function SpeedPicker({ value, onChange }) {
   );
 }
 
+function BoostToggle({ value, onChange }) {
+  return (
+    <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+      <span className="ct-meta" style={{ color: "var(--fg-muted)", letterSpacing: "1.2px", textTransform: "uppercase" }}>Boost</span>
+      <button onClick={() => onChange(!value)}
+        className="ct-btn ct-btn--xs"
+        title="Compress dynamic range and lift overall loudness (~+3 LU). Helps in noisy / underwater listening."
+        style={{
+          fontFamily: "var(--font-mono)", fontSize: 11, padding: "3px 10px",
+          border: "1px solid var(--rule)",
+          background: value ? "var(--ct-tea-ghost)" : "transparent",
+          color: value ? "var(--fg)" : "var(--fg-muted)",
+        }}>
+        {value ? "ON" : "OFF"}
+      </button>
+    </div>
+  );
+}
+
 export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   goSync, goUpNext, deviceCapacityMB, downloadByUuid = {}, onRetryDownload,
-  playbackSpeed = 1.0, setPlaybackSpeed, devicePath, setShowMountDialog }) {
+  playbackSpeed = 1.0, setPlaybackSpeed, boost = false, setBoost, devicePath, setShowMountDialog }) {
 
   const queue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
   const totalMin = queue.reduce((s, x) => s + x.durMin, 0);
@@ -166,7 +185,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
       <Toolbar
         label={`Ready · ${queue.length} episodes lined up`}
         title="Ready for your swim."
-        subtitle={`${totalHM} · ${totalMB.toFixed(1)}MB · will write ${queue.length} file${queue.length > 1 ? "s" : ""}, remove ${removed.length}${playbackSpeed !== 1.0 ? ` · will re-encode at ${playbackSpeed}× playback speed` : ""}`}
+        subtitle={`${totalHM} · ${totalMB.toFixed(1)}MB · will write ${queue.length} file${queue.length > 1 ? "s" : ""}, remove ${removed.length}${playbackSpeed !== 1.0 ? ` · will re-encode at ${playbackSpeed}× playback speed` : ""}${boost ? " · boost on" : ""}`}
         actions={<>
           <Btn variant="secondary" onClick={goUpNext}>+ add more</Btn>
           <Btn variant="cta" onClick={goSync} disabled={overCap}>
@@ -190,6 +209,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
         </div>
         <div style={{ flex: 1 }}></div>
         {setPlaybackSpeed && <SpeedPicker value={playbackSpeed} onChange={setPlaybackSpeed} />}
+        {setBoost && <BoostToggle value={boost} onChange={setBoost} />}
         <div className="ct-meta" style={{ color: "var(--fg-muted)" }}>drag to reorder · video → MP3</div>
       </div>
 

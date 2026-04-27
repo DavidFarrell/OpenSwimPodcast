@@ -104,6 +104,45 @@ describe("convert()", () => {
     expect(calls[0].args.includes("-filter:a")).toBe(false);
   });
 
+  it("appends the boost filter chain when boost is true", async () => {
+    const src = path.join(tmp, "ep.mp3");
+    const dest = path.join(tmp, "ep-boost.mp3");
+    fs.writeFileSync(src, "audio");
+
+    const { spawn, calls } = fakeSpawn((child) => {
+      child.stderr.write("Duration: 00:00:10.00, start: 0\n");
+      fs.writeFileSync(calls[0].args.at(-1), "mp3");
+      child.emit("exit", 0);
+    });
+    await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, speed: 1.0, boost: true });
+    const args = calls[0].args;
+    const idx = args.indexOf("-filter:a");
+    expect(idx).toBeGreaterThan(-1);
+    expect(args[idx + 1]).toMatch(/^acompressor=.*loudnorm=.*volume=6dB.*alimiter=/);
+    expect(args[idx + 1]).not.toContain("atempo=");
+  });
+
+  it("chains atempo before the boost filter when both are set", async () => {
+    const src = path.join(tmp, "ep.mp3");
+    const dest = path.join(tmp, "ep-both.mp3");
+    fs.writeFileSync(src, "audio");
+
+    const { spawn, calls } = fakeSpawn((child) => {
+      child.stderr.write("Duration: 00:00:10.00, start: 0\n");
+      fs.writeFileSync(calls[0].args.at(-1), "mp3");
+      child.emit("exit", 0);
+    });
+    await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, speed: 1.5, boost: true });
+    const args = calls[0].args;
+    const idx = args.indexOf("-filter:a");
+    expect(idx).toBeGreaterThan(-1);
+    const chain = args[idx + 1];
+    const atempoPos = chain.indexOf("atempo=1.5");
+    const compPos = chain.indexOf("acompressor=");
+    expect(atempoPos).toBeGreaterThan(-1);
+    expect(compPos).toBeGreaterThan(atempoPos);
+  });
+
   it("reports monotonic progress from stderr time= lines", async () => {
     const src = path.join(tmp, "ep.mp4");
     const dest = path.join(tmp, "ep.mp3");

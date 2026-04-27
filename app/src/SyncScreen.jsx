@@ -4,29 +4,52 @@ import { Toolbar } from "./Shell.jsx";
 import { fnameFor } from "./TodayScreen.jsx";
 import { formatMB } from "./useDevice.js";
 
-const STAGES = [
-  { id: "finalise", label: "Finalise order", detail: "locking slot numbers" },
-  { id: "delete",   label: "Remove old",    detail: "delete superseded files" },
-  { id: "convert",  label: "Convert video", detail: "extract audio @ 128kbps" },
-  { id: "transfer", label: "Transfer",      detail: "copy to OpenSwim Pro" },
-  { id: "verify",   label: "Verify",        detail: "checksum + eject-safe" },
-];
+function buildStages({ hasVideo, playbackSpeed, boost }) {
+  const reEncode = playbackSpeed !== 1.0 || boost;
+  let encodeDetail;
+  if (hasVideo && reEncode) {
+    const tags = [];
+    if (playbackSpeed !== 1.0) tags.push(`${playbackSpeed}×`);
+    if (boost) tags.push("boost");
+    encodeDetail = `extract audio + ${tags.join(" + ")}`;
+  } else if (hasVideo) {
+    encodeDetail = "extract audio @ 128kbps";
+  } else if (reEncode) {
+    const tags = [];
+    if (playbackSpeed !== 1.0) tags.push(`${playbackSpeed}×`);
+    if (boost) tags.push("boost");
+    encodeDetail = `apply ${tags.join(" + ")}`;
+  } else {
+    encodeDetail = "no encoding needed";
+  }
+  return [
+    { id: "finalise", label: "Finalise order", detail: "locking slot numbers" },
+    { id: "delete",   label: "Remove old",    detail: "delete superseded files" },
+    { id: "convert",  label: "Encode",        detail: encodeDetail },
+    { id: "transfer", label: "Transfer",      detail: "copy to OpenSwim Pro" },
+    { id: "verify",   label: "Verify",        detail: "checksum + eject-safe" },
+  ];
+}
 
 function logKey(evt) {
   return evt.uuid ? `${evt.stage}:${evt.uuid}` : `${evt.stage}:${evt.text}`;
 }
 
-export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onArm, setMountState, devicePath, downloadByUuid = {}, playbackSpeed = 1.0 }) {
+export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onArm, setMountState, devicePath, downloadByUuid = {}, playbackSpeed = 1.0, boost = false }) {
   const fullQueue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
   const readyQueue = fullQueue.filter((it) => downloadByUuid[it.uuid]?.state === "ready");
   const skipped = fullQueue.filter((it) => !readyQueue.includes(it));
   const videoCount = readyQueue.filter((x) => x.kind === "VIDEO").length;
   const totalMB = readyQueue.reduce((s, x) => s + x.sizeMB, 0);
   const queue = readyQueue;
+  const STAGES = useMemo(() => buildStages({
+    hasVideo: videoCount > 0, playbackSpeed, boost,
+  }), [videoCount, playbackSpeed, boost]);
 
   const spec = useMemo(() => ({
     devicePath,
     speed: playbackSpeed,
+    boost,
     queue: readyQueue.map((it, i) => ({
       uuid: it.uuid,
       url: it.url,
@@ -38,7 +61,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       sizeMB: it.sizeMB,
       durMin: it.durMin,
     })),
-  }), [readyQueue, devicePath, playbackSpeed]);
+  }), [readyQueue, devicePath, playbackSpeed, boost]);
 
   const [phase, setPhase] = useState(armed ? "running" : "idle");
   const [serverPlan, setServerPlan] = useState([]);
@@ -134,14 +157,20 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
 
   if (phase === "idle") {
     const removedPreview = onDevice.filter((d) => !queue.some((q) => (d.uuid && q.uuid === d.uuid) || q.show === d.show)).length;
-    const skipNote = skipped.length ? ` · ${skipped.length} skipped (unreachable)` : "";
     return (
       <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
         <Toolbar
           label={`Transfer · ${queue.length} ready${skipped.length ? ` · ${skipped.length} skipped` : ""}`}
           title={devicePath ? "Ready when you are." : "No headphones connected."}
           subtitle={devicePath
-            ? `${totalMB.toFixed(1)}MB across ${queue.length} file${queue.length !== 1 ? "s" : ""} · ~${removedPreview} to remove · ${videoCount} video→audio${playbackSpeed !== 1.0 ? ` · re-encoding at ${playbackSpeed}× speed` : ""}${skipNote}`
+            ? [
+                `${totalMB.toFixed(1)}MB across ${queue.length} file${queue.length !== 1 ? "s" : ""}`,
+                removedPreview > 0 ? `~${removedPreview} to remove` : null,
+                videoCount > 0 ? `${videoCount} video→audio` : null,
+                playbackSpeed !== 1.0 ? `re-encoding at ${playbackSpeed}× speed` : null,
+                boost ? "volume boost on" : null,
+                skipped.length ? `${skipped.length} skipped (unreachable)` : null,
+              ].filter(Boolean).join(" · ")
             : "Plug in your OpenSwim Pro before transferring."}
           actions={<>
             <Btn variant="ghost" onClick={onBack}>back to line-up</Btn>
@@ -205,9 +234,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
               <div style={{ minWidth: 0 }}>
                 <div className="stage__label">{st.label}</div>
                 <div className="stage__label stage__detail" style={{ marginTop: 3 }}>
-                  {st.state === "done" ? `done · ${st.total}` :
-                   st.state === "active" ? `${st.detail} · ${st.done}/${st.total}` :
-                   st.total ? `${st.total} pending` : st.detail}
+                  {st.state === "done" ? "done" : st.detail}
                 </div>
               </div>
               <div className="stage__right">

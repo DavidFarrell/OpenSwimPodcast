@@ -33,9 +33,11 @@ class AbortError extends Error {
   constructor() { super("aborted"); this.name = "AbortError"; }
 }
 
+const BOOST_FILTER = "acompressor=threshold=-22dB:ratio=3:attack=5:release=80:makeup=4dB,loudnorm=I=-14:LRA=9:TP=-1.0,volume=6dB,alimiter=limit=0.97:level=disabled";
+
 async function convert({
   src, dest,
-  bitrate = "128k", mono = true, speed = 1.0,
+  bitrate = "128k", mono = true, speed = 1.0, boost = false,
   ffmpegPath = defaultFfmpegPath,
   spawn = defaultSpawn,
   onProgress, signal,
@@ -54,6 +56,10 @@ async function convert({
   const tmp = `${dest}.tmp`;
   try { await fsp.unlink(tmp); } catch {}
 
+  const filters = [];
+  if (speed && speed !== 1.0) filters.push(`atempo=${speed}`);
+  if (boost) filters.push(BOOST_FILTER);
+
   const args = [
     "-y",
     "-hide_banner",
@@ -63,7 +69,7 @@ async function convert({
     "-b:a", bitrate,
     "-f", "mp3",
   ];
-  if (speed && speed !== 1.0) args.push("-filter:a", `atempo=${speed}`);
+  if (filters.length) args.push("-filter:a", filters.join(","));
   if (mono) args.push("-ac", "1");
   args.push(tmp);
 
@@ -128,4 +134,4 @@ async function convert({
   });
 }
 
-module.exports = { convert, parseDuration, parseTime, AbortError };
+module.exports = { convert, parseDuration, parseTime, AbortError, BOOST_FILTER };
