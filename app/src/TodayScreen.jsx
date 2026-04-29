@@ -113,7 +113,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   const [dragId, setDragId] = useState(null);
   const [dropTarget, setDropTarget] = useState(null);
 
-  const removed = onDevice.filter((d) => !queue.some((q) => (d.uuid && q.uuid === d.uuid) || q.show === d.show));
+  const removed = onDevice.filter((d) => !queue.some((q) => d.uuid && q.uuid && q.uuid === d.uuid));
 
   const remove = (id) => {
     setSelected((s) => s.filter((x) => x !== id));
@@ -221,7 +221,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
 
         {queue.map((it, idx) => {
           const slot = idx + 1;
-          const prev = onDevice.find((d) => (d.uuid && d.uuid === it.uuid) || d.show === it.show);
+          const prev = onDevice.find((d) => d.uuid && it.uuid && d.uuid === it.uuid);
           const fname = fnameFor(it.show, slot, "mp3");
           const isRename = prev && prev.fname && prev.fname !== fname;
           const fate = isRename ? "rename" : "new";

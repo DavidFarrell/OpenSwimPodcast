@@ -135,9 +135,8 @@ export default function App() {
     setRouteRaw(r);
   };
 
-  const onDeviceIds = onDevice
-    .map((d) => items.find((x) => (d.uuid && x.uuid === d.uuid) || x.show === d.show)?.id)
-    .filter(Boolean);
+  const onDeviceUuids = new Set(onDevice.map((d) => d.uuid).filter(Boolean));
+  const onDeviceIds = items.filter((x) => x.uuid && onDeviceUuids.has(x.uuid)).map((x) => x.id);
   const usedMB = onDevice.reduce((s, x) => s + (x.sizeMB || 0), 0);
 
   const refreshManifest = useCallback(() => {
