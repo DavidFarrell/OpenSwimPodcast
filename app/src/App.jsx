@@ -13,6 +13,11 @@ import {
   loadAnnounceOff, saveAnnounceOff,
   effectiveAnnounce,
 } from "./announcePrefs.js";
+import {
+  loadTrimGlobal, saveTrimGlobal,
+  loadTrimOff, saveTrimOff,
+  effectiveTrim,
+} from "./trimPrefs.js";
 
 const pc = () => (typeof window !== "undefined" && window.openswim && window.openswim.pocketcasts) || null;
 
@@ -51,6 +56,25 @@ export default function App() {
     });
   };
   const [announceStatus, setAnnounceStatus] = useState({});
+  // Trim-interstitials intent (P2d). Universal toggle + per-episode OFF overrides,
+  // persisted exactly like announce above. Passive trim status (per uuid) is
+  // collected from the P2c sync:event stream.
+  const [trimOn, setTrimOnRaw] = useState(() => loadTrimGlobal());
+  const setTrimOn = (v) => {
+    setTrimOnRaw(!!v);
+    saveTrimGlobal(!!v);
+  };
+  const [trimOff, setTrimOffRaw] = useState(() => loadTrimOff());
+  const setTrimEpisode = (uuid, enabled) => {
+    if (!uuid) return;
+    setTrimOffRaw((prev) => {
+      const next = new Set(prev);
+      if (enabled) next.delete(uuid); else next.add(uuid);
+      saveTrimOff(next);
+      return next;
+    });
+  };
+  const [trimStatus, setTrimStatus] = useState({});
   const [selected, setSelected] = useState([]);
   const [order, setOrder] = useState([]);
   const [syncArmed, setSyncArmed] = useState(false);
@@ -86,6 +110,33 @@ export default function App() {
     const off = api.onEvent((evt) => {
       if (evt && evt.type === "announce" && evt.uuid) {
         setAnnounceStatus((prev) => ({ ...prev, [evt.uuid]: evt.state }));
+      }
+    });
+    return typeof off === "function" ? off : undefined;
+  }, []);
+
+  // Push the effective per-episode Trim intent to the P2c IPC for every queued
+  // episode. Same off-intent discipline as announce: record an explicit ON or
+  // OFF per uuid so a stale queued ON never wins over a chosen OFF (CARDINAL
+  // RULE - a per-episode disable must be honoured, never risk a bad cut).
+  useEffect(() => {
+    const api = typeof window !== "undefined" && window.openswim && window.openswim.trim;
+    if (!api || !api.set) return;
+    for (const id of order) {
+      const it = items.find((x) => x.id === id);
+      if (!it || !it.uuid) continue;
+      api.set(it.uuid, effectiveTrim(it.uuid, trimOn, trimOff));
+    }
+  }, [trimOn, trimOff, order, items]);
+
+  // Passive trim status badge feed (P2c emits trim events during sync). States:
+  // analysing / ready / needs-review / skipped.
+  useEffect(() => {
+    const api = typeof window !== "undefined" && window.openswim && window.openswim.sync;
+    if (!api || !api.onEvent) return;
+    const off = api.onEvent((evt) => {
+      if (evt && evt.type === "trim" && evt.uuid) {
+        setTrimStatus((prev) => ({ ...prev, [evt.uuid]: evt.state }));
       }
     });
     return typeof off === "function" ? off : undefined;
@@ -272,6 +323,11 @@ export default function App() {
                 announceOff={announceOff}
                 setAnnounceEpisode={setAnnounceEpisode}
                 announceStatus={announceStatus}
+                trimOn={trimOn}
+                setTrimOn={setTrimOn}
+                trimOff={trimOff}
+                setTrimEpisode={setTrimEpisode}
+                trimStatus={trimStatus}
                 devicePath={device.mounted ? device.path : null}
                 setShowMountDialog={setShowMountDialog} />
             )}
