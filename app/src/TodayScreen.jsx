@@ -3,6 +3,7 @@ import { Btn, CoverArt, DragHandle } from "./Atoms.jsx";
 import { Toolbar } from "./Shell.jsx";
 import { effectiveAnnounce } from "./announcePrefs.js";
 import { effectiveTrim } from "./trimPrefs.js";
+import { CutlistReview } from "./CutlistReview.jsx";
 
 import { fnameFor } from "./slugShow.js";
 export { fnameFor };
@@ -212,6 +213,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   playbackSpeed = 1.0, setPlaybackSpeed, boost = false, setBoost,
   announceOn = false, setAnnounceOn, announceOff, setAnnounceEpisode, announceStatus = {},
   trimOn = false, setTrimOn, trimOff, setTrimEpisode, trimStatus = {},
+  trimCuts = {}, trimDecisions = {}, onTrimDecide,
   devicePath, setShowMountDialog }) {
 
   const offSet = announceOff || new Set();
@@ -343,7 +345,8 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
           const isRename = prev && prev.fname && prev.fname !== fname;
           const fate = isRename ? "rename" : "new";
           return (
-            <div key={it.id} className="today-row" data-fate={fate}
+            <div key={it.id}>
+            <div className="today-row" data-fate={fate}
               draggable
               data-dragging={dragId === it.id ? "true" : undefined}
               data-drop-above={dropTarget && dropTarget.id === it.id && dropTarget.pos === "above" ? "true" : undefined}
@@ -397,6 +400,13 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
                 <button className="ct-btn ct-btn--ghost ct-btn--sm" onClick={() => remove(it.id)}
                   style={{ color: "var(--destructive)" }} title="remove">✕</button>
               </div>
+            </div>
+            {trimOn && it.uuid && !trimOffSet.has(it.uuid) && (
+              <CutlistReview uuid={it.uuid}
+                trimEntry={{ cuts: trimCuts[it.uuid] || [] }}
+                decisions={trimDecisions[it.uuid] || {}}
+                onDecide={onTrimDecide} />
+            )}
             </div>
           );
         })}

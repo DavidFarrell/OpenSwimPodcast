@@ -9,6 +9,7 @@ const require = createRequire(import.meta.url);
 const {
   getAnnounce, setAnnounce, listAnnounce, resolveAnnounceQueue,
   getTrim, setTrim, listTrim, resolveTrimQueue, getTrimStatus, recordTrimEvent,
+  setTrimDecision, getTrimDecisions, cutKey, buildHandlers,
 } = require("./ipc.cjs");
 
 describe("announce toggle intent (ipc helpers, { ok, data } surface)", () => {
@@ -137,5 +138,58 @@ describe("trim status surface (recordTrimEvent / getTrimStatus)", () => {
   it("ignores non-trim events", () => {
     recordTrimEvent({ type: "stage", stage: "convert", state: "done" });
     expect(getTrimStatus("epB")).toEqual({ status: "idle", cuts: [] });
+  });
+});
+
+describe("trim review decisions (setTrimDecision / getTrimDecisions, P3a)", () => {
+  const cut = { startSec: 1390, endSec: 1445, needsReview: true, reasons: ["over-threshold"], label: "ad" };
+
+  it("returns an empty map for an episode with no decisions (default = keep)", () => {
+    expect(getTrimDecisions("no-decisions-yet")).toEqual({});
+  });
+
+  it("records a remove decision keyed by a stable ms-rounded cut key", () => {
+    const key = cutKey(cut);
+    expect(setTrimDecision("epD", cut, "remove")).toBe("remove");
+    expect(getTrimDecisions("epD")).toEqual({ [key]: "remove" });
+  });
+
+  it("a later keep overrides an earlier remove for the same cut", () => {
+    const key = cutKey(cut);
+    setTrimDecision("epE", cut, "remove");
+    setTrimDecision("epE", cut, "keep");
+    expect(getTrimDecisions("epE")).toEqual({ [key]: "keep" });
+  });
+
+  it("coerces any non-remove decision to keep (CARDINAL: only explicit remove cuts)", () => {
+    const key = cutKey(cut);
+    expect(setTrimDecision("epF", cut, "garbage")).toBe("keep");
+    expect(getTrimDecisions("epF")).toEqual({ [key]: "keep" });
+  });
+
+  it("ignores a missing uuid or an unmappable cut without throwing", () => {
+    expect(setTrimDecision(undefined, cut, "remove")).toBe(null);
+    expect(setTrimDecision("epG", {}, "remove")).toBe(null);
+    expect(getTrimDecisions("epG")).toEqual({});
+    expect(getTrimDecisions(undefined)).toEqual({});
+  });
+
+  it("cutKey matches the renderer cutKey (decisions round-trip across processes)", () => {
+    expect(cutKey(cut)).toBe("1390000-1445000");
+  });
+
+  it("the trim:decide IPC handler degrades gracefully on a null/missing payload (does not throw)", () => {
+    const decide = buildHandlers()["trim:decide"];
+    // A null or undefined payload from a malformed IPC call must not throw when
+    // the handler destructures { uuid, cut, decision }. It returns null (no
+    // decision recorded == keep), honouring the cardinal rule. This would throw
+    // a TypeError if the handler destructured the payload directly.
+    expect(() => decide(null, null)).not.toThrow();
+    expect(decide(null, null)).toBe(null);
+    expect(() => decide(null, undefined)).not.toThrow();
+    expect(decide(null, undefined)).toBe(null);
+    // A well-formed payload still records as before.
+    expect(decide(null, { uuid: "epH", cut, decision: "remove" })).toBe("remove");
+    expect(getTrimDecisions("epH")).toEqual({ [cutKey(cut)]: "remove" });
   });
 });

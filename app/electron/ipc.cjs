@@ -118,6 +118,42 @@ function recordTrimEvent(e) {
   });
 }
 
+// Per-episode keep/remove decisions for FLAGGED (needs-review) cuts, recorded by
+// the P3a coarse cut-list review surface. Keyed by uuid, then by a stable cut key
+// (startSec-endSec rounded to ms) so a decision sticks to a specific proposed
+// cut even if the cut list is re-read. The value is "keep" or "remove".
+//
+// CARDINAL RULE: a flagged cut defaults to KEEP (no decision recorded == keep
+// the audio intact). Only an explicit "remove" decision lets the cut be applied.
+// Nothing here forces a cut; recording a decision never throws.
+const trimDecisions = new Map();
+
+function cutKey(cut) {
+  if (!cut) return null;
+  const s = Number(cut.startSec);
+  const e = Number(cut.endSec);
+  if (!Number.isFinite(s) || !Number.isFinite(e)) return null;
+  return `${Math.round(s * 1000)}-${Math.round(e * 1000)}`;
+}
+
+function setTrimDecision(uuid, cut, decision) {
+  if (!uuid) return null;
+  const key = cutKey(cut);
+  if (!key) return null;
+  const value = decision === "remove" ? "remove" : "keep";
+  let m = trimDecisions.get(uuid);
+  if (!m) { m = new Map(); trimDecisions.set(uuid, m); }
+  m.set(key, value);
+  return value;
+}
+
+function getTrimDecisions(uuid) {
+  if (!uuid) return {};
+  const m = trimDecisions.get(uuid);
+  if (!m) return {};
+  return Object.fromEntries(m.entries());
+}
+
 let syncController = null;
 
 async function startSync(spec) {
@@ -176,8 +212,8 @@ function extFromUrl(url) {
   return "mp3";
 }
 
-function registerAll() {
-  const handlers = {
+function buildHandlers() {
+  return {
     "pc:status": () => pc.status(),
     "pc:login": (_, { email, password }) => pc.login(email, password),
     "pc:logout": () => pc.logout(),
@@ -212,7 +248,13 @@ function registerAll() {
     "trim:set": (_, { uuid, enabled }) => setTrim(uuid, enabled),
     "trim:list": () => listTrim(),
     "trim:status": (_, uuid) => getTrimStatus(uuid),
+    "trim:decide": (_, payload) => { const { uuid, cut, decision } = payload || {}; return setTrimDecision(uuid, cut, decision); },
+    "trim:decisions": (_, uuid) => getTrimDecisions(uuid),
   };
+}
+
+function registerAll() {
+  const handlers = buildHandlers();
   for (const [ch, fn] of Object.entries(handlers)) {
     ipcMain.handle(ch, async (ev, arg) => {
       try { return { ok: true, data: await fn(ev, arg) }; }
@@ -223,6 +265,8 @@ function registerAll() {
 
 module.exports = {
   registerPocketCasts: registerAll,
+  buildHandlers,
   getAnnounce, setAnnounce, listAnnounce, resolveAnnounceQueue,
   getTrim, setTrim, listTrim, resolveTrimQueue, getTrimStatus, recordTrimEvent,
+  setTrimDecision, getTrimDecisions, cutKey,
 };

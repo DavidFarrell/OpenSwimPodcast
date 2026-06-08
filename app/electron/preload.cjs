@@ -56,5 +56,7 @@ contextBridge.exposeInMainWorld("openswim", {
     set: (uuid, enabled) => invoke("trim:set", { uuid, enabled }),
     list: () => invoke("trim:list"),
     status: (uuid) => invoke("trim:status", uuid),
+    decide: (uuid, cut, decision) => invoke("trim:decide", { uuid, cut, decision }),
+    decisions: (uuid) => invoke("trim:decisions", uuid),
   },
 });

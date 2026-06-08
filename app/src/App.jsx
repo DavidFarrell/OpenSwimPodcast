@@ -75,6 +75,22 @@ export default function App() {
     });
   };
   const [trimStatus, setTrimStatus] = useState({});
+  // Proposed cut lists per uuid (P3a) - the trim sync:event carries the full cut
+  // list alongside the state. Kept separate from the string status above so the
+  // badge can stay a simple string while the review surface reads the cuts.
+  const [trimCuts, setTrimCuts] = useState({});
+  // Recorded keep/remove decisions for FLAGGED cuts, keyed by uuid then cut key
+  // ({ uuid: { "start-end": "keep" | "remove" } }). Default is keep everywhere
+  // (cardinal rule); only an explicit remove lets a flagged cut be applied.
+  const [trimDecisions, setTrimDecisions] = useState({});
+  const onTrimDecide = (uuid, cut, decision) => {
+    if (!uuid || !cut) return;
+    const key = `${Math.round(Number(cut.startSec) * 1000)}-${Math.round(Number(cut.endSec) * 1000)}`;
+    const value = decision === "remove" ? "remove" : "keep";
+    setTrimDecisions((prev) => ({ ...prev, [uuid]: { ...(prev[uuid] || {}), [key]: value } }));
+    const api = typeof window !== "undefined" && window.openswim && window.openswim.trim;
+    if (api && api.decide) api.decide(uuid, cut, value);
+  };
   const [selected, setSelected] = useState([]);
   const [order, setOrder] = useState([]);
   const [syncArmed, setSyncArmed] = useState(false);
@@ -137,6 +153,9 @@ export default function App() {
     const off = api.onEvent((evt) => {
       if (evt && evt.type === "trim" && evt.uuid) {
         setTrimStatus((prev) => ({ ...prev, [evt.uuid]: evt.state }));
+        if (Array.isArray(evt.cuts)) {
+          setTrimCuts((prev) => ({ ...prev, [evt.uuid]: evt.cuts }));
+        }
       }
     });
     return typeof off === "function" ? off : undefined;
@@ -328,6 +347,9 @@ export default function App() {
                 trimOff={trimOff}
                 setTrimEpisode={setTrimEpisode}
                 trimStatus={trimStatus}
+                trimCuts={trimCuts}
+                trimDecisions={trimDecisions}
+                onTrimDecide={onTrimDecide}
                 devicePath={device.mounted ? device.path : null}
                 setShowMountDialog={setShowMountDialog} />
             )}
