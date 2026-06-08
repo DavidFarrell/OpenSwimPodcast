@@ -129,8 +129,10 @@ async function summariseTranscript({
       {
         role: "system",
         content:
-          "You summarise a podcast episode in one or two sentences (under 45 words) "
-          + "for a spoken intro. Be concrete about the actual topic. Reply only with the JSON object.",
+          "You write the topic of a podcast episode as a short phrase (under 35 words) "
+          + "that completes the sentence \"This episode is about ...\". Be concrete about the "
+          + "actual topic. Do NOT begin with \"This episode\", \"In this episode\" or \"Today\" - "
+          + "start straight at the topic. Reply only with the JSON object.",
       },
       {
         role: "user",
@@ -169,7 +171,9 @@ async function buildAnnouncementText({
 
   const parts = [];
   if (cleanShow) parts.push(`This is ${cleanShow}.`);
-  if (cleanTitle) parts.push(`${cleanTitle}.`);
+  // Only add a full stop when the title does not already end in terminal
+  // punctuation, so a title like "Who Won?" does not become "Who Won?.".
+  if (cleanTitle) parts.push(/[.!?]$/.test(cleanTitle) ? cleanTitle : `${cleanTitle}.`);
   let metadata = parts.join(" ");
 
   let summary = "";
@@ -179,10 +183,21 @@ async function buildAnnouncementText({
 
   let full = metadata;
   if (summary) {
-    // The appended sentence must terminate with a period. Strip any trailing
-    // punctuation/whitespace off the summary first so we never double up.
+    // Strip any trailing punctuation/whitespace so we never double up the stop.
     const sentenceBody = summary.replace(/[\s.!?]+$/, "");
-    full = `${metadata} This episode is about ${sentenceBody}.`.trim();
+    // The model is asked for a bare topic phrase to slot into "This episode is
+    // about ...". When it instead returns a full sentence that already opens
+    // with "This episode" / "In this episode" / "Today" / "The episode", using
+    // the lead-in would stutter ("...is about This episode investigates..."), so
+    // we drop the lead-in and use the model's sentence as-is.
+    const alreadyAClause = /^((in|on)\s+)?(this|today'?s?|the)\s+(episode|podcast|show|week|conversation)\b/i.test(sentenceBody)
+      || /^today\b/i.test(sentenceBody);
+    if (alreadyAClause) {
+      const standalone = sentenceBody.charAt(0).toUpperCase() + sentenceBody.slice(1);
+      full = `${metadata} ${standalone}.`.trim();
+    } else {
+      full = `${metadata} This episode is about ${sentenceBody}.`.trim();
+    }
   }
 
   full = stripTtsUnfriendly(full);

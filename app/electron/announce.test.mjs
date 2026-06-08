@@ -193,4 +193,49 @@ describe("buildAnnouncementText()", () => {
     expect(await buildAnnouncementText({ show: "Only Show" })).toBe("This is Only Show.");
     expect(await buildAnnouncementText({ title: "Only Title" })).toBe("Only Title.");
   });
+
+  it("does not double the stop when the title ends in ? or ! (no 'Alliance?.')", async () => {
+    const q = await buildAnnouncementText({ show: "The Rest Is Classified", title: "Did the CIA do it?" });
+    expect(q).toBe("This is The Rest Is Classified. Did the CIA do it?");
+    expect(q).not.toMatch(/\?\./);
+    const bang = await buildAnnouncementText({ show: "S", title: "Boom!" });
+    expect(bang).toBe("This is S. Boom!");
+    expect(bang).not.toMatch(/!\./);
+  });
+
+  it("does not stutter when the summary already opens as a full episode clause", async () => {
+    // The model sometimes returns a whole sentence beginning "This episode ..."
+    // despite being asked for a bare phrase. We must not produce
+    // "...is about This episode investigates...".
+    const fetch = fakeFetch("This episode investigates an alleged CIA plot");
+    const out = await buildAnnouncementText({
+      show: "The Rest Is Classified",
+      title: "The Plot",
+      transcript: TRANSCRIPT,
+      llm: { fetch },
+    });
+    expect(out).toBe("This is The Rest Is Classified. The Plot. This episode investigates an alleged CIA plot.");
+    expect(out).not.toMatch(/is about This episode/i);
+  });
+
+  it("handles 'In this episode' / 'Today' openers without the lead-in", async () => {
+    const f1 = fakeFetch("In this episode the hosts debate kelp policy");
+    expect(await buildAnnouncementText({ show: "Nature Pod", title: "Kelp", transcript: TRANSCRIPT, llm: { fetch: f1 } }))
+      .toBe("This is Nature Pod. Kelp. In this episode the hosts debate kelp policy.");
+    const f2 = fakeFetch("today's deep dive into otters");
+    const out2 = await buildAnnouncementText({ show: "Nature Pod", title: "Otters", transcript: TRANSCRIPT, llm: { fetch: f2 } });
+    expect(out2).toBe("This is Nature Pod. Otters. Today's deep dive into otters.");
+    expect(out2).not.toMatch(/is about today/i);
+  });
+
+  it("still uses the 'is about' lead-in for a bare topic phrase", async () => {
+    const fetch = fakeFetch("a CIA plot against the 1970 World Cup squad");
+    const out = await buildAnnouncementText({
+      show: "The Rest Is Classified",
+      title: "Goalkeeper Down",
+      transcript: TRANSCRIPT,
+      llm: { fetch },
+    });
+    expect(out).toBe("This is The Rest Is Classified. Goalkeeper Down. This episode is about a CIA plot against the 1970 World Cup squad.");
+  });
 });
