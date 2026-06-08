@@ -74,4 +74,63 @@ describe("converter smoke test (real ffmpeg-static)", () => {
     expect(seconds).toBeGreaterThan(1.3);
     expect(seconds).toBeLessThan(1.8);
   }, 30_000);
+
+  it("cuts a middle slice out of a tone and the output is shorter by the cut length", async () => {
+    tmp = mkTmp();
+    const src = path.join(tmp, "ep.mp3");
+    const dest = path.join(tmp, "out.mp3");
+
+    // 6s episode tone at 44.1kHz mp3.
+    const re = spawnSync(ffmpegPath, [
+      "-y", "-hide_banner",
+      "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+      "-ar", "44100", "-c:a", "libmp3lame", src,
+    ]);
+    expect(re.status).toBe(0);
+
+    function probe(file) {
+      const p = spawnSync(ffmpegPath, ["-hide_banner", "-i", file], { encoding: "utf8" });
+      const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(p.stderr || "");
+      expect(m).not.toBeNull();
+      return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+    }
+
+    const original = probe(src);
+    expect(original).toBeGreaterThan(5.8);
+
+    // Cut the 2s..4s middle slice (2s removed); expect ~4s out.
+    const result = await convert({ src, dest, speed: 1.0, cuts: [[2, 4]] });
+    expect(fs.existsSync(dest)).toBe(true);
+    expect(result.bytes).toBeGreaterThan(0);
+
+    const cutDuration = probe(dest);
+    // Original ~6s minus the 2s cut ~= 4s. Allow mp3-frame slack.
+    expect(cutDuration).toBeGreaterThan(3.6);
+    expect(cutDuration).toBeLessThan(4.4);
+    expect(original - cutDuration).toBeGreaterThan(1.6);
+  }, 30_000);
+
+  it("cutting nothing produces the same duration as the input (zero-regression)", async () => {
+    tmp = mkTmp();
+    const src = path.join(tmp, "ep.mp3");
+    const dest = path.join(tmp, "out.mp3");
+
+    const re = spawnSync(ffmpegPath, [
+      "-y", "-hide_banner",
+      "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+      "-ar", "44100", "-c:a", "libmp3lame", src,
+    ]);
+    expect(re.status).toBe(0);
+
+    const result = await convert({ src, dest, speed: 1.0, cuts: [] });
+    expect(fs.existsSync(dest)).toBe(true);
+
+    const probe = spawnSync(ffmpegPath, ["-hide_banner", "-i", dest], { encoding: "utf8" });
+    const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(probe.stderr || "");
+    expect(m).not.toBeNull();
+    const seconds = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+    expect(seconds).toBeGreaterThan(2.8);
+    expect(seconds).toBeLessThan(3.2);
+    expect(result.bytes).toBeGreaterThan(0);
+  }, 30_000);
 });

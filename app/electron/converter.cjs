@@ -35,10 +35,62 @@ class AbortError extends Error {
 
 const BOOST_FILTER = "acompressor=threshold=-22dB:ratio=3:attack=5:release=80:makeup=4dB,loudnorm=I=-14:LRA=9:TP=-1.0,volume=6dB,alimiter=limit=0.97:level=disabled";
 
+// Sanitise the caller-supplied cut ranges into a clean, sorted, non-overlapping
+// list of [startSec, endSec] pairs on the ORIGINAL (pre-speed) episode timeline.
+// Invalid, empty, inverted, negative-start or non-finite ranges are dropped
+// (degrade safely - never trim something we cannot reason about). Overlapping /
+// touching ranges are merged so the resulting aselect expression has no
+// redundant terms.
+function normaliseCuts(cuts) {
+  if (!Array.isArray(cuts) || cuts.length === 0) return [];
+  const clean = [];
+  for (const c of cuts) {
+    if (!Array.isArray(c) || c.length < 2) continue;
+    const start = Number(c[0]);
+    const end = Number(c[1]);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+    // A negative start is out-of-bounds/malformed - drop the whole range (cut
+    // nothing) rather than reshaping it to start at 0, which would silently
+    // trim real beginning-of-episode content. Trim cardinal rule: zero false
+    // positives - never trim audio we cannot reason about.
+    if (start < 0) continue;
+    const lo = start;
+    const hi = end;
+    if (hi <= lo) continue; // empty or inverted range - skip, cut nothing
+    clean.push([lo, hi]);
+  }
+  if (clean.length === 0) return [];
+  clean.sort((a, b) => a[0] - b[0]);
+  const merged = [clean[0].slice()];
+  for (let i = 1; i < clean.length; i++) {
+    const prev = merged[merged.length - 1];
+    const cur = clean[i];
+    if (cur[0] <= prev[1]) {
+      if (cur[1] > prev[1]) prev[1] = cur[1];
+    } else {
+      merged.push(cur.slice());
+    }
+  }
+  return merged;
+}
+
+// Build the ffmpeg aselect+asetpts filter pair that DROPS the given ranges from
+// an audio stream and repacks the surviving samples into a gapless timeline.
+// Returns [] when there is nothing to cut, so the caller emits exactly the same
+// args it does today (zero-regression guarantee). aselect keeps samples whose
+// timestamp is NOT inside any cut range; asetpts re-bases the PTS so the gap
+// closes. The cut math is on the ORIGINAL timeline, so this MUST run before any
+// atempo/boost stage.
+function buildCutFilters(ranges) {
+  if (!ranges || ranges.length === 0) return [];
+  const terms = ranges.map(([a, b]) => `between(t,${a},${b})`).join("+");
+  return [`aselect='not(${terms})'`, "asetpts=N/SR/TB"];
+}
+
 async function convert({
   src, dest,
   bitrate = "128k", mono = true, speed = 1.0, boost = false,
-  introPath = null,
+  introPath = null, cuts = null,
   ffmpegPath = defaultFfmpegPath,
   spawn = defaultSpawn,
   onProgress, signal,
@@ -57,9 +109,12 @@ async function convert({
   const tmp = `${dest}.tmp`;
   try { await fsp.unlink(tmp); } catch {}
 
-  // The speed-up and boost only ever apply to the EPISODE audio. The spoken
-  // intro must play at normal speed, so it is never run through these filters.
-  const episodeFilters = [];
+  // The cut ranges, speed-up and boost only ever apply to the EPISODE audio.
+  // The spoken intro must play at normal speed and uncut, so it is never run
+  // through these filters. Cuts are on the ORIGINAL timeline, so the aselect/
+  // asetpts drop MUST come first, before atempo changes the time base.
+  const cutFilters = buildCutFilters(normaliseCuts(cuts));
+  const episodeFilters = [...cutFilters];
   if (speed && speed !== 1.0) episodeFilters.push(`atempo=${speed}`);
   if (boost) episodeFilters.push(BOOST_FILTER);
 
@@ -173,4 +228,4 @@ async function convert({
   });
 }
 
-module.exports = { convert, parseDuration, parseTime, AbortError, BOOST_FILTER };
+module.exports = { convert, parseDuration, parseTime, AbortError, BOOST_FILTER, normaliseCuts, buildCutFilters };

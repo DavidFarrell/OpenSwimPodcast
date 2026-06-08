@@ -6,7 +6,7 @@ import path from "node:path";
 import os from "node:os";
 
 const require = createRequire(import.meta.url);
-const { convert, parseDuration, parseTime } = require("./converter.cjs");
+const { convert, parseDuration, parseTime, normaliseCuts, buildCutFilters } = require("./converter.cjs");
 
 function mkTmp() { return fs.mkdtempSync(path.join(os.tmpdir(), "os-conv-")); }
 function rmTmp(d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
@@ -39,6 +39,59 @@ describe("converter parsers", () => {
   it("parseTime extracts time= from a stderr progress line", () => {
     expect(parseTime("size=100kB time=00:02:30.50 bitrate=128 speed=2x")).toBeCloseTo(150.5, 2);
     expect(parseTime("no time in here")).toBe(null);
+  });
+});
+
+describe("normaliseCuts()", () => {
+  it("returns [] for absent/empty/non-array input (cut nothing)", () => {
+    expect(normaliseCuts(null)).toEqual([]);
+    expect(normaliseCuts(undefined)).toEqual([]);
+    expect(normaliseCuts([])).toEqual([]);
+    expect(normaliseCuts("nope")).toEqual([]);
+  });
+
+  it("drops empty, inverted, non-finite and malformed ranges (degrade safely)", () => {
+    expect(normaliseCuts([[5, 5]])).toEqual([]);        // empty
+    expect(normaliseCuts([[10, 5]])).toEqual([]);       // inverted
+    expect(normaliseCuts([[NaN, 5]])).toEqual([]);      // non-finite
+    expect(normaliseCuts([[0, Infinity]])).toEqual([]); // non-finite
+    expect(normaliseCuts([[3]])).toEqual([]);           // malformed
+    expect(normaliseCuts([["a", "b"]])).toEqual([]);    // non-numeric
+  });
+
+  it("drops negative-start ranges entirely (never trims real start-of-episode content)", () => {
+    // A negative start is out-of-bounds/malformed. Per the trim cardinal rule
+    // (zero false positives) it must be discarded - NOT reshaped to start at 0,
+    // which would silently cut the beginning of the episode.
+    expect(normaliseCuts([[-3, 10]])).toEqual([]);
+    expect(normaliseCuts([[-1, 5], [20, 30]])).toEqual([[20, 30]]); // bad one dropped, good one kept
+  });
+
+  it("sorts and merges overlapping / touching ranges", () => {
+    expect(normaliseCuts([[30, 40], [10, 20]])).toEqual([[10, 20], [30, 40]]);
+    expect(normaliseCuts([[10, 25], [20, 40]])).toEqual([[10, 40]]); // overlap
+    expect(normaliseCuts([[10, 20], [20, 30]])).toEqual([[10, 30]]); // touching
+  });
+});
+
+describe("buildCutFilters()", () => {
+  it("returns [] when there are no ranges (zero-regression)", () => {
+    expect(buildCutFilters([])).toEqual([]);
+    expect(buildCutFilters(null)).toEqual([]);
+  });
+
+  it("builds aselect+asetpts dropping a single range", () => {
+    expect(buildCutFilters([[10, 20]])).toEqual([
+      "aselect='not(between(t,10,20))'",
+      "asetpts=N/SR/TB",
+    ]);
+  });
+
+  it("sums between() terms for multiple ranges", () => {
+    expect(buildCutFilters([[10, 20], [30, 40]])).toEqual([
+      "aselect='not(between(t,10,20)+between(t,30,40))'",
+      "asetpts=N/SR/TB",
+    ]);
   });
 });
 
@@ -229,6 +282,123 @@ describe("convert()", () => {
     const idx = args.indexOf("-filter:a");
     expect(idx).toBeGreaterThan(-1);
     expect(args[idx + 1]).toBe("atempo=1.5");
+  });
+
+  it("prepends the aselect/asetpts cut filters before atempo in the single-input -filter:a chain", async () => {
+    const src = path.join(tmp, "ep.mp3");
+    const dest = path.join(tmp, "ep-cut.mp3");
+    fs.writeFileSync(src, "audio");
+
+    const { spawn, calls } = fakeSpawn((child) => {
+      child.stderr.write("Duration: 00:00:30.00, start: 0\n");
+      fs.writeFileSync(calls[0].args.at(-1), "mp3");
+      child.emit("exit", 0);
+    });
+
+    await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, speed: 1.5, boost: true, cuts: [[10, 20]] });
+    const args = calls[0].args;
+    expect(args.includes("-filter_complex")).toBe(false);
+    const idx = args.indexOf("-filter:a");
+    expect(idx).toBeGreaterThan(-1);
+    const chain = args[idx + 1];
+    // Order: cut drop (aselect/asetpts) -> atempo -> boost. Cuts are on the
+    // original timeline so they MUST come before atempo changes the timebase.
+    const selPos = chain.indexOf("aselect='not(between(t,10,20))'");
+    const ptsPos = chain.indexOf("asetpts=N/SR/TB");
+    const atempoPos = chain.indexOf("atempo=1.5");
+    const compPos = chain.indexOf("acompressor=");
+    expect(selPos).toBe(0);
+    expect(ptsPos).toBeGreaterThan(selPos);
+    expect(atempoPos).toBeGreaterThan(ptsPos);
+    expect(compPos).toBeGreaterThan(atempoPos);
+  });
+
+  it("applies cuts to the EPISODE stream (not the intro) in the concat filter graph, before atempo/boost", async () => {
+    const src = path.join(tmp, "ep.mp3");
+    const dest = path.join(tmp, "ep-intro-cut.mp3");
+    const intro = path.join(tmp, "intro.wav");
+    fs.writeFileSync(src, "episode audio");
+    fs.writeFileSync(intro, "intro wav");
+
+    const { spawn, calls } = fakeSpawn((child) => {
+      child.stderr.write("Duration: 00:00:30.00, start: 0\n");
+      fs.writeFileSync(calls[0].args.at(-1), "mp3");
+      child.emit("exit", 0);
+    });
+
+    await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, introPath: intro, speed: 1.5, boost: true, cuts: [[10, 20], [40, 50]] });
+    const args = calls[0].args;
+    const fc = args[args.indexOf("-filter_complex") + 1];
+
+    const epStage = fc.split(";").find((s) => s.endsWith("[ep]"));
+    expect(epStage).toBeDefined();
+    expect(epStage.startsWith("[1:a]")).toBe(true);
+    // Both cut ranges, summed, dropped before atempo/boost.
+    const selPos = epStage.indexOf("aselect='not(between(t,10,20)+between(t,40,50))'");
+    const ptsPos = epStage.indexOf("asetpts=N/SR/TB");
+    const atempoPos = epStage.indexOf("atempo=1.5");
+    const compPos = epStage.indexOf("acompressor=");
+    expect(selPos).toBeGreaterThan(-1);
+    expect(ptsPos).toBeGreaterThan(selPos);
+    expect(atempoPos).toBeGreaterThan(ptsPos);
+    expect(compPos).toBeGreaterThan(atempoPos);
+
+    // The intro stream is never cut.
+    const introStage = fc.split(";").find((s) => s.endsWith("[intro]"));
+    expect(introStage).toBeDefined();
+    expect(introStage).not.toContain("aselect");
+    expect(introStage).not.toContain("asetpts");
+  });
+
+  it("cutting nothing yields byte-for-byte identical args to no cuts at all (zero-regression)", async () => {
+    const src = path.join(tmp, "ep.mp3");
+    const intro = path.join(tmp, "intro.wav");
+    fs.writeFileSync(src, "audio");
+    fs.writeFileSync(intro, "intro");
+
+    async function argsFor(opts) {
+      const dest = path.join(tmp, `out-${Math.random().toString(36).slice(2)}.mp3`);
+      const { spawn, calls } = fakeSpawn((child) => {
+        child.stderr.write("Duration: 00:00:30.00, start: 0\n");
+        fs.writeFileSync(calls[0].args.at(-1), "mp3");
+        child.emit("exit", 0);
+      });
+      await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, ...opts });
+      // Drop the trailing tmp path (varies by dest) before comparing.
+      return calls[0].args.slice(0, -1);
+    }
+
+    // Single-input path: empty/null/invalid-only cuts == no cuts.
+    const base = await argsFor({ speed: 1.5, boost: true });
+    expect(await argsFor({ speed: 1.5, boost: true, cuts: null })).toEqual(base);
+    expect(await argsFor({ speed: 1.5, boost: true, cuts: [] })).toEqual(base);
+    expect(await argsFor({ speed: 1.5, boost: true, cuts: [[5, 5], [10, 5]] })).toEqual(base);
+
+    // Concat (intro) path too.
+    const baseIntro = await argsFor({ introPath: intro, speed: 1.5, boost: true });
+    expect(await argsFor({ introPath: intro, speed: 1.5, boost: true, cuts: [] })).toEqual(baseIntro);
+    expect(await argsFor({ introPath: intro, speed: 1.5, boost: true, cuts: [[20, 10]] })).toEqual(baseIntro);
+  });
+
+  it("can cut at speed 1.0 with no boost (cut-only, no atempo present)", async () => {
+    const src = path.join(tmp, "ep.mp3");
+    const dest = path.join(tmp, "ep-cutonly.mp3");
+    fs.writeFileSync(src, "audio");
+
+    const { spawn, calls } = fakeSpawn((child) => {
+      child.stderr.write("Duration: 00:00:30.00, start: 0\n");
+      fs.writeFileSync(calls[0].args.at(-1), "mp3");
+      child.emit("exit", 0);
+    });
+
+    await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, speed: 1.0, boost: false, cuts: [[10, 20]] });
+    const args = calls[0].args;
+    const idx = args.indexOf("-filter:a");
+    expect(idx).toBeGreaterThan(-1);
+    const chain = args[idx + 1];
+    expect(chain).toBe("aselect='not(between(t,10,20))',asetpts=N/SR/TB");
+    expect(chain).not.toContain("atempo");
+    expect(chain).not.toContain("acompressor=");
   });
 
   it("reports monotonic progress from stderr time= lines", async () => {
