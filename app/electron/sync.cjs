@@ -3,6 +3,9 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { convert: defaultConvert } = require("./converter.cjs");
+const { transcribe: defaultTranscribe } = require("./transcribe.cjs");
+const { buildAnnouncementText: defaultBuildAnnouncementText } = require("./announce.cjs");
+const { renderIntro: defaultRenderIntro } = require("./tts.cjs");
 
 class AbortError extends Error {
   constructor() { super("aborted"); this.name = "AbortError"; }
@@ -137,6 +140,14 @@ async function defaultCopy(src, dest, { onProgress, signal } = {}) {
   return { bytes: totalBytes };
 }
 
+// An episode needs the converter (a re-encode) when it is a non-mp3 source, when
+// speed/boost is on, or when an intro is being prepended - the front-concat
+// resamples and re-encodes, so a plain copy will not do.
+function itemNeedsEncode(it, needsEncode) {
+  const isVideo = it.ext && it.ext !== "mp3";
+  return isVideo || needsEncode || !!it.announce;
+}
+
 function buildPlan({ queue, existingDeviceFiles = [], existingManifest = [], needsEncode = false }) {
   const plan = [];
   plan.push({ stage: "finalise", kind: "info", text: `order locked · ${queue.length} slots` });
@@ -148,8 +159,13 @@ function buildPlan({ queue, existingDeviceFiles = [], existingManifest = [], nee
   }
 
   for (const it of queue) {
-    const isVideo = it.ext && it.ext !== "mp3";
-    if (isVideo || needsEncode) {
+    if (it.announce) {
+      plan.push({ stage: "announce", kind: "ann", text: it.title, uuid: it.uuid, slot: it.slot });
+    }
+  }
+
+  for (const it of queue) {
+    if (itemNeedsEncode(it, needsEncode)) {
       plan.push({ stage: "convert", kind: "conv", text: it.title, uuid: it.uuid, slot: it.slot });
     }
   }
@@ -162,11 +178,48 @@ function buildPlan({ queue, existingDeviceFiles = [], existingManifest = [], nee
   return plan;
 }
 
+// Generate the intro WAV for a single episode: transcribe -> announce text ->
+// tts. Returns the introPath on success, or null on any failure. Degrades
+// safely - the metadata-only announcement text always works even without a
+// transcript, and renderIntro falls back to null if TTS/ffmpeg is unavailable.
+// Never throws into the pipeline.
+//
+// Transcription is best-effort, NOT a gate: if the transcriber is unavailable,
+// unsupported, or throws, we degrade transcript to null and still build the
+// metadata-only announce text ("This is {show}. {title}.") and run TTS. Episode
+// identification must never depend on a working transcriber/model.
+async function generateIntro({
+  it, src, outPath,
+  transcribeFn, buildAnnouncementTextFn, renderIntroFn,
+  llm, signal,
+}) {
+  try {
+    let transcript = null;
+    try {
+      transcript = await transcribeFn({ src, signal });
+    } catch {
+      transcript = null; // no transcript -> metadata-only intro, keep going
+    }
+    const text = await buildAnnouncementTextFn({
+      show: it.show, title: it.title, transcript, llm,
+    });
+    if (!text || !String(text).trim()) return null;
+    const intro = await renderIntroFn({ text, outPath, signal });
+    return intro || null;
+  } catch {
+    return null;
+  }
+}
+
 async function runSync({
   devicePath, cacheDir, queue,
   speed = 1.0, boost = false,
   convertFn = defaultConvert,
   copyFn = defaultCopy,
+  transcribeFn = defaultTranscribe,
+  buildAnnouncementTextFn = defaultBuildAnnouncementText,
+  renderIntroFn = defaultRenderIntro,
+  llm,
   onEvent,
   signal,
 } = {}) {
@@ -191,6 +244,39 @@ async function runSync({
   emit({ type: "stage", stage: "finalise", state: "active" });
   emit({ type: "stage", stage: "finalise", state: "done" });
 
+  // Stage: announce
+  // For every episode with the Announce toggle on, kick off intro generation in
+  // the BACKGROUND so transcription/summarisation/TTS overlap with the delete
+  // and copy work happening below. Each episode's intro promise is awaited just
+  // before that episode is converted, so the intro is always ready in time for
+  // the front-concat. A failed intro degrades to a normal converted episode.
+  const announceItems = queue
+    .map((it, i) => ({ it, i }))
+    .filter(({ it }) => it.announce);
+  const introPaths = new Array(queue.length).fill(null);
+  const introJobs = new Array(queue.length).fill(null);
+
+  if (announceItems.length) {
+    emit({ type: "stage", stage: "announce", state: "active" });
+    for (const { it, i } of announceItems) {
+      const src = path.join(cacheDir, `${it.uuid}.${it.ext || "mp3"}`);
+      const outPath = path.join(cacheDir, `${it.uuid}.intro.wav`);
+      emit({ type: "announce", uuid: it.uuid, slot: it.slot, state: "analysing" });
+      introJobs[i] = generateIntro({
+        it, src, outPath,
+        transcribeFn, buildAnnouncementTextFn, renderIntroFn,
+        llm, signal,
+      }).then((intro) => {
+        introPaths[i] = intro;
+        emit({
+          type: "announce", uuid: it.uuid, slot: it.slot,
+          state: intro ? "ready" : "skipped",
+        });
+        return intro;
+      });
+    }
+  }
+
   // Stage: delete
   emit({ type: "stage", stage: "delete", state: "active" });
   const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
@@ -209,21 +295,42 @@ async function runSync({
   }
   emit({ type: "stage", stage: "delete", state: "done" });
 
+  // Let the background intro jobs settle before we convert. They have been
+  // running during the delete stage; awaiting here guarantees each introPath is
+  // resolved (or null) before its episode is front-concatenated.
+  if (announceItems.length) {
+    await Promise.allSettled(introJobs.filter(Boolean));
+    emit({ type: "stage", stage: "announce", state: "done" });
+  }
+
   // Stage: convert
   emit({ type: "stage", stage: "convert", state: "active" });
   const sources = new Array(queue.length);
   const speedSuffix = (speed && speed !== 1.0) ? `-speed${String(speed).replace(".", "_")}` : "";
   const boostSuffix = boost ? "-boost" : "";
-  const variantSuffix = `${speedSuffix}${boostSuffix}`;
   for (let i = 0; i < queue.length; i++) {
     throwIfAborted();
     const it = queue[i];
     const downloadedPath = path.join(cacheDir, `${it.uuid}.${it.ext || "mp3"}`);
+    const introPath = introPaths[i];
+    // Decide encode on the RESOLVED intro, not just the toggle: if Announce was
+    // on but the intro was skipped (transcribe/LLM/TTS unavailable) and nothing
+    // else forces a re-encode, the episode is a plain mp3 at speed 1.0 and is
+    // copied directly - degrading to the normal episode exactly as required.
     const isVideo = it.ext && it.ext !== "mp3";
-    if (!isVideo && !needsEncode) {
+    // Whether the episode would still need a re-encode even with the intro
+    // dropped (video source, or speed/boost on). Drives the convert-failure
+    // fallback below: if false, dropping the intro means a plain copy.
+    const mustEncodeWithoutIntro = isVideo || needsEncode;
+    const mustEncode = mustEncodeWithoutIntro || !!introPath;
+    if (!mustEncode) {
       sources[i] = downloadedPath;
       continue;
     }
+    // The intro is baked into the variant key so a cached intro-less encode is
+    // never reused for an intro'd episode (and vice versa).
+    const introSuffix = introPath ? "-intro" : "";
+    const variantSuffix = `${speedSuffix}${boostSuffix}${introSuffix}`;
     const mp3Path = path.join(cacheDir, `${it.uuid}${variantSuffix}.mp3`);
     let cached = false;
     try { cached = (await fsp.stat(mp3Path)).size > 0; } catch {}
@@ -233,15 +340,64 @@ async function runSync({
       continue;
     }
     emit({ type: "log", stage: "convert", state: "active", uuid: it.uuid, text: it.title });
-    await convertFn({
-      src: downloadedPath, dest: mp3Path, speed, boost, signal,
-      onProgress: ({ seconds, durationSec }) => emit({
-        type: "log", stage: "convert", state: "active", uuid: it.uuid, text: it.title,
-        bytes: seconds, total: durationSec,
-      }),
-    });
-    sources[i] = mp3Path;
-    emit({ type: "log", stage: "convert", state: "done", uuid: it.uuid, text: it.title });
+    try {
+      await convertFn({
+        src: downloadedPath, dest: mp3Path, speed, boost, introPath, signal,
+        onProgress: ({ seconds, durationSec }) => emit({
+          type: "log", stage: "convert", state: "active", uuid: it.uuid, text: it.title,
+          bytes: seconds, total: durationSec,
+        }),
+      });
+      sources[i] = mp3Path;
+      emit({ type: "log", stage: "convert", state: "done", uuid: it.uuid, text: it.title });
+    } catch (e) {
+      if (e && e.name === "AbortError") throw e;
+      // The intro front-concat is an extra step layered on top of whatever the
+      // episode would have needed anyway. If the convert fails while an intro
+      // was being prepended, we must never lose the real audio because of the
+      // intro. So for ANY episode type (mp3, sped/boosted, or video) we RETRY
+      // the normal conversion WITHOUT the introPath. Only if that retry also
+      // fails is it a genuine conversion failure that surfaces.
+      //
+      // - A plain speed-1.0 mp3 has no encode to redo, so the retry is just a
+      //   direct copy of the original (the un-introd episode ships).
+      // - A video / sped / boosted episode is re-encoded without the intro so
+      //   it still ships as a playable mp3, just without the spoken intro.
+      if (introPath) {
+        const fallbackSuffix = `${speedSuffix}${boostSuffix}`;
+        const fallbackPath = path.join(cacheDir, `${it.uuid}${fallbackSuffix}.mp3`);
+        try {
+          if (!mustEncodeWithoutIntro) {
+            // No re-encode needed once the intro is dropped - ship the original.
+            sources[i] = downloadedPath;
+          } else {
+            let cachedFallback = false;
+            try { cachedFallback = (await fsp.stat(fallbackPath)).size > 0; } catch {}
+            if (!cachedFallback) {
+              await convertFn({
+                src: downloadedPath, dest: fallbackPath, speed, boost, introPath: null, signal,
+                onProgress: ({ seconds, durationSec }) => emit({
+                  type: "log", stage: "convert", state: "active", uuid: it.uuid, text: it.title,
+                  bytes: seconds, total: durationSec,
+                }),
+              });
+            }
+            sources[i] = fallbackPath;
+          }
+          emit({ type: "announce", uuid: it.uuid, slot: it.slot, state: "skipped" });
+          emit({ type: "log", stage: "convert", state: "done", uuid: it.uuid, text: `${it.title} · intro skipped (${e.message})` });
+          continue;
+        } catch (e2) {
+          if (e2 && e2.name === "AbortError") throw e2;
+          // The retry without the intro also failed - this is a real conversion
+          // failure, not an intro problem. Surface it.
+          emit({ type: "log", stage: "convert", state: "error", uuid: it.uuid, text: `${it.title}: ${e2.message}` });
+          throw e2;
+        }
+      }
+      emit({ type: "log", stage: "convert", state: "error", uuid: it.uuid, text: `${it.title}: ${e.message}` });
+      throw e;
+    }
   }
   emit({ type: "stage", stage: "convert", state: "done" });
 
@@ -293,4 +449,4 @@ async function runSync({
   return { ok: true, files: dests };
 }
 
-module.exports = { runSync, buildPlan, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE };
+module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE };

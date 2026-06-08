@@ -46,4 +46,9 @@ contextBridge.exposeInMainWorld("openswim", {
       return () => ipcRenderer.removeListener("sync:event", listener);
     },
   },
+  announce: {
+    get: (uuid) => invoke("announce:get", uuid),
+    set: (uuid, enabled) => invoke("announce:set", { uuid, enabled }),
+    list: () => invoke("announce:list"),
+  },
 });

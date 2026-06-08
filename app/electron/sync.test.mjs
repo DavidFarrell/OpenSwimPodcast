@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 
 const require = createRequire(import.meta.url);
-const { runSync, isOurFilename, sha256File, buildPlan, readManifest, writeManifest, MANIFEST_FILE } = require("./sync.cjs");
+const { runSync, isOurFilename, sha256File, buildPlan, itemNeedsEncode, readManifest, writeManifest, MANIFEST_FILE } = require("./sync.cjs");
 
 function mkTmp(label = "os-sync-") { return fs.mkdtempSync(path.join(os.tmpdir(), label)); }
 function rmTmp(d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
@@ -270,5 +270,355 @@ describe("readManifest", () => {
   it("written manifest is at .openswim-manifest.json", async () => {
     await writeManifest(dir, [{ uuid: "a", title: "t", show: "S", filename: "01_s.mp3", sizeMB: 1, durMin: 1, ext: "mp3", slot: 1 }]);
     expect(fs.existsSync(path.join(dir, MANIFEST_FILE))).toBe(true);
+  });
+});
+
+describe("itemNeedsEncode", () => {
+  it("forces an encode for an mp3 episode at speed 1.0 once Announce is on (intro needs re-encode)", () => {
+    const plain = { ext: "mp3", announce: false };
+    const intro = { ext: "mp3", announce: true };
+    expect(itemNeedsEncode(plain, false)).toBe(false);
+    expect(itemNeedsEncode(intro, false)).toBe(true);
+  });
+});
+
+describe("buildPlan with announce", () => {
+  it("adds an announce entry and a convert entry for each announced episode", () => {
+    const queue = [
+      makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" }),
+      { ...makeItem({ uuid: "b", show: "RADIOLAB", slot: 2, ext: "mp3", filename: "02_radiolab.mp3" }), announce: true },
+    ];
+    const plan = buildPlan({ queue });
+    const announce = plan.filter((p) => p.stage === "announce");
+    const convert = plan.filter((p) => p.stage === "convert");
+    expect(announce.map((p) => p.uuid)).toEqual(["b"]);
+    // "a" is a plain mp3 at speed 1.0 - no encode; only "b" needs the converter.
+    expect(convert.map((p) => p.uuid)).toEqual(["b"]);
+  });
+});
+
+describe("runSync announce stage", () => {
+  let devicePath, cacheDir;
+
+  beforeEach(() => {
+    devicePath = mkTmp("os-device-");
+    cacheDir = mkTmp("os-cache-");
+  });
+  afterEach(() => { rmTmp(devicePath); rmTmp(cacheDir); });
+
+  function announceItem(over = {}) {
+    return { ...makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" }), announce: true, ...over };
+  }
+
+  it("announce-on happy path: builds an intro and converts with introPath", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+
+    const transcribeFn = vi.fn(async ({ src }) => {
+      expect(src).toBe(path.join(cacheDir, "a.mp3"));
+      return { segments: [{ text: "hello world" }] };
+    });
+    const buildAnnouncementTextFn = vi.fn(async ({ show, title, transcript }) => {
+      expect(show).toBe("HARD FORK");
+      expect(transcript).toBeTruthy();
+      return "This is HARD FORK. Ep. This episode is about hello world.";
+    });
+    const renderIntroFn = vi.fn(async ({ text, outPath }) => {
+      expect(text).toContain("This is HARD FORK");
+      fs.writeFileSync(outPath, Buffer.from("intro wav"));
+      return outPath;
+    });
+    const convertFn = vi.fn(async ({ src, dest, introPath }) => {
+      expect(src).toBe(path.join(cacheDir, "a.mp3"));
+      expect(introPath).toBe(path.join(cacheDir, "a.intro.wav"));
+      fs.writeFileSync(dest, Buffer.from("converted with intro"));
+      return { bytes: 20, durationSec: 60, fromCache: false };
+    });
+
+    const events = [];
+    const res = await runSync({
+      devicePath, cacheDir, queue: [announceItem()],
+      transcribeFn, buildAnnouncementTextFn, renderIntroFn, convertFn,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(res.ok).toBe(true);
+    expect(transcribeFn).toHaveBeenCalledOnce();
+    expect(renderIntroFn).toHaveBeenCalledOnce();
+    expect(convertFn).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).toString()).toBe("converted with intro");
+
+    const ann = events.filter((e) => e.type === "announce" && e.uuid === "a").map((e) => e.state);
+    expect(ann).toEqual(["analysing", "ready"]);
+    const stagesDone = events.filter((e) => e.type === "stage" && e.state === "done").map((e) => e.stage);
+    expect(stagesDone).toContain("announce");
+  });
+
+  it("a failing TTS skips the intro and degrades to the normal episode (plain mp3 copied, no introPath)", async () => {
+    const payload = Buffer.from("episode audio");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);
+
+    const transcribeFn = vi.fn(async () => ({ segments: [{ text: "hi" }] }));
+    const buildAnnouncementTextFn = vi.fn(async () => "This is HARD FORK. Ep.");
+    // TTS unavailable - renderIntro degrades to null.
+    const renderIntroFn = vi.fn(async () => null);
+    // No intro and a plain mp3 at speed 1.0 means no re-encode: the converter is
+    // never invoked and the original episode is copied straight through.
+    const convertFn = vi.fn();
+
+    const events = [];
+    const res = await runSync({
+      devicePath, cacheDir, queue: [announceItem()],
+      transcribeFn, buildAnnouncementTextFn, renderIntroFn, convertFn,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(res.ok).toBe(true);
+    expect(convertFn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
+    const ann = events.filter((e) => e.type === "announce" && e.uuid === "a").map((e) => e.state);
+    expect(ann).toEqual(["analysing", "skipped"]);
+  });
+
+  it("a throwing transcribe degrades to a metadata-only intro - the episode still gets an intro, not a skip", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+
+    // Transcriber unavailable / unsupported / crashing must NOT abort the intro:
+    // the announce-text builder still produces "This is {show}. {title}." from
+    // metadata alone and we proceed to TTS.
+    const transcribeFn = vi.fn(async () => { throw new Error("fast-diarize crashed"); });
+    const buildAnnouncementTextFn = vi.fn(async ({ show, title, transcript }) => {
+      expect(transcript).toBeNull();
+      return `This is ${show}. ${title}.`;
+    });
+    const renderIntroFn = vi.fn(async ({ text, outPath }) => {
+      expect(text).toBe("This is HARD FORK. Ep.");
+      fs.writeFileSync(outPath, Buffer.from("metadata-only intro wav"));
+      return outPath;
+    });
+    const convertFn = vi.fn(async ({ introPath, dest }) => {
+      expect(introPath).toBe(path.join(cacheDir, "a.intro.wav"));
+      fs.writeFileSync(dest, Buffer.from("converted with metadata intro"));
+      return { bytes: 30, durationSec: 60, fromCache: false };
+    });
+
+    const events = [];
+    const res = await runSync({
+      devicePath, cacheDir, queue: [announceItem()],
+      transcribeFn, buildAnnouncementTextFn, renderIntroFn, convertFn,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(res.ok).toBe(true);
+    expect(transcribeFn).toHaveBeenCalledOnce();
+    expect(buildAnnouncementTextFn).toHaveBeenCalledOnce();
+    expect(renderIntroFn).toHaveBeenCalledOnce();
+    expect(convertFn).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).toString()).toBe("converted with metadata intro");
+    const ann = events.filter((e) => e.type === "announce" && e.uuid === "a").map((e) => e.state);
+    expect(ann).toEqual(["analysing", "ready"]);
+  });
+
+  it("a failing TTS still re-encodes a video episode (degrades the intro only, not the conversion)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp4"), Buffer.from("video bytes"));
+
+    const transcribeFn = vi.fn(async () => ({ segments: [{ text: "hi" }] }));
+    const buildAnnouncementTextFn = vi.fn(async () => "This is HARD FORK. Ep.");
+    const renderIntroFn = vi.fn(async () => null);
+    const convertFn = vi.fn(async ({ dest, introPath }) => {
+      expect(introPath).toBeNull();
+      fs.writeFileSync(dest, Buffer.from("converted video no intro"));
+      return { bytes: 24, durationSec: 60, fromCache: false };
+    });
+
+    const res = await runSync({
+      devicePath, cacheDir,
+      queue: [announceItem({ ext: "mp4" })],
+      transcribeFn, buildAnnouncementTextFn, renderIntroFn, convertFn,
+      onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    expect(convertFn).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).toString()).toBe("converted video no intro");
+  });
+
+  it("an intro is produced but the front-concat convert fails: original episode still ships, batch continues", async () => {
+    // The intro WAV renders fine, but the front-concat re-encode (ffmpeg) blows
+    // up. Because the episode is a plain speed-1.0 mp3, the only reason it was
+    // being re-encoded at all was the intro - so on convert failure we degrade
+    // to shipping the original un-introd episode. No real audio may be lost and
+    // the ffmpeg outage must not throw into the pipeline.
+    const epPayload = Buffer.from("real episode audio that must survive");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), epPayload);
+    // A second plain episode after it to prove the batch continues.
+    const bPayload = Buffer.from("second episode audio");
+    fs.writeFileSync(path.join(cacheDir, "b.mp3"), bPayload);
+
+    const transcribeFn = vi.fn(async () => ({ segments: [{ text: "hi" }] }));
+    const buildAnnouncementTextFn = vi.fn(async () => "This is HARD FORK. Ep.");
+    const renderIntroFn = vi.fn(async ({ outPath }) => {
+      fs.writeFileSync(outPath, Buffer.from("intro wav"));
+      return outPath;
+    });
+    const convertFn = vi.fn(async ({ introPath }) => {
+      expect(introPath).toBe(path.join(cacheDir, "a.intro.wav"));
+      throw new Error("front-concat ffmpeg crashed");
+    });
+
+    const events = [];
+    const res = await runSync({
+      devicePath, cacheDir,
+      queue: [
+        announceItem(),
+        makeItem({ uuid: "b", show: "RADIOLAB", slot: 2, ext: "mp3", filename: "02_radiolab.mp3" }),
+      ],
+      transcribeFn, buildAnnouncementTextFn, renderIntroFn, convertFn,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(res.ok).toBe(true);
+    expect(convertFn).toHaveBeenCalledOnce();
+    // The original (un-introd) audio is what reaches the device, not the intro mix.
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(epPayload)).toBe(true);
+    // The rest of the batch still ships.
+    expect(fs.readFileSync(path.join(devicePath, "02_radiolab.mp3")).equals(bPayload)).toBe(true);
+    // The episode is reported as skipped once the intro mix failed.
+    const ann = events.filter((e) => e.type === "announce" && e.uuid === "a").map((e) => e.state);
+    expect(ann).toEqual(["analysing", "ready", "skipped"]);
+    // No convert error event escaped - the failure was degraded, not propagated.
+    expect(events.some((e) => e.stage === "convert" && e.state === "error")).toBe(false);
+  });
+
+  it("intro'd VIDEO episode whose front-concat fails retries WITHOUT introPath and the batch continues", async () => {
+    // Regression for the over-narrow degrade path: previously a convert failure
+    // for a video (needs-encode) intro'd episode rethrew and aborted the whole
+    // batch. Required behaviour: retry the normal conversion without the intro;
+    // that retry succeeds, the episode ships intro-less, and the batch carries on.
+    fs.writeFileSync(path.join(cacheDir, "a.mp4"), Buffer.from("video bytes"));
+    const bPayload = Buffer.from("second episode audio");
+    fs.writeFileSync(path.join(cacheDir, "b.mp3"), bPayload);
+
+    const transcribeFn = vi.fn(async () => ({ segments: [{ text: "hi" }] }));
+    const buildAnnouncementTextFn = vi.fn(async () => "This is HARD FORK. Ep.");
+    const renderIntroFn = vi.fn(async ({ outPath }) => {
+      fs.writeFileSync(outPath, Buffer.from("intro wav"));
+      return outPath;
+    });
+    const convertFn = vi.fn(async ({ introPath, dest }) => {
+      if (introPath) throw new Error("front-concat ffmpeg crashed");
+      // Retry without the intro re-encodes the video to a playable mp3.
+      fs.writeFileSync(dest, Buffer.from("video converted no intro"));
+      return { bytes: 24, durationSec: 60, fromCache: false };
+    });
+
+    const events = [];
+    const res = await runSync({
+      devicePath, cacheDir,
+      queue: [
+        announceItem({ ext: "mp4" }),
+        makeItem({ uuid: "b", show: "RADIOLAB", slot: 2, ext: "mp3", filename: "02_radiolab.mp3" }),
+      ],
+      transcribeFn, buildAnnouncementTextFn, renderIntroFn, convertFn,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(res.ok).toBe(true);
+    // Two convert calls: the intro attempt (threw) and the intro-less retry.
+    expect(convertFn).toHaveBeenCalledTimes(2);
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).toString()).toBe("video converted no intro");
+    expect(fs.readFileSync(path.join(devicePath, "02_radiolab.mp3")).equals(bPayload)).toBe(true);
+    const ann = events.filter((e) => e.type === "announce" && e.uuid === "a").map((e) => e.state);
+    expect(ann).toEqual(["analysing", "ready", "skipped"]);
+    expect(events.some((e) => e.stage === "convert" && e.state === "error")).toBe(false);
+  });
+
+  it("intro'd SPEED/BOOST episode whose front-concat fails retries WITHOUT introPath and ships sped audio", async () => {
+    // Same degrade requirement for a needs-encode mp3 (speed/boost on): the
+    // first convert (with intro) fails, the retry without intro succeeds and the
+    // sped/boosted episode still ships - intro dropped, audio preserved.
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+
+    const transcribeFn = vi.fn(async () => ({ segments: [{ text: "hi" }] }));
+    const buildAnnouncementTextFn = vi.fn(async () => "This is HARD FORK. Ep.");
+    const renderIntroFn = vi.fn(async ({ outPath }) => {
+      fs.writeFileSync(outPath, Buffer.from("intro wav"));
+      return outPath;
+    });
+    const convertFn = vi.fn(async ({ introPath, dest, speed, boost }) => {
+      if (introPath) throw new Error("front-concat ffmpeg crashed");
+      expect(speed).toBeCloseTo(1.5, 3);
+      expect(boost).toBe(true);
+      fs.writeFileSync(dest, Buffer.from("sped boosted no intro"));
+      return { bytes: 20, durationSec: 60, fromCache: false };
+    });
+
+    const events = [];
+    const res = await runSync({
+      devicePath, cacheDir,
+      queue: [announceItem()],
+      speed: 1.5, boost: true,
+      transcribeFn, buildAnnouncementTextFn, renderIntroFn, convertFn,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(res.ok).toBe(true);
+    expect(convertFn).toHaveBeenCalledTimes(2);
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).toString()).toBe("sped boosted no intro");
+    const ann = events.filter((e) => e.type === "announce" && e.uuid === "a").map((e) => e.state);
+    expect(ann).toEqual(["analysing", "ready", "skipped"]);
+    expect(events.some((e) => e.stage === "convert" && e.state === "error")).toBe(false);
+  });
+
+  it("a GENUINE conversion failure (intro-less retry also fails) still surfaces as a failure", async () => {
+    // Degradation must not swallow real failures: when the retry without the
+    // intro ALSO throws, the batch fails - that is a true conversion error, not
+    // an intro problem.
+    fs.writeFileSync(path.join(cacheDir, "a.mp4"), Buffer.from("video bytes"));
+
+    const transcribeFn = vi.fn(async () => ({ segments: [{ text: "hi" }] }));
+    const buildAnnouncementTextFn = vi.fn(async () => "This is HARD FORK. Ep.");
+    const renderIntroFn = vi.fn(async ({ outPath }) => {
+      fs.writeFileSync(outPath, Buffer.from("intro wav"));
+      return outPath;
+    });
+    const convertFn = vi.fn(async ({ introPath }) => {
+      if (introPath) throw new Error("front-concat ffmpeg crashed");
+      throw new Error("codec missing - genuine failure");
+    });
+
+    const events = [];
+    await expect(runSync({
+      devicePath, cacheDir,
+      queue: [announceItem({ ext: "mp4" })],
+      transcribeFn, buildAnnouncementTextFn, renderIntroFn, convertFn,
+      onEvent: (e) => events.push(e),
+    })).rejects.toThrow(/genuine failure/i);
+
+    expect(convertFn).toHaveBeenCalledTimes(2);
+    expect(events.some((e) => e.stage === "convert" && e.state === "error")).toBe(true);
+  });
+
+  it("announce-off path is unchanged: no announce events, no intro deps invoked, plain copy", async () => {
+    const payload = Buffer.from("pristine mp3");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);
+
+    const transcribeFn = vi.fn();
+    const renderIntroFn = vi.fn();
+    const convertFn = vi.fn();
+
+    const events = [];
+    await runSync({
+      devicePath, cacheDir,
+      queue: [makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" })],
+      transcribeFn, renderIntroFn, convertFn, speed: 1.0,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(transcribeFn).not.toHaveBeenCalled();
+    expect(renderIntroFn).not.toHaveBeenCalled();
+    expect(convertFn).not.toHaveBeenCalled();
+    expect(events.some((e) => e.type === "announce")).toBe(false);
+    expect(events.some((e) => e.type === "stage" && e.stage === "announce")).toBe(false);
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
   });
 });
