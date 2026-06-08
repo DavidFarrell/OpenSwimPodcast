@@ -154,6 +154,38 @@ function getTrimDecisions(uuid) {
   return Object.fromEntries(m.entries());
 }
 
+// Edited boundaries for FLAGGED cuts (P3b). Keyed by uuid then the ORIGINAL cut
+// key, holding the new { startSec, endSec } the user nudged/typed. The renderer
+// already keeps the edited cut in its own state for an immediate redraw; this
+// store is the persistence layer so an edit survives a re-render / re-process,
+// mirroring trimDecisions above.
+//
+// CARDINAL RULE: an edit only changes WHAT a later REMOVE would cut; it never
+// applies a cut on its own. We reject any edit that is missing, unparseable, or
+// would invert the range (start >= end) so a bad boundary can never be recorded.
+const trimEdits = new Map();
+
+function setTrimEdit(uuid, originalCut, newCut) {
+  if (!uuid) return null;
+  const key = cutKey(originalCut);
+  if (!key || !newCut) return null;
+  const s = Number(newCut.startSec);
+  const e = Number(newCut.endSec);
+  if (!Number.isFinite(s) || !Number.isFinite(e) || s >= e || s < 0) return null;
+  const edited = { startSec: s, endSec: e };
+  let m = trimEdits.get(uuid);
+  if (!m) { m = new Map(); trimEdits.set(uuid, m); }
+  m.set(key, edited);
+  return edited;
+}
+
+function getTrimEdits(uuid) {
+  if (!uuid) return {};
+  const m = trimEdits.get(uuid);
+  if (!m) return {};
+  return Object.fromEntries(m.entries());
+}
+
 let syncController = null;
 
 async function startSync(spec) {
@@ -250,6 +282,8 @@ function buildHandlers() {
     "trim:status": (_, uuid) => getTrimStatus(uuid),
     "trim:decide": (_, payload) => { const { uuid, cut, decision } = payload || {}; return setTrimDecision(uuid, cut, decision); },
     "trim:decisions": (_, uuid) => getTrimDecisions(uuid),
+    "trim:edit": (_, payload) => { const { uuid, originalCut, newCut } = payload || {}; return setTrimEdit(uuid, originalCut, newCut); },
+    "trim:edits": (_, uuid) => getTrimEdits(uuid),
   };
 }
 
@@ -269,4 +303,5 @@ module.exports = {
   getAnnounce, setAnnounce, listAnnounce, resolveAnnounceQueue,
   getTrim, setTrim, listTrim, resolveTrimQueue, getTrimStatus, recordTrimEvent,
   setTrimDecision, getTrimDecisions, cutKey,
+  setTrimEdit, getTrimEdits,
 };

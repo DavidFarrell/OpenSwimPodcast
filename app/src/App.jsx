@@ -18,6 +18,7 @@ import {
   loadTrimOff, saveTrimOff,
   effectiveTrim,
 } from "./trimPrefs.js";
+import { buildTrimAudioUrls, applyCutEdit } from "./trimAudio.js";
 
 const pc = () => (typeof window !== "undefined" && window.openswim && window.openswim.pocketcasts) || null;
 
@@ -90,6 +91,22 @@ export default function App() {
     setTrimDecisions((prev) => ({ ...prev, [uuid]: { ...(prev[uuid] || {}), [key]: value } }));
     const api = typeof window !== "undefined" && window.openswim && window.openswim.trim;
     if (api && api.decide) api.decide(uuid, cut, value);
+  };
+  // Boundary edit for a FLAGGED cut (P3b nudge / typed timestamp). The new cut
+  // already passed cutlistReview's invert guard, so here we just (1) swap the
+  // boundaries in the in-memory cut list for an immediate redraw and (2) persist
+  // the edit through IPC so it survives a re-process. CARDINAL RULE: this only
+  // changes WHAT a later REMOVE would cut - it never applies a cut.
+  const onTrimEdit = (uuid, originalCut, newCut) => {
+    if (!uuid || !originalCut || !newCut) return;
+    setTrimCuts((prev) => {
+      const cur = prev[uuid];
+      const next = applyCutEdit(cur, originalCut, newCut);
+      if (next === cur) return prev;
+      return { ...prev, [uuid]: next };
+    });
+    const api = typeof window !== "undefined" && window.openswim && window.openswim.trim;
+    if (api && api.edit) api.edit(uuid, originalCut, newCut);
   };
   const [selected, setSelected] = useState([]);
   const [order, setOrder] = useState([]);
@@ -350,6 +367,8 @@ export default function App() {
                 trimCuts={trimCuts}
                 trimDecisions={trimDecisions}
                 onTrimDecide={onTrimDecide}
+                onTrimEdit={onTrimEdit}
+                trimAudioUrls={buildTrimAudioUrls(downloadByUuid)}
                 devicePath={device.mounted ? device.path : null}
                 setShowMountDialog={setShowMountDialog} />
             )}

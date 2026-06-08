@@ -213,7 +213,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   playbackSpeed = 1.0, setPlaybackSpeed, boost = false, setBoost,
   announceOn = false, setAnnounceOn, announceOff, setAnnounceEpisode, announceStatus = {},
   trimOn = false, setTrimOn, trimOff, setTrimEpisode, trimStatus = {},
-  trimCuts = {}, trimDecisions = {}, onTrimDecide,
+  trimCuts = {}, trimDecisions = {}, onTrimDecide, onTrimEdit, trimAudioUrls = {},
   devicePath, setShowMountDialog }) {
 
   const offSet = announceOff || new Set();
@@ -405,7 +405,9 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
               <CutlistReview uuid={it.uuid}
                 trimEntry={{ cuts: trimCuts[it.uuid] || [] }}
                 decisions={trimDecisions[it.uuid] || {}}
-                onDecide={onTrimDecide} />
+                audioUrl={trimAudioUrls[it.uuid]}
+                onDecide={onTrimDecide}
+                onEditCut={onTrimEdit} />
             )}
             </div>
           );

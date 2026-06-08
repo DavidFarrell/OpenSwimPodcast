@@ -124,6 +124,11 @@ class DownloadManager {
   list() {
     return [...this.entries.values()].map((e) => ({
       uuid: e.uuid, state: e.state, bytes: e.bytes, total: e.total, error: e.error,
+      // Local cached file path - surfaced so the renderer can play the
+      // converted/original audio (P3b trim preview) once it is ready. Only the
+      // path is exposed, never file contents; consumers should ignore it unless
+      // state === "ready".
+      path: e.dest || null,
     }));
   }
 
@@ -191,7 +196,7 @@ class DownloadManager {
   }
 
   emit(e) {
-    this.onEvent({ uuid: e.uuid, state: e.state, bytes: e.bytes, total: e.total, error: e.error });
+    this.onEvent({ uuid: e.uuid, state: e.state, bytes: e.bytes, total: e.total, error: e.error, path: e.dest || null });
   }
 
   async pump() {

@@ -10,6 +10,7 @@ const {
   getAnnounce, setAnnounce, listAnnounce, resolveAnnounceQueue,
   getTrim, setTrim, listTrim, resolveTrimQueue, getTrimStatus, recordTrimEvent,
   setTrimDecision, getTrimDecisions, cutKey, buildHandlers,
+  setTrimEdit, getTrimEdits,
 } = require("./ipc.cjs");
 
 describe("announce toggle intent (ipc helpers, { ok, data } surface)", () => {
@@ -191,5 +192,56 @@ describe("trim review decisions (setTrimDecision / getTrimDecisions, P3a)", () =
     // A well-formed payload still records as before.
     expect(decide(null, { uuid: "epH", cut, decision: "remove" })).toBe("remove");
     expect(getTrimDecisions("epH")).toEqual({ [cutKey(cut)]: "remove" });
+  });
+});
+
+describe("trim boundary edits (setTrimEdit / getTrimEdits, P3b)", () => {
+  const cut = { startSec: 1390, endSec: 1445, needsReview: true, reasons: ["over-threshold"], label: "ad" };
+
+  it("returns an empty map for an episode with no edits", () => {
+    expect(getTrimEdits("no-edits-yet")).toEqual({});
+  });
+
+  it("records an edit keyed by the ORIGINAL cut key (so it round-trips with decisions)", () => {
+    const key = cutKey(cut);
+    expect(setTrimEdit("epEdit1", cut, { startSec: 1385, endSec: 1450 })).toEqual({ startSec: 1385, endSec: 1450 });
+    expect(getTrimEdits("epEdit1")).toEqual({ [key]: { startSec: 1385, endSec: 1450 } });
+  });
+
+  it("a later edit for the same cut overrides the earlier one", () => {
+    const key = cutKey(cut);
+    setTrimEdit("epEdit2", cut, { startSec: 1380, endSec: 1450 });
+    setTrimEdit("epEdit2", cut, { startSec: 1388, endSec: 1444 });
+    expect(getTrimEdits("epEdit2")).toEqual({ [key]: { startSec: 1388, endSec: 1444 } });
+  });
+
+  // CARDINAL RULE: an edit must never record an inverted / negative range, since
+  // that would describe a bad cut. The store rejects it (returns null) and keeps
+  // the prior boundaries.
+  it("rejects an inverted, equal, negative or non-finite range without recording it", () => {
+    expect(setTrimEdit("epEdit3", cut, { startSec: 1445, endSec: 1390 })).toBe(null);
+    expect(setTrimEdit("epEdit3", cut, { startSec: 100, endSec: 100 })).toBe(null);
+    expect(setTrimEdit("epEdit3", cut, { startSec: -5, endSec: 10 })).toBe(null);
+    expect(setTrimEdit("epEdit3", cut, { startSec: NaN, endSec: 10 })).toBe(null);
+    expect(getTrimEdits("epEdit3")).toEqual({});
+  });
+
+  it("ignores a missing uuid, unmappable original cut, or missing new cut without throwing", () => {
+    expect(setTrimEdit(undefined, cut, { startSec: 1, endSec: 2 })).toBe(null);
+    expect(setTrimEdit("epEdit4", {}, { startSec: 1, endSec: 2 })).toBe(null);
+    expect(setTrimEdit("epEdit4", cut, null)).toBe(null);
+    expect(getTrimEdits("epEdit4")).toEqual({});
+    expect(getTrimEdits(undefined)).toEqual({});
+  });
+
+  it("the trim:edit IPC handler degrades gracefully on a null/missing payload (does not throw)", () => {
+    const edit = buildHandlers()["trim:edit"];
+    expect(() => edit(null, null)).not.toThrow();
+    expect(edit(null, null)).toBe(null);
+    expect(() => edit(null, undefined)).not.toThrow();
+    expect(edit(null, undefined)).toBe(null);
+    expect(edit(null, { uuid: "epEdit5", originalCut: cut, newCut: { startSec: 1385, endSec: 1450 } }))
+      .toEqual({ startSec: 1385, endSec: 1450 });
+    expect(getTrimEdits("epEdit5")).toEqual({ [cutKey(cut)]: { startSec: 1385, endSec: 1450 } });
   });
 });

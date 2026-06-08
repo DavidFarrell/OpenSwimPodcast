@@ -99,3 +99,110 @@ describe("CutlistReview - decision recording", () => {
     expect(() => remove.props.onClick()).not.toThrow();
   });
 });
+
+describe("CutlistReview - P3b boundary edit controls", () => {
+  function findByClass(tree, re) {
+    return walk(tree, (n) => n.props && n.props.className && re.test(n.props.className))[0];
+  }
+  function setup(decisions = {}) {
+    const onEditCut = vi.fn();
+    const tree = renderTree(
+      <CutlistReview uuid="ep-x"
+        trimEntry={{ status: "needs-review", cuts: [flaggedMid] }}
+        decisions={decisions} onEditCut={onEditCut} />
+    );
+    return { onEditCut, tree };
+  }
+
+  it("-5s on start records an edited cut with start moved 5s earlier", () => {
+    const { onEditCut, tree } = setup();
+    findByClass(tree, /cutlist-review__start-minus/).props.onClick();
+    expect(onEditCut).toHaveBeenCalledTimes(1);
+    const [uuid, orig, next] = onEditCut.mock.calls[0];
+    expect(uuid).toBe("ep-x");
+    expect(orig).toBe(flaggedMid);
+    expect(next.startSec).toBe(1385); // 1390 - 5
+    expect(next.endSec).toBe(1445);
+  });
+
+  it("+5s on end records an edited cut with end moved 5s later", () => {
+    const { onEditCut, tree } = setup();
+    findByClass(tree, /cutlist-review__end-plus/).props.onClick();
+    expect(onEditCut.mock.calls[0][2].endSec).toBe(1450); // 1445 + 5
+  });
+
+  it("typing a new start timestamp records the edited boundary", () => {
+    const { onEditCut, tree } = setup();
+    const input = findByClass(tree, /cutlist-review__start-input/);
+    input.props.onBlur({ target: { value: "23:00" } }); // 1380s
+    expect(onEditCut).toHaveBeenCalledTimes(1);
+    expect(onEditCut.mock.calls[0][2].startSec).toBe(1380);
+  });
+
+  it("CARDINAL: an inverting typed start is rejected (no edit recorded, field reset)", () => {
+    const { onEditCut, tree } = setup();
+    const input = findByClass(tree, /cutlist-review__start-input/);
+    const target = { value: "30:00" }; // 1800s, past end 1445 - inverts
+    input.props.onBlur({ target });
+    expect(onEditCut).not.toHaveBeenCalled();
+    expect(target.value).toBe("23:10"); // reset to the cut's real start (1390s)
+  });
+
+  it("an unparseable typed value is rejected and the field reset", () => {
+    const { onEditCut, tree } = setup();
+    const input = findByClass(tree, /cutlist-review__end-input/);
+    const target = { value: "not-a-time" };
+    input.props.onBlur({ target });
+    expect(onEditCut).not.toHaveBeenCalled();
+    expect(target.value).toBe("24:05"); // endSec 1445 -> 24:05
+  });
+
+  it("does not throw when no onEditCut handler is wired", () => {
+    const tree = renderTree(
+      <CutlistReview uuid="ep-x" trimEntry={{ status: "needs-review", cuts: [flaggedMid] }} />
+    );
+    const minus = findByClass(tree, /cutlist-review__start-minus/);
+    expect(() => minus.props.onClick()).not.toThrow();
+  });
+});
+
+describe("CutlistReview - P3b audio previews", () => {
+  function findByClass(tree, re) {
+    return walk(tree, (n) => n.props && n.props.className && re.test(n.props.className))[0];
+  }
+
+  it("renders an <audio> element only when an audioUrl is supplied", () => {
+    const withUrl = renderToStaticMarkup(
+      <CutlistReview uuid="e1"
+        trimEntry={{ status: "needs-review", cuts: [flaggedMid] }}
+        audioUrl="file:///tmp/ep.mp3" />
+    );
+    expect(withUrl).toContain("<audio");
+    expect(withUrl).toContain("cutlist-review__preview-join");
+    const noUrl = renderToStaticMarkup(
+      <CutlistReview uuid="e1" trimEntry={{ status: "needs-review", cuts: [flaggedMid] }} />
+    );
+    expect(noUrl).not.toContain("<audio");
+  });
+
+  it("preview buttons are disabled without an audioUrl", () => {
+    const tree = renderTree(
+      <CutlistReview uuid="e1" trimEntry={{ status: "needs-review", cuts: [flaggedMid] }} />
+    );
+    expect(findByClass(tree, /cutlist-review__play-before/).props.disabled).toBe(true);
+    expect(findByClass(tree, /cutlist-review__preview-join/).props.disabled).toBe(true);
+  });
+
+  it("preview button clicks are a safe no-op when there is no audio element", () => {
+    const tree = renderTree(
+      <CutlistReview uuid="e1"
+        trimEntry={{ status: "needs-review", cuts: [flaggedMid] }}
+        audioUrl="file:///tmp/ep.mp3" />
+    );
+    // The callback ref does not fire in a direct function-call render, so
+    // audioRef.current stays null - the handlers must not throw.
+    expect(() => findByClass(tree, /cutlist-review__play-before/).props.onClick()).not.toThrow();
+    expect(() => findByClass(tree, /cutlist-review__play-after/).props.onClick()).not.toThrow();
+    expect(() => findByClass(tree, /cutlist-review__preview-join/).props.onClick()).not.toThrow();
+  });
+});

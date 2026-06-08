@@ -215,4 +215,25 @@ describe("download()", () => {
     expect(fs.existsSync(`${dest}.part`)).toBe(true);
     expect(fs.statSync(`${dest}.part`).size).toBeGreaterThan(0);
   });
+
+  // P3b: the renderer needs the local cache path to play the converted/original
+  // file in the trim-review previews. list() and the progress events must surface
+  // it (pointing at the manager's pathFor(uuid, ext)) once an entry exists.
+  it("list() and emitted events surface the local cache path for an entry", async () => {
+    const payload = Buffer.alloc(1024 * 8, 0x21);
+    ({ srv: server, url: baseUrl } = await makeServer((req, res) => serveBytes(res, payload)));
+    const events = [];
+    const mgr = new DownloadManager({ cacheDir: tmp, concurrency: 1, onEvent: (e) => events.push(e) });
+    const expectedPath = mgr.pathFor("path-ep", "mp3");
+
+    mgr.ensure({ uuid: "path-ep", url: `${baseUrl}/ep.mp3`, ext: "mp3" });
+    await new Promise((r) => setTimeout(r, 200));
+
+    const entry = mgr.list().find((e) => e.uuid === "path-ep");
+    expect(entry).toBeTruthy();
+    expect(entry.path).toBe(expectedPath);
+    // The progress / state events carry the same path so a live "ready" event is
+    // enough for the renderer to build the audio URL without a re-list.
+    expect(events.some((e) => e.uuid === "path-ep" && e.path === expectedPath)).toBe(true);
+  });
 });
