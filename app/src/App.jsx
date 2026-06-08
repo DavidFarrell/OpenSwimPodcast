@@ -19,6 +19,7 @@ import {
   effectiveTrim,
 } from "./trimPrefs.js";
 import { buildTrimAudioUrls, applyCutEdit } from "./trimAudio.js";
+import { loadModel, saveModel, MODEL_OPTIONS } from "./modelPrefs.js";
 
 const pc = () => (typeof window !== "undefined" && window.openswim && window.openswim.pocketcasts) || null;
 
@@ -37,6 +38,15 @@ export default function App() {
   const setBoost = (v) => {
     setBoostRaw(!!v);
     localStorage.setItem("os_boost", v ? "1" : "0");
+  };
+  // Model picker (P4a). The LM Studio model id used by the announce summary and
+  // the trim detector, persisted like speed/boost. Defaults to the LOCKED
+  // gemma-4-12b-qat. Threaded into the sync spec -> announce.cjs / detectAds.cjs.
+  const [model, setModelRaw] = useState(() => loadModel());
+  const setModel = (v) => {
+    const next = (typeof v === "string" && v.trim()) ? v.trim() : loadModel();
+    setModelRaw(next);
+    saveModel(next);
   };
   // Announce-episode intent (S6). Universal toggle + per-episode OFF overrides,
   // persisted exactly like speed/boost above. Passive announce status (per uuid)
@@ -361,6 +371,9 @@ export default function App() {
                 setPlaybackSpeed={setPlaybackSpeed}
                 boost={boost}
                 setBoost={setBoost}
+                model={model}
+                setModel={setModel}
+                modelOptions={MODEL_OPTIONS}
                 announceOn={announceOn}
                 setAnnounceOn={setAnnounceOn}
                 announceOff={announceOff}
@@ -389,7 +402,8 @@ export default function App() {
                 devicePath={device.mounted ? device.path : null}
                 downloadByUuid={downloadByUuid}
                 playbackSpeed={playbackSpeed}
-                boost={boost} />
+                boost={boost}
+                model={model} />
             )}
           </main>
           {showMountDialog && device.mounted && (

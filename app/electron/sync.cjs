@@ -291,7 +291,7 @@ function adToCut({ ad, segments }) {
 // converts uncut. A missing/corrupt decision cache is treated as "no decisions"
 // (the cut list is flagged exactly as detected). Never throws into the pipeline.
 async function generateCuts({
-  src, transcribeFn, detectAdsFn, llmFetch, signal,
+  src, transcribeFn, detectAdsFn, llmFetch, model, signal,
   readDecisionsFn = defaultReadDecisions,
 }) {
   try {
@@ -308,7 +308,12 @@ async function generateCuts({
 
     let result = null;
     try {
-      result = await detectAdsFn({ transcript, fetch: llmFetch, signal });
+      // model is the user-picked LM Studio model id (P4a). When undefined,
+      // detectAds falls back to its own LMSTUDIO_MODEL default, so the locked
+      // detector keeps working unchanged.
+      const detectArgs = { transcript, fetch: llmFetch, signal };
+      if (model) detectArgs.model = model;
+      result = await detectAdsFn(detectArgs);
     } catch {
       result = null;
     }
@@ -347,7 +352,7 @@ async function runSync({
   renderIntroFn = defaultRenderIntro,
   detectAdsFn = defaultDetectAds,
   readDecisionsFn = defaultReadDecisions,
-  llm, llmFetch,
+  llm, llmFetch, model,
   onEvent,
   signal,
 } = {}) {
@@ -390,10 +395,14 @@ async function runSync({
       const src = path.join(cacheDir, `${it.uuid}.${it.ext || "mp3"}`);
       const outPath = path.join(cacheDir, `${it.uuid}.intro.wav`);
       emit({ type: "announce", uuid: it.uuid, slot: it.slot, state: "analysing" });
+      // Thread the user-picked model id (P4a) into the announce summary. We
+      // only add it when present so an unset model leaves announce.cjs on its
+      // own LMSTUDIO_MODEL default. Spread the existing llm (fetch etc.) first.
+      const introLlm = model ? { ...(llm || {}), model } : llm;
       introJobs[i] = generateIntro({
         it, src, outPath,
         transcribeFn, buildAnnouncementTextFn, renderIntroFn,
-        llm, signal,
+        llm: introLlm, signal,
       }).then((intro) => {
         introPaths[i] = intro;
         emit({
@@ -427,7 +436,7 @@ async function runSync({
       const src = path.join(cacheDir, `${it.uuid}.${it.ext || "mp3"}`);
       emit({ type: "trim", uuid: it.uuid, slot: it.slot, state: "analysing" });
       trimJobs[i] = generateCuts({
-        src, transcribeFn, detectAdsFn, readDecisionsFn, llmFetch, signal,
+        src, transcribeFn, detectAdsFn, readDecisionsFn, llmFetch, model, signal,
       }).then((res) => {
         trimResults[i] = res;
         emit({

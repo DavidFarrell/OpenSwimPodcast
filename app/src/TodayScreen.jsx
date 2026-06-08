@@ -174,6 +174,35 @@ function TrimToggle({ value, onChange }) {
   );
 }
 
+// Model picker (P4a). A pulldown that selects which local LM Studio model the
+// announce summary and the trim detector use. The default (gemma-4-12b-qat) is
+// the LOCKED detector model; changing this does NOT change the default or the
+// detector method, only which model the calls are routed to. Persisted in
+// localStorage by App.jsx. The current value is always shown even when it is not
+// one of the listed options (the user may have a custom id stored).
+function ModelPicker({ value, onChange, options = [] }) {
+  if (!onChange) return null;
+  const opts = options.includes(value) || !value ? options : [value, ...options];
+  return (
+    <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+      <span className="ct-meta" style={{ color: "var(--fg-muted)", letterSpacing: "1.2px", textTransform: "uppercase" }}>Model</span>
+      <select
+        value={value || ""}
+        onChange={(e) => onChange(e.target.value)}
+        title="The local LM Studio model used for the announce summary and the ad/intro trim detector. Default is the locked gemma-4-12b-qat. Changing this does not change how the detector works, only which model it calls."
+        style={{
+          fontFamily: "var(--font-mono)", fontSize: 11, padding: "3px 8px",
+          border: "1px solid var(--rule)", background: "transparent",
+          color: "var(--fg)",
+        }}>
+        {opts.map((m) => (
+          <option key={m} value={m}>{m}</option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
 // Compact per-row trim affordance, mirroring AnnounceBadge. When the global
 // toggle is off it renders nothing. When on it shows the passive status fed by
 // the P2c trim IPC (analysing / ready / needs-review / skipped) plus a single
@@ -212,6 +241,7 @@ function TrimBadge({ globalOn, off, status, onToggle }) {
 export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   goSync, goUpNext, deviceCapacityMB, downloadByUuid = {}, onRetryDownload,
   playbackSpeed = 1.0, setPlaybackSpeed, boost = false, setBoost,
+  model, setModel, modelOptions = [],
   announceOn = false, setAnnounceOn, announceOff, setAnnounceEpisode, announceStatus = {},
   trimOn = false, setTrimOn, trimOff, setTrimEpisode, trimStatus = {},
   trimCuts = {}, trimDecisions = {}, onTrimDecide, onTrimEdit, trimAudioUrls = {},
@@ -331,6 +361,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
         {setBoost && <BoostToggle value={boost} onChange={setBoost} />}
         {setAnnounceOn && <AnnounceToggle value={announceOn} onChange={setAnnounceOn} />}
         {setTrimOn && <TrimToggle value={trimOn} onChange={setTrimOn} />}
+        {setModel && <ModelPicker value={model} onChange={setModel} options={modelOptions} />}
         <div className="ct-meta" style={{ color: "var(--fg-muted)" }}>drag to reorder · video → MP3</div>
       </div>
 

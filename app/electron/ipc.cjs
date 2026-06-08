@@ -250,6 +250,9 @@ async function startSync(spec) {
       queue,
       speed: spec.speed || 1.0,
       boost: !!spec.boost,
+      // User-picked LM Studio model id (P4a) for the announce summary + the trim
+      // detector. Falls through to each module's default when absent.
+      model: (typeof spec.model === "string" && spec.model.trim()) ? spec.model.trim() : undefined,
       cacheDir,
       signal: syncController.signal,
       onEvent: (e) => { recordTrimEvent(e); broadcast("sync:event", e); },

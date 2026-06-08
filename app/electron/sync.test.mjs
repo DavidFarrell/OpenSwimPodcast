@@ -705,6 +705,29 @@ describe("generateCuts", () => {
     expect(out.status).toBe("skipped");
     expect(out.cuts).toEqual([]);
   });
+
+  // P4a model-picker threading: the user-picked model id must reach the detector.
+  it("threads the picked model id into the detector", async () => {
+    const transcribeFn = vi.fn(async () => ({ segments: [{ start: 0, end: 10, text: "hi" }] }));
+    const detectAdsFn = vi.fn(async ({ model }) => {
+      expect(model).toBe("qwen/qwen3-14b");
+      return { ads: [], stats: {} };
+    });
+    await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, model: "qwen/qwen3-14b" });
+    expect(detectAdsFn).toHaveBeenCalledOnce();
+  });
+
+  // When no model is picked we must NOT pass an explicit model - the detector
+  // falls back to its own LOCKED LMSTUDIO_MODEL default unchanged.
+  it("does not pass a model when none is picked (detector keeps its locked default)", async () => {
+    const transcribeFn = vi.fn(async () => ({ segments: [{ start: 0, end: 10, text: "hi" }] }));
+    const detectAdsFn = vi.fn(async (args) => {
+      expect("model" in args).toBe(false);
+      return { ads: [], stats: {} };
+    });
+    await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn });
+    expect(detectAdsFn).toHaveBeenCalledOnce();
+  });
 });
 
 describe("generateCuts decision-cache reuse (P3c)", () => {
@@ -1039,5 +1062,78 @@ describe("runSync trim stage", () => {
     expect(convertFn).toHaveBeenCalledTimes(2);
     expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).toString()).toBe("sped no trim");
     expect(events.some((e) => e.stage === "convert" && e.state === "error")).toBe(false);
+  });
+
+  // P4a model-picker threading end-to-end through runSync: the picked model id
+  // reaches BOTH the trim detector and the announce summary, without changing
+  // the locked detector method.
+  it("threads runSync({ model }) into both the detector and the announce summary", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+
+    const transcribeFn = vi.fn(async () => ({ segments: [
+      { start: 0, end: 10, text: "hello" },
+      { start: 600, end: 700, text: "this ad" },
+      { start: 700, end: 1300, text: "back to it" },
+    ] }));
+    const detectAdsFn = vi.fn(async ({ model }) => {
+      expect(model).toBe("qwen/qwen3-14b");
+      return { ads: [{ startSec: 600, endSec: 700, needsReview: false, reasons: [] }], stats: {} };
+    });
+    const buildAnnouncementTextFn = vi.fn(async ({ llm }) => {
+      expect(llm).toBeTruthy();
+      expect(llm.model).toBe("qwen/qwen3-14b");
+      return "This is HARD FORK. Ep.";
+    });
+    const renderIntroFn = vi.fn(async ({ outPath }) => {
+      fs.writeFileSync(outPath, Buffer.from("intro wav"));
+      return outPath;
+    });
+    const convertFn = vi.fn(async ({ dest, cuts }) => {
+      expect(cuts).toEqual([[600, 700]]);
+      fs.writeFileSync(dest, Buffer.from("trimmed mp3"));
+      return { bytes: 11, durationSec: 60, fromCache: false };
+    });
+
+    const res = await runSync({
+      devicePath, cacheDir,
+      queue: [trimItem({ announce: true })],
+      model: "qwen/qwen3-14b",
+      llm: { fetch: () => {} },
+      transcribeFn, detectAdsFn, buildAnnouncementTextFn, renderIntroFn, convertFn,
+      onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    expect(detectAdsFn).toHaveBeenCalledOnce();
+    expect(buildAnnouncementTextFn).toHaveBeenCalledOnce();
+  });
+
+  // No model picked: the detector receives no explicit model (locked default
+  // stays in force) and the announce llm is left untouched.
+  it("leaves the locked default in force when no model is picked", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+
+    const transcribeFn = vi.fn(async () => ({ segments: [
+      { start: 0, end: 10, text: "hello" },
+      { start: 600, end: 700, text: "this ad" },
+      { start: 700, end: 1300, text: "back to it" },
+    ] }));
+    const detectAdsFn = vi.fn(async (args) => {
+      expect("model" in args).toBe(false);
+      return { ads: [], stats: {} };
+    });
+    const convertFn = vi.fn(async ({ dest }) => {
+      fs.writeFileSync(dest, Buffer.from("uncut"));
+      return { bytes: 5, durationSec: 60, fromCache: false };
+    });
+
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn, detectAdsFn, convertFn,
+      onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    expect(detectAdsFn).toHaveBeenCalledOnce();
   });
 });
