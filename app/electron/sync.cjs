@@ -7,6 +7,7 @@ const { transcribe: defaultTranscribe } = require("./transcribe.cjs");
 const { buildAnnouncementText: defaultBuildAnnouncementText } = require("./announce.cjs");
 const { renderIntro: defaultRenderIntro } = require("./tts.cjs");
 const { detectAds: defaultDetectAds, toSegments } = require("./detectAds.cjs");
+const { readDecisions: defaultReadDecisions, applyDecisions } = require("./decisionCache.cjs");
 
 // A detected ad block is treated as a positional intro/outro (and snapped to the
 // episode edge) when its first/last segment sits within this many seconds of the
@@ -278,11 +279,20 @@ function adToCut({ ad, segments }) {
 // reasons, label }). Only cuts with needsReview === false are auto-applyable; the
 // caller passes those into convert and holds the rest for the review layer.
 //
+// Before the cut list is returned, any persisted review decision for THIS episode
+// (keyed by audio fingerprint, see decisionCache.cjs) is applied: a cut the user
+// previously chose to REMOVE is un-flagged so it auto-applies (never re-asked); a
+// cut the user previously chose to KEEP is dropped (never re-flagged). A cut with
+// no recorded decision keeps its original flagging. This is what makes a reviewed
+// episode stick across re-processing.
+//
 // Degrades safely: a missing/failed transcript, an unavailable detector, or any
 // thrown error returns { status: "skipped", cuts: [] } so the episode still
-// converts uncut. Never throws into the pipeline.
+// converts uncut. A missing/corrupt decision cache is treated as "no decisions"
+// (the cut list is flagged exactly as detected). Never throws into the pipeline.
 async function generateCuts({
   src, transcribeFn, detectAdsFn, llmFetch, signal,
+  readDecisionsFn = defaultReadDecisions,
 }) {
   try {
     let transcript = null;
@@ -304,8 +314,18 @@ async function generateCuts({
     }
     if (!result || !Array.isArray(result.ads)) return { status: "skipped", cuts: [] };
 
-    const cuts = result.ads.map((ad) => adToCut({ ad, segments }))
+    const detected = result.ads.map((ad) => adToCut({ ad, segments }))
       .filter((c) => Number.isFinite(c.startSec) && Number.isFinite(c.endSec) && c.endSec > c.startSec);
+
+    // Reuse any previously-reviewed decisions for this exact episode. A cache
+    // miss / corrupt cache yields {} so the cut list is flagged as detected.
+    let decisions = {};
+    try {
+      decisions = await readDecisionsFn({ src });
+    } catch {
+      decisions = {};
+    }
+    const cuts = applyDecisions(detected, decisions);
 
     if (cuts.length === 0) return { status: "ready", cuts: [] };
     const status = cuts.some((c) => c.needsReview) ? "needs-review" : "ready";
@@ -324,6 +344,7 @@ async function runSync({
   buildAnnouncementTextFn = defaultBuildAnnouncementText,
   renderIntroFn = defaultRenderIntro,
   detectAdsFn = defaultDetectAds,
+  readDecisionsFn = defaultReadDecisions,
   llm, llmFetch,
   onEvent,
   signal,
@@ -404,7 +425,7 @@ async function runSync({
       const src = path.join(cacheDir, `${it.uuid}.${it.ext || "mp3"}`);
       emit({ type: "trim", uuid: it.uuid, slot: it.slot, state: "analysing" });
       trimJobs[i] = generateCuts({
-        src, transcribeFn, detectAdsFn, llmFetch, signal,
+        src, transcribeFn, detectAdsFn, readDecisionsFn, llmFetch, signal,
       }).then((res) => {
         trimResults[i] = res;
         emit({

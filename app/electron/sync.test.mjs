@@ -707,6 +707,102 @@ describe("generateCuts", () => {
   });
 });
 
+describe("generateCuts decision-cache reuse (P3c)", () => {
+  // A flagged mid-roll the detector keeps surfacing. Without a cached decision it
+  // should always come back needs-review.
+  // A genuine mid-roll: content surrounds the ad on both sides AND the episode
+  // edges are far away, so adToCut leaves the [600,700] boundaries unchanged and
+  // the cut key is the predictable "600000-700000".
+  function flaggedSetup() {
+    const transcribeFn = vi.fn(async () => ({ segments: [
+      { start: 0, end: 590, text: "opening content" },
+      { start: 600, end: 700, text: "ad" },
+      { start: 700, end: 3000, text: "more content" },
+    ] }));
+    const detectAdsFn = vi.fn(async () => ({
+      ads: [{ startSec: 600, endSec: 700, needsReview: true, reasons: ["over-threshold"] }],
+      stats: {},
+    }));
+    return { transcribeFn, detectAdsFn };
+  }
+
+  it("cache miss flags normally (no recorded decision -> needs-review)", async () => {
+    const { transcribeFn, detectAdsFn } = flaggedSetup();
+    const readDecisionsFn = vi.fn(async () => ({})); // empty cache
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readDecisionsFn });
+    expect(out.status).toBe("needs-review");
+    expect(out.cuts).toHaveLength(1);
+    expect(out.cuts[0].needsReview).toBe(true);
+  });
+
+  it("a cached REMOVE decision is reused: the cut auto-applies and is NOT re-flagged", async () => {
+    const { transcribeFn, detectAdsFn } = flaggedSetup();
+    const readDecisionsFn = vi.fn(async () => ({ "600000-700000": "remove" }));
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readDecisionsFn });
+    expect(readDecisionsFn).toHaveBeenCalledWith({ src: "/x.mp3" });
+    expect(out.status).toBe("ready"); // no longer needs review
+    expect(out.cuts).toHaveLength(1);
+    expect(out.cuts[0].needsReview).toBe(false);
+  });
+
+  it("a cached KEEP decision is reused: the cut is dropped, never re-flagged", async () => {
+    const { transcribeFn, detectAdsFn } = flaggedSetup();
+    const readDecisionsFn = vi.fn(async () => ({ "600000-700000": "keep" }));
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readDecisionsFn });
+    expect(out.status).toBe("ready");
+    expect(out.cuts).toEqual([]);
+  });
+
+  it("tolerates a corrupt/throwing decision cache: flags normally, never throws", async () => {
+    const { transcribeFn, detectAdsFn } = flaggedSetup();
+    const readDecisionsFn = vi.fn(async () => { throw new Error("corrupt sidecar"); });
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readDecisionsFn });
+    expect(out.status).toBe("needs-review");
+    expect(out.cuts[0].needsReview).toBe(true);
+  });
+
+  it("uses the real decisionCache default when no readDecisionsFn injected (cache miss path)", async () => {
+    const { transcribeFn, detectAdsFn } = flaggedSetup();
+    // No sidecar on disk for /does/not/exist.mp3 -> real readDecisions returns {}.
+    const out = await generateCuts({ src: "/does/not/exist.mp3", transcribeFn, detectAdsFn });
+    expect(out.status).toBe("needs-review");
+  });
+
+  it("a cached ADJUSTED remove re-applies at the user-adjusted boundaries, not the detector's", async () => {
+    // The user approved this removal only after nudging it from 600-700 to 615-690.
+    // On re-process the detector still proposes 600-700; the cut that auto-applies
+    // (and ultimately reaches the converter) must be the adjusted 615-690 range, so
+    // we never trim the audio the user explicitly excluded (cardinal rule).
+    const { transcribeFn, detectAdsFn } = flaggedSetup();
+    const readDecisionsFn = vi.fn(async () => ({
+      "600000-700000": { action: "remove", startSec: 615, endSec: 690 },
+    }));
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readDecisionsFn });
+    expect(out.status).toBe("ready");
+    expect(out.cuts).toHaveLength(1);
+    expect(out.cuts[0].needsReview).toBe(false);
+    expect(out.cuts[0].startSec).toBe(615);
+    expect(out.cuts[0].endSec).toBe(690);
+  });
+
+  it("a MALFORMED cached adjusted-remove leaves the cut flagged (never auto-applied at the detector's wider range) - cardinal rule", async () => {
+    // The cache holds a corrupt adjusted-remove (inverted boundaries). The user
+    // only approved a removal at the narrowed range; we must NOT fall back to the
+    // detector's original 600-700 and auto-cut it. The unusable decision is ignored,
+    // so the cut keeps needs-review and is re-asked rather than trimming excluded audio.
+    const { transcribeFn, detectAdsFn } = flaggedSetup();
+    const readDecisionsFn = vi.fn(async () => ({
+      "600000-700000": { action: "remove", startSec: 690, endSec: 615 },
+    }));
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readDecisionsFn });
+    expect(out.status).toBe("needs-review");
+    expect(out.cuts).toHaveLength(1);
+    expect(out.cuts[0].needsReview).toBe(true);
+    expect(out.cuts[0].startSec).toBe(600);
+    expect(out.cuts[0].endSec).toBe(700);
+  });
+});
+
 describe("runSync trim stage", () => {
   let devicePath, cacheDir;
 

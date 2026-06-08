@@ -10,7 +10,7 @@ const {
   getAnnounce, setAnnounce, listAnnounce, resolveAnnounceQueue,
   getTrim, setTrim, listTrim, resolveTrimQueue, getTrimStatus, recordTrimEvent,
   setTrimDecision, getTrimDecisions, cutKey, buildHandlers,
-  setTrimEdit, getTrimEdits,
+  setTrimEdit, getTrimEdits, mergeDecisionsWithEdits,
 } = require("./ipc.cjs");
 
 describe("announce toggle intent (ipc helpers, { ok, data } surface)", () => {
@@ -243,5 +243,38 @@ describe("trim boundary edits (setTrimEdit / getTrimEdits, P3b)", () => {
     expect(edit(null, { uuid: "epEdit5", originalCut: cut, newCut: { startSec: 1385, endSec: 1450 } }))
       .toEqual({ startSec: 1385, endSec: 1450 });
     expect(getTrimEdits("epEdit5")).toEqual({ [cutKey(cut)]: { startSec: 1385, endSec: 1450 } });
+  });
+});
+
+describe("mergeDecisionsWithEdits (P3c - fold adjusted boundaries into the persisted map)", () => {
+  it("turns a removed-AND-edited cut into an adjusted-remove object keyed by the original cut", () => {
+    const cut = { startSec: 600, endSec: 700 };
+    const key = cutKey(cut);
+    setTrimDecision("epMerge1", cut, "remove");
+    setTrimEdit("epMerge1", cut, { startSec: 615, endSec: 690 });
+    expect(mergeDecisionsWithEdits("epMerge1")).toEqual({
+      [key]: { action: "remove", startSec: 615, endSec: 690 },
+    });
+  });
+
+  it("leaves a plain remove (no edit) as the string 'remove' - detector boundaries", () => {
+    const cut = { startSec: 600, endSec: 700 };
+    const key = cutKey(cut);
+    setTrimDecision("epMerge2", cut, "remove");
+    expect(mergeDecisionsWithEdits("epMerge2")).toEqual({ [key]: "remove" });
+  });
+
+  it("never attaches boundaries to a KEEP (nothing is cut, so an edit is moot)", () => {
+    const cut = { startSec: 600, endSec: 700 };
+    const key = cutKey(cut);
+    setTrimDecision("epMerge3", cut, "keep");
+    setTrimEdit("epMerge3", cut, { startSec: 615, endSec: 690 });
+    expect(mergeDecisionsWithEdits("epMerge3")).toEqual({ [key]: "keep" });
+  });
+
+  it("an edit alone (no decision) is not promoted to a removal - cardinal rule", () => {
+    const cut = { startSec: 600, endSec: 700 };
+    setTrimEdit("epMerge4", cut, { startSec: 615, endSec: 690 });
+    expect(mergeDecisionsWithEdits("epMerge4")).toEqual({});
   });
 });

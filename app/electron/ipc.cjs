@@ -4,6 +4,7 @@ const pc = require("./pocketcasts.cjs");
 const { DownloadManager } = require("./downloader.cjs");
 const { createDeviceWatcher } = require("./device.cjs");
 const { runSync, readManifest } = require("./sync.cjs");
+const { writeDecisions } = require("./decisionCache.cjs");
 
 function serializeError(e) {
   return { message: e.message || String(e), code: e.code, status: e.status };
@@ -154,6 +155,51 @@ function getTrimDecisions(uuid) {
   return Object.fromEntries(m.entries());
 }
 
+// Fold the per-episode edited boundaries (P3b) into the keep/remove decision map so
+// the persisted sidecar records the cut the user ACTUALLY approved. A "remove" that
+// the user only approved after nudging the boundaries must round-trip as an
+// adjusted-remove (object form), otherwise a re-process would auto-apply the
+// detector's original range - a cut the user never approved (cardinal-rule
+// violation). The edit map is keyed by the SAME original cut key as the decision
+// map, so we merge by key:
+//   - decision "remove" + an edit for that key -> { action:"remove", startSec, endSec }
+//   - decision "remove" with no edit            -> "remove" (detector boundaries)
+//   - decision "keep"                           -> "keep" (an edit is irrelevant)
+// A "keep" never carries boundaries: nothing is cut, so the adjustment is moot.
+function mergeDecisionsWithEdits(uuid) {
+  const decisions = getTrimDecisions(uuid);
+  const edits = getTrimEdits(uuid);
+  const merged = {};
+  for (const [key, value] of Object.entries(decisions)) {
+    if (value === "remove" && edits[key]
+        && Number.isFinite(edits[key].startSec) && Number.isFinite(edits[key].endSec)) {
+      merged[key] = { action: "remove", startSec: edits[key].startSec, endSec: edits[key].endSec };
+    } else {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
+// Best-effort persistence (P3c): mirror the in-memory decision map for an episode
+// to the fingerprint-keyed sidecar next to its cached audio, so a re-process of
+// the same untouched episode reuses these reviewed choices and never re-asks. The
+// persisted map carries any user-adjusted boundaries (see mergeDecisionsWithEdits)
+// so an adjusted+removed cut re-applies at the adjusted range. This is
+// fire-and-forget - a missing/unwritable cache is not fatal (the user can decide
+// again next pass), and it never throws into the IPC reply.
+function persistTrimDecisions(uuid, ext) {
+  if (!uuid) return;
+  let cacheDir;
+  try { cacheDir = path.join(app.getPath("userData"), "cache", "episodes"); }
+  catch { return; }
+  const src = path.join(cacheDir, `${uuid}.${ext || "mp3"}`);
+  const decisions = mergeDecisionsWithEdits(uuid);
+  // Async, best-effort: writeDecisions itself never throws (resolves false on
+  // failure). Detach so a slow/failing disk write never blocks the IPC reply.
+  Promise.resolve().then(() => writeDecisions({ src, decisions })).catch(() => {});
+}
+
 // Edited boundaries for FLAGGED cuts (P3b). Keyed by uuid then the ORIGINAL cut
 // key, holding the new { startSec, endSec } the user nudged/typed. The renderer
 // already keeps the edited cut in its own state for an immediate redraw; this
@@ -280,9 +326,29 @@ function buildHandlers() {
     "trim:set": (_, { uuid, enabled }) => setTrim(uuid, enabled),
     "trim:list": () => listTrim(),
     "trim:status": (_, uuid) => getTrimStatus(uuid),
-    "trim:decide": (_, payload) => { const { uuid, cut, decision } = payload || {}; return setTrimDecision(uuid, cut, decision); },
+    "trim:decide": (_, payload) => {
+      const { uuid, cut, decision, ext } = payload || {};
+      const value = setTrimDecision(uuid, cut, decision);
+      // Persist the episode's full decision map to its fingerprint sidecar so the
+      // choice survives a re-process. Only when the decision was actually recorded.
+      if (value != null) persistTrimDecisions(uuid, ext);
+      return value;
+    },
     "trim:decisions": (_, uuid) => getTrimDecisions(uuid),
-    "trim:edit": (_, payload) => { const { uuid, originalCut, newCut } = payload || {}; return setTrimEdit(uuid, originalCut, newCut); },
+    "trim:edit": (_, payload) => {
+      const { uuid, originalCut, newCut, ext } = payload || {};
+      const edited = setTrimEdit(uuid, originalCut, newCut);
+      // If this cut was already decided REMOVE, the persisted sidecar must pick up
+      // the new boundaries so a re-process re-applies the cut the user just
+      // adjusted (not the stale range). Re-persist on a successful edit when a
+      // decision already exists, so edit-after-decide is captured too.
+      if (edited != null) {
+        const key = cutKey(originalCut);
+        const decisions = getTrimDecisions(uuid);
+        if (key && decisions[key]) persistTrimDecisions(uuid, ext);
+      }
+      return edited;
+    },
     "trim:edits": (_, uuid) => getTrimEdits(uuid),
   };
 }
@@ -303,5 +369,5 @@ module.exports = {
   getAnnounce, setAnnounce, listAnnounce, resolveAnnounceQueue,
   getTrim, setTrim, listTrim, resolveTrimQueue, getTrimStatus, recordTrimEvent,
   setTrimDecision, getTrimDecisions, cutKey,
-  setTrimEdit, getTrimEdits,
+  setTrimEdit, getTrimEdits, mergeDecisionsWithEdits,
 };
