@@ -728,6 +728,44 @@ describe("generateCuts", () => {
     await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn });
     expect(detectAdsFn).toHaveBeenCalledOnce();
   });
+
+  // P4b sensitivity threading: the user-picked threshold must reach the detector.
+  it("threads the sensitivity threshold into the detector", async () => {
+    const transcribeFn = vi.fn(async () => ({ segments: [{ start: 0, end: 10, text: "hi" }] }));
+    const detectAdsFn = vi.fn(async ({ needsReviewMaxSec }) => {
+      expect(needsReviewMaxSec).toBe(90);
+      return { ads: [], stats: {} };
+    });
+    await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, needsReviewMaxSec: 90 });
+    expect(detectAdsFn).toHaveBeenCalledOnce();
+  });
+
+  // No sensitivity picked -> do NOT pass an explicit threshold so the detector
+  // falls back to its own LOCKED NEEDS_REVIEW_MAX_SEC default.
+  it("does not pass a threshold when none is picked (detector keeps its locked default)", async () => {
+    const transcribeFn = vi.fn(async () => ({ segments: [{ start: 0, end: 10, text: "hi" }] }));
+    const detectAdsFn = vi.fn(async (args) => {
+      expect("needsReviewMaxSec" in args).toBe(false);
+      return { ads: [], stats: {} };
+    });
+    await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn });
+    expect(detectAdsFn).toHaveBeenCalledOnce();
+  });
+
+  // A non-positive / non-finite threshold must NOT be forwarded - it would be
+  // meaningless and the detector default must take over instead.
+  it("ignores a non-positive / non-finite threshold (falls back to detector default)", async () => {
+    const transcribeFn = vi.fn(async () => ({ segments: [{ start: 0, end: 10, text: "hi" }] }));
+    for (const bad of [0, -5, NaN, Infinity]) {
+      const detectAdsFn = vi.fn(async (args) => {
+        expect("needsReviewMaxSec" in args).toBe(false);
+        return { ads: [], stats: {} };
+      });
+      // eslint-disable-next-line no-await-in-loop
+      await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, needsReviewMaxSec: bad });
+      expect(detectAdsFn).toHaveBeenCalledOnce();
+    }
+  });
 });
 
 describe("generateCuts decision-cache reuse (P3c)", () => {

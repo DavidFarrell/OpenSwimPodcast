@@ -150,6 +150,144 @@ describe("classifyRange()", () => {
   });
 });
 
+// P4b - sensitivity setting. needsReviewMaxSec only tunes the over-threshold
+// check; it can never weaken the cardinal rule (ambiguous boundary always flagged)
+// nor the quote-map fail-safe (that lives in detectAds(), tested separately below).
+describe("classifyRange() - P4b sensitivity threshold tuning", () => {
+  // A clean, well-mapped cut spanning 0 -> 120s (2 minutes). At the locked default
+  // (150s) it auto-applies; a conservative (lower) threshold flags it; an
+  // aggressive (higher) threshold still auto-applies it.
+  const segments = [
+    { start: 0, end: 4, text: "a" },
+    { start: 4, end: 120, text: "b" },
+    { start: 120, end: 400, text: "c" },
+  ];
+
+  it("conservative (lower threshold) flags a borderline clean cut that the default auto-applies", () => {
+    const dflt = classifyRange({ startIndex: 0, endIndex: 1, segments, endQuoteMapped: true });
+    expect(dflt.needsReview).toBe(false); // 120s < 150s default -> auto-apply
+
+    const conservative = classifyRange({
+      startIndex: 0, endIndex: 1, segments, endQuoteMapped: true, needsReviewMaxSec: 90,
+    });
+    expect(conservative.needsReview).toBe(true); // 120s > 90s -> flagged
+    expect(conservative.reasons).toContain("over-threshold");
+  });
+
+  it("aggressive (higher threshold) keeps auto-applying a cut the default would flag", () => {
+    const longSegs = [
+      { start: 0, end: 4, text: "a" },
+      { start: 4, end: 200, text: "b" }, // 200s span
+    ];
+    const dflt = classifyRange({ startIndex: 0, endIndex: 1, segments: longSegs, endQuoteMapped: true });
+    expect(dflt.needsReview).toBe(true); // 200s > 150s default -> flagged
+
+    const aggressive = classifyRange({
+      startIndex: 0, endIndex: 1, segments: longSegs, endQuoteMapped: true, needsReviewMaxSec: 240,
+    });
+    expect(aggressive.needsReview).toBe(false); // 200s < 240s -> auto-apply
+  });
+
+  it("an invalid / non-positive threshold falls back to the locked default", () => {
+    for (const bad of [undefined, null, 0, -10, NaN, Infinity, "150"]) {
+      const r = classifyRange({
+        startIndex: 0, endIndex: 1, segments, endQuoteMapped: true, needsReviewMaxSec: bad,
+      });
+      // 120s < 150s default -> auto-apply, proving fallback to default not "off".
+      expect(r.needsReview).toBe(false);
+    }
+    // And the default still flags an over-150s cut even with a bad threshold.
+    const over = classifyRange({
+      startIndex: 0, endIndex: 2, segments, endQuoteMapped: true, needsReviewMaxSec: 0,
+    });
+    expect(over.needsReview).toBe(true);
+    expect(over.reasons).toContain("over-threshold");
+  });
+
+  it("CARDINAL: aggressive NEVER overrides an ambiguous boundary", () => {
+    // Even with a huge aggressive threshold, an unmapped end boundary is flagged.
+    const r = classifyRange({
+      startIndex: 0, endIndex: 1, segments, endQuoteMapped: false, needsReviewMaxSec: 100000,
+    });
+    expect(r.needsReview).toBe(true);
+    expect(r.reasons).toContain("ambiguous-boundary");
+  });
+});
+
+describe("detectAds() - P4b sensitivity threading and fail-safes", () => {
+  // A transcript with an ad that spans 0 -> 120s (2 minutes), clean boundaries.
+  const borderlineAd = {
+    segments: [
+      { speaker: "S", start: 0, end: 5, text: "Our show today is brought to you by Acme VPN." },
+      { speaker: "S", start: 5, end: 120, text: "Visit Acme dot com slash show for three months free." },
+      { speaker: "S", start: 120, end: 300, text: "We're back, so anyway where were we." },
+    ],
+  };
+  const adQuotes = [{
+    first_line: "Our show today is brought to you by Acme VPN.",
+    last_line: "Visit Acme dot com slash show for three months free.",
+  }];
+
+  it("conservative threshold flags a clean cut that the default auto-applies", async () => {
+    const dflt = await detectAds({ transcript: borderlineAd, fetch: fetchReturning(adQuotes) });
+    expect(dflt.ads).toHaveLength(1);
+    expect(dflt.ads[0].needsReview).toBe(false);
+
+    const conservative = await detectAds({
+      transcript: borderlineAd, fetch: fetchReturning(adQuotes), needsReviewMaxSec: 90,
+    });
+    expect(conservative.ads).toHaveLength(1);
+    expect(conservative.ads[0].needsReview).toBe(true);
+    expect(conservative.ads[0].reasons).toContain("over-threshold");
+  });
+
+  it("aggressive threshold auto-applies a cut the default would flag", async () => {
+    const longAd = {
+      segments: [
+        { speaker: "S", start: 0, end: 5, text: "Our show today is brought to you by Acme VPN." },
+        { speaker: "S", start: 5, end: 200, text: "Visit Acme dot com slash show for three months free." },
+        { speaker: "S", start: 200, end: 400, text: "We're back, so anyway where were we." },
+      ],
+    };
+    const dflt = await detectAds({ transcript: longAd, fetch: fetchReturning(adQuotes) });
+    expect(dflt.ads[0].needsReview).toBe(true); // 200s > 150s default
+
+    const aggressive = await detectAds({
+      transcript: longAd, fetch: fetchReturning(adQuotes), needsReviewMaxSec: 240,
+    });
+    expect(aggressive.ads[0].needsReview).toBe(false); // 200s < 240s
+  });
+
+  it("CARDINAL: aggressive NEVER auto-applies a quote-map-failed ad - it is skipped entirely", async () => {
+    // The first_line quote does not appear in any segment -> the ad cannot be
+    // placed -> it must be SKIPPED (no cut), at ANY sensitivity.
+    const unmappable = [{
+      first_line: "This sentence appears nowhere in the transcript at all.",
+      last_line: "Neither does this one, friend.",
+    }];
+    const aggressive = await detectAds({
+      transcript: borderlineAd, fetch: fetchReturning(unmappable), needsReviewMaxSec: 100000,
+    });
+    expect(aggressive.ads).toHaveLength(0); // skipped - never auto-applied
+    expect(aggressive.stats.quoteMapFailures).toBe(1);
+  });
+
+  it("CARDINAL: aggressive NEVER auto-applies an ambiguous-boundary cut", async () => {
+    // first_line maps, last_line does NOT -> endQuoteMapped false -> flagged
+    // ambiguous, never cut, even with a huge aggressive threshold.
+    const ambiguous = [{
+      first_line: "Our show today is brought to you by Acme VPN.",
+      last_line: "A closing line that is nowhere in the transcript.",
+    }];
+    const aggressive = await detectAds({
+      transcript: borderlineAd, fetch: fetchReturning(ambiguous), needsReviewMaxSec: 100000,
+    });
+    expect(aggressive.ads).toHaveLength(1);
+    expect(aggressive.ads[0].needsReview).toBe(true);
+    expect(aggressive.ads[0].reasons).toContain("ambiguous-boundary");
+  });
+});
+
 describe("detectAds()", () => {
   it("posts the locked model, prompt and strict json_schema", async () => {
     const fetch = fetchReturning([]);

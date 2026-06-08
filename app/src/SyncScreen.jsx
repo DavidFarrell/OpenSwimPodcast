@@ -35,7 +35,7 @@ function logKey(evt) {
   return evt.uuid ? `${evt.stage}:${evt.uuid}` : `${evt.stage}:${evt.text}`;
 }
 
-export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onArm, setMountState, devicePath, downloadByUuid = {}, playbackSpeed = 1.0, boost = false, model }) {
+export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onArm, setMountState, devicePath, downloadByUuid = {}, playbackSpeed = 1.0, boost = false, model, needsReviewMaxSec }) {
   const fullQueue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
   const readyQueue = fullQueue.filter((it) => downloadByUuid[it.uuid]?.state === "ready");
   const skipped = fullQueue.filter((it) => !readyQueue.includes(it));
@@ -53,6 +53,10 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     // Chosen LM Studio model id (P4a) for the announce summary + trim detector.
     // Omitted when unset so the backend falls through to its locked default.
     ...(model ? { model } : {}),
+    // Chosen sensitivity threshold (P4b), in seconds. Tunes flag-vs-auto-apply
+    // only. Omitted when unset / non-positive so the backend falls through to the
+    // locked NEEDS_REVIEW_MAX_SEC default; the cardinal rule is never weakened.
+    ...((Number.isFinite(needsReviewMaxSec) && needsReviewMaxSec > 0) ? { needsReviewMaxSec } : {}),
     queue: readyQueue.map((it, i) => ({
       uuid: it.uuid,
       url: it.url,
@@ -64,7 +68,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       sizeMB: it.sizeMB,
       durMin: it.durMin,
     })),
-  }), [readyQueue, devicePath, playbackSpeed, boost, model]);
+  }), [readyQueue, devicePath, playbackSpeed, boost, model, needsReviewMaxSec]);
 
   const [phase, setPhase] = useState(armed ? "running" : "idle");
   const [serverPlan, setServerPlan] = useState([]);

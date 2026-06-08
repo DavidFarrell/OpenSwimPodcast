@@ -291,7 +291,7 @@ function adToCut({ ad, segments }) {
 // converts uncut. A missing/corrupt decision cache is treated as "no decisions"
 // (the cut list is flagged exactly as detected). Never throws into the pipeline.
 async function generateCuts({
-  src, transcribeFn, detectAdsFn, llmFetch, model, signal,
+  src, transcribeFn, detectAdsFn, llmFetch, model, needsReviewMaxSec, signal,
   readDecisionsFn = defaultReadDecisions,
 }) {
   try {
@@ -313,6 +313,13 @@ async function generateCuts({
       // detector keeps working unchanged.
       const detectArgs = { transcript, fetch: llmFetch, signal };
       if (model) detectArgs.model = model;
+      // needsReviewMaxSec is the user-picked sensitivity threshold (P4b). When
+      // undefined, detectAds falls back to its own NEEDS_REVIEW_MAX_SEC default,
+      // so the locked behaviour is unchanged. It only tunes flag-vs-auto-apply;
+      // the quote-map fail-safe and ambiguous-boundary flagging are unaffected.
+      if (Number.isFinite(needsReviewMaxSec) && needsReviewMaxSec > 0) {
+        detectArgs.needsReviewMaxSec = needsReviewMaxSec;
+      }
       result = await detectAdsFn(detectArgs);
     } catch {
       result = null;
@@ -352,7 +359,7 @@ async function runSync({
   renderIntroFn = defaultRenderIntro,
   detectAdsFn = defaultDetectAds,
   readDecisionsFn = defaultReadDecisions,
-  llm, llmFetch, model,
+  llm, llmFetch, model, needsReviewMaxSec,
   onEvent,
   signal,
 } = {}) {
@@ -436,7 +443,7 @@ async function runSync({
       const src = path.join(cacheDir, `${it.uuid}.${it.ext || "mp3"}`);
       emit({ type: "trim", uuid: it.uuid, slot: it.slot, state: "analysing" });
       trimJobs[i] = generateCuts({
-        src, transcribeFn, detectAdsFn, readDecisionsFn, llmFetch, model, signal,
+        src, transcribeFn, detectAdsFn, readDecisionsFn, llmFetch, model, needsReviewMaxSec, signal,
       }).then((res) => {
         trimResults[i] = res;
         emit({

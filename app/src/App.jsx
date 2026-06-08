@@ -20,6 +20,9 @@ import {
 } from "./trimPrefs.js";
 import { buildTrimAudioUrls, applyCutEdit } from "./trimAudio.js";
 import { loadModel, saveModel, MODEL_OPTIONS } from "./modelPrefs.js";
+import {
+  loadSensitivity, saveSensitivity, thresholdSecFor, SENSITIVITY_OPTIONS,
+} from "./sensitivityPrefs.js";
 
 const pc = () => (typeof window !== "undefined" && window.openswim && window.openswim.pocketcasts) || null;
 
@@ -47,6 +50,18 @@ export default function App() {
     const next = (typeof v === "string" && v.trim()) ? v.trim() : loadModel();
     setModelRaw(next);
     saveModel(next);
+  };
+  // Sensitivity setting (P4b). Tunes the trim detector's needs-review duration
+  // threshold ONLY: conservative flags more, aggressive flags less. It cannot
+  // weaken the cardinal rule (quote-map failures are still skipped, ambiguous
+  // boundaries still flagged). Persisted like model/speed/boost; threaded into the
+  // sync spec -> detectAds.cjs as needsReviewMaxSec (seconds).
+  const [sensitivity, setSensitivityRaw] = useState(() => loadSensitivity());
+  const setSensitivity = (v) => {
+    setSensitivityRaw((prev) => {
+      saveSensitivity(v);
+      return loadSensitivity();
+    });
   };
   // Announce-episode intent (S6). Universal toggle + per-episode OFF overrides,
   // persisted exactly like speed/boost above. Passive announce status (per uuid)
@@ -374,6 +389,9 @@ export default function App() {
                 model={model}
                 setModel={setModel}
                 modelOptions={MODEL_OPTIONS}
+                sensitivity={sensitivity}
+                setSensitivity={setSensitivity}
+                sensitivityOptions={SENSITIVITY_OPTIONS}
                 announceOn={announceOn}
                 setAnnounceOn={setAnnounceOn}
                 announceOff={announceOff}
@@ -403,7 +421,8 @@ export default function App() {
                 downloadByUuid={downloadByUuid}
                 playbackSpeed={playbackSpeed}
                 boost={boost}
-                model={model} />
+                model={model}
+                needsReviewMaxSec={thresholdSecFor(sensitivity)} />
             )}
           </main>
           {showMountDialog && device.mounted && (

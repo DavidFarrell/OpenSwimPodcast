@@ -263,7 +263,18 @@ async function callModel({
 //     start segment), OR
 //   - the cut is longer than the needs-review threshold.
 // Everything else (a clean whole-segment span within threshold) auto-applies.
-function classifyRange({ startIndex, endIndex, segments, endQuoteMapped }) {
+//
+// needsReviewMaxSec is the duration threshold (P4b sensitivity setting). It only
+// tunes the over-threshold check - a lower value flags more cuts (conservative),
+// a higher value flags fewer (aggressive). It NEVER affects the ambiguous-boundary
+// rule, and the quote-map-failure skip lives in detectAds() above this, so neither
+// the zero-false-positive cardinal rule nor the quote-map fail-safe can be weakened
+// by it. A missing / non-finite / non-positive value falls back to the locked
+// default so the threshold can never be disabled.
+function classifyRange({ startIndex, endIndex, segments, endQuoteMapped, needsReviewMaxSec }) {
+  const maxSec = Number.isFinite(needsReviewMaxSec) && needsReviewMaxSec > 0
+    ? needsReviewMaxSec
+    : NEEDS_REVIEW_MAX_SEC;
   const reasons = [];
   if (!endQuoteMapped) reasons.push("ambiguous-boundary");
 
@@ -277,7 +288,7 @@ function classifyRange({ startIndex, endIndex, segments, endQuoteMapped }) {
     endSec = endIndex + 1 < segments.length ? segments[endIndex + 1].start : endSeg.start;
   }
   const durationSec = endSec - startSeg.start;
-  if (Number.isFinite(durationSec) && durationSec > NEEDS_REVIEW_MAX_SEC) {
+  if (Number.isFinite(durationSec) && durationSec > maxSec) {
     reasons.push("over-threshold");
   }
 
@@ -298,6 +309,10 @@ async function detectAds({
   url = LMSTUDIO_URL,
   model = LMSTUDIO_MODEL,
   timeoutMs = LMSTUDIO_TIMEOUT_MS,
+  // needs-review duration threshold (P4b sensitivity). Only tunes which clean cuts
+  // are auto-applied vs flagged; never weakens the cardinal rule or the quote-map
+  // fail-safe. Falls back to the locked default inside classifyRange.
+  needsReviewMaxSec,
   signal,
 } = {}) {
   const empty = { ads: [], stats: { windowsRun: 0, adsReturned: 0, quoteMapFailures: 0 } };
@@ -372,7 +387,9 @@ async function detectAds({
   const ads = [...seen.values()]
     .sort((a, b) => a.startIndex - b.startIndex)
     .map(({ startIndex, endIndex, endQuoteMapped }) => {
-      const { needsReview, reasons } = classifyRange({ startIndex, endIndex, segments, endQuoteMapped });
+      const { needsReview, reasons } = classifyRange({
+        startIndex, endIndex, segments, endQuoteMapped, needsReviewMaxSec,
+      });
       const startSeg = segments[startIndex];
       const endSeg = segments[endIndex];
       let endSec = endSeg.end;

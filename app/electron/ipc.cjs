@@ -253,6 +253,12 @@ async function startSync(spec) {
       // User-picked LM Studio model id (P4a) for the announce summary + the trim
       // detector. Falls through to each module's default when absent.
       model: (typeof spec.model === "string" && spec.model.trim()) ? spec.model.trim() : undefined,
+      // User-picked sensitivity threshold (P4b), in seconds. Tunes flag-vs-auto-
+      // apply only. Falls through to detectAds.cjs's NEEDS_REVIEW_MAX_SEC default
+      // when absent / non-positive, so the cardinal rule can never be weakened.
+      needsReviewMaxSec: (typeof spec.needsReviewMaxSec === "number" && Number.isFinite(spec.needsReviewMaxSec) && spec.needsReviewMaxSec > 0)
+        ? spec.needsReviewMaxSec
+        : undefined,
       cacheDir,
       signal: syncController.signal,
       onEvent: (e) => { recordTrimEvent(e); broadcast("sync:event", e); },

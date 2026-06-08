@@ -203,6 +203,34 @@ function ModelPicker({ value, onChange, options = [] }) {
   );
 }
 
+// Sensitivity picker (P4b). A pulldown that tunes the trim detector's needs-review
+// duration threshold ONLY: conservative flags more cuts for review, aggressive
+// flags fewer. It does NOT change the locked detector method and CANNOT weaken the
+// cardinal rule - quote-map failures are still skipped and ambiguous boundaries
+// still flagged regardless of this setting. Persisted in localStorage by App.jsx.
+function SensitivityPicker({ value, onChange, options = [] }) {
+  if (!onChange) return null;
+  const opts = options.includes(value) || !value ? options : [value, ...options];
+  return (
+    <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+      <span className="ct-meta" style={{ color: "var(--fg-muted)", letterSpacing: "1.2px", textTransform: "uppercase" }}>Sensitivity</span>
+      <select
+        value={value || ""}
+        onChange={(e) => onChange(e.target.value)}
+        title="How readily the trim detector flags a cut for review. Conservative flags more cuts; aggressive flags fewer. This only tunes the review threshold - it never lets the detector trim an ambiguous or unmappable cut."
+        style={{
+          fontFamily: "var(--font-mono)", fontSize: 11, padding: "3px 8px",
+          border: "1px solid var(--rule)", background: "transparent",
+          color: "var(--fg)",
+        }}>
+        {opts.map((m) => (
+          <option key={m} value={m}>{m}</option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
 // Compact per-row trim affordance, mirroring AnnounceBadge. When the global
 // toggle is off it renders nothing. When on it shows the passive status fed by
 // the P2c trim IPC (analysing / ready / needs-review / skipped) plus a single
@@ -242,6 +270,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   goSync, goUpNext, deviceCapacityMB, downloadByUuid = {}, onRetryDownload,
   playbackSpeed = 1.0, setPlaybackSpeed, boost = false, setBoost,
   model, setModel, modelOptions = [],
+  sensitivity, setSensitivity, sensitivityOptions = [],
   announceOn = false, setAnnounceOn, announceOff, setAnnounceEpisode, announceStatus = {},
   trimOn = false, setTrimOn, trimOff, setTrimEpisode, trimStatus = {},
   trimCuts = {}, trimDecisions = {}, onTrimDecide, onTrimEdit, trimAudioUrls = {},
@@ -362,6 +391,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
         {setAnnounceOn && <AnnounceToggle value={announceOn} onChange={setAnnounceOn} />}
         {setTrimOn && <TrimToggle value={trimOn} onChange={setTrimOn} />}
         {setModel && <ModelPicker value={model} onChange={setModel} options={modelOptions} />}
+        {setSensitivity && <SensitivityPicker value={sensitivity} onChange={setSensitivity} options={sensitivityOptions} />}
         <div className="ct-meta" style={{ color: "var(--fg-muted)" }}>drag to reorder · video → MP3</div>
       </div>
 
