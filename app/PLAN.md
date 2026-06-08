@@ -163,6 +163,8 @@ Core principle: **explore before implementing**. For each feature, first prove t
 
 ## 7. Local catalogue (SQLite)
 
+> **Status (2026-06-08): deferred.** The app currently persists state via localStorage (route, playback speed, boost) plus the on-device manifest written by the sync pipeline, and this works well for single-user use. SQLite is not required right now - revisit only if persistence needs outgrow these. The design below is kept for reference.
+
 **Why seventh**: by now we have state to persist - downloads, device contents, user prefs.
 
 **What**: move from `localStorage` and in-memory React state to a proper database.

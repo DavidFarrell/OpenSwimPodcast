@@ -31,9 +31,4 @@ const rows = [
 
 export const upNext = rows.map((r, i) => ({ id: i + 1, ...r }));
 
-export const onDevice = [
-  { id: 900, title: "The accidental cartographer (yesterday)", show: "SEARCH ENGINE", size: "39.4M", sizeMB: 39.4, fname: "01_search.mp3" },
-  { id: 901, title: "Forty seconds on the moon (yesterday)",   show: "RADIOLAB",      size: "17.8M", sizeMB: 17.8, fname: "02_radiolab.mp3" },
-];
-
 export const deviceCapacityMB = 6200;

@@ -242,6 +242,6 @@ A small list of things that ARE decided. Don't spend cycles reconsidering them.
 - `design-system/` — tokens, components, rules, example HTML
 - `design-system/index.html` — rendered workbench
 - `design-system/DECISIONS.md` — type / colour / motion decisions already made
-- `inspo/OpenSwim Podcast _standalone_.html` — standalone workbench prototype (most current visual reference)
+- `prototype/OpenSwim Podcast (standalone).html` — standalone workbench prototype (most current visual reference)
 - `inspo/OpenSwim Podcast — Workbench prototype.pdf` — PDF export of the same
 - `inspo/old/reference-0[1-4]-*.jpg` — earlier reference screenshots (superseded by the standalone prototype, kept for context)

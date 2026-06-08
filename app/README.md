@@ -24,13 +24,13 @@ npm run preview
 src/
   main.jsx          mount + styles
   App.jsx           route + global state (connected, selected, order, mount)
-  Atoms.jsx         Btn, Kbd, Tag, Toggle, Progress, CoverArt, MountPill, DragHandle
+  Atoms.jsx         Btn, Kbd, Progress, CoverArt, MountPill, DragHandle
   Shell.jsx         Window chrome, Sidebar, Toolbar
   LoginScreen.jsx   Pocket Casts cookie paste + fake connect
   UpNextScreen.jsx  filter + tap-to-queue with order pill
   TodayScreen.jsx   drag-to-reorder, rename/new/remove fates
   SyncScreen.jsx    5-stage stepper + log, transforms to Success on done
-  data.js           curated sample upNext + onDevice
+  data.js           curated sample upNext (mock fallback)
   styles.css        tokens + components (from design-system)
 public/
   fonts/            self-hosted Space Grotesk + JetBrains Mono (variable, latin + latin-ext)
@@ -46,6 +46,16 @@ public/
 - Sync tab opened via the sidebar is idle (requires START SYNC). Opened via the Today CTA it auto-runs.
 - Fixed 1120×720 window with scrollable middle; sidebar + mount pill are pinned.
 
-## What's not wired yet
+## Implementation status
 
-Everything below the UI layer is mock. No Pocket Casts integration, no USB device watcher, no ffmpeg conversion, no actual file writes. Data is hard-coded in `src/data.js`; the sync stepper animates on a `setInterval` rather than real work.
+The Electron backend is fully implemented (`electron/`):
+
+- `pocketcasts.cjs` / `pocketcastsApi.cjs` - real email/password auth to a JWT, encrypted at rest via Electron `safeStorage`.
+- `downloader.cjs` - streaming episode download to a local cache, Range-resume, progress events.
+- `device.cjs` - OpenSwim Pro detection on `/Volumes`, capacity readout, claim/eject.
+- `converter.cjs` - video to 128 kbps mono mp3 via bundled `ffmpeg-static`.
+- `sync.cjs` - the real staged pipeline (finalise -> delete -> convert -> transfer -> verify) with an on-device manifest for accurate diffs.
+
+The renderer reaches all of this through `window.openswim` (`preload.cjs` / `ipc.cjs`). When that bridge is absent (running the renderer as plain Vite via `npm run dev`), the app falls back to the hard-coded sample data in `src/data.js` so the UI can be worked on without a device or account. `npm run electron:dev` runs the fully wired app.
+
+Still on the roadmap (see `PLAN.md`): SQLite catalogue (deferred - localStorage plus the on-device manifest currently suffice), settings/error-UI/logs, packaging/signing, and the playback-progress sync-back stretch.

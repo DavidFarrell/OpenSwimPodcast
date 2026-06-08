@@ -7,22 +7,6 @@ export function Kbd({ children }) {
   return <span className="ct-kbd">{children}</span>;
 }
 
-export function Tag({ variant, children }) {
-  const cls = ["ct-tag", variant && `ct-tag--${variant}`].filter(Boolean).join(" ");
-  return <span className={cls}>{children}</span>;
-}
-
-export function Toggle({ on, onChange, label, dim }) {
-  return (
-    <div className="ct-toggle" role="switch" aria-checked={on} tabIndex={0}
-      onClick={() => onChange(!on)}
-      onKeyDown={(e) => (e.key === " " || e.key === "Enter") && onChange(!on)}>
-      <div className="ct-toggle__track"><div className="ct-toggle__thumb"></div></div>
-      <span style={{ color: dim ? "var(--fg-dim)" : "var(--fg)", fontSize: 13 }}>{label}</span>
-    </div>
-  );
-}
-
 export function Progress({ value }) {
   return <div className="ct-progress"><div className="ct-progress__fill" style={{ width: `${value}%` }}></div></div>;
 }
