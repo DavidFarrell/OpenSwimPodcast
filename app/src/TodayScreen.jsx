@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Btn, CoverArt, DragHandle } from "./Atoms.jsx";
 import { Toolbar } from "./Shell.jsx";
+import { effectiveAnnounce } from "./announcePrefs.js";
 
 import { fnameFor } from "./slugShow.js";
 export { fnameFor };
@@ -98,9 +99,66 @@ function BoostToggle({ value, onChange }) {
   );
 }
 
+function AnnounceToggle({ value, onChange }) {
+  return (
+    <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+      <span className="ct-meta" style={{ color: "var(--fg-muted)", letterSpacing: "1.2px", textTransform: "uppercase" }}>Announce</span>
+      <button onClick={() => onChange(!value)}
+        className="ct-btn ct-btn--xs"
+        title="Prepend a short spoken intro (show, title, what the episode is about) so you can tell episodes apart underwater. Applies to every episode unless you disable one below."
+        style={{
+          fontFamily: "var(--font-mono)", fontSize: 11, padding: "3px 10px",
+          border: "1px solid var(--rule)",
+          background: value ? "var(--ct-tea-ghost)" : "transparent",
+          color: value ? "var(--fg)" : "var(--fg-muted)",
+        }}>
+        {value ? "ON" : "OFF"}
+      </button>
+    </div>
+  );
+}
+
+// Compact per-row announce affordance. When the global toggle is off it renders
+// nothing (no clutter). When on it shows the passive status (analysing / ready /
+// skipped) once the sync stream reports it, plus a single overflow action to
+// disable announce for just this episode (or re-enable it). No full toggle set
+// per row - just the badge and one action.
+function AnnounceBadge({ globalOn, off, status, onToggle }) {
+  if (!globalOn) return null;
+  let statusEl = null;
+  if (off) {
+    statusEl = <span style={{ color: "var(--fg-muted)", fontSize: 10 }}>announce off</span>;
+  } else if (status === "analysing") {
+    statusEl = <span style={{ color: "var(--ct-amber)", fontSize: 10 }}>analysing…</span>;
+  } else if (status === "ready") {
+    statusEl = <span style={{ color: "var(--ct-tea)", fontSize: 10 }}>✓ intro ready</span>;
+  } else if (status === "skipped") {
+    statusEl = <span style={{ color: "var(--fg-muted)", fontSize: 10 }} title="intro could not be built - episode sent without it">intro skipped</span>;
+  } else {
+    statusEl = <span style={{ color: "var(--fg-dim)", fontSize: 10 }}>announce on</span>;
+  }
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 6, marginRight: 6 }}>
+      {statusEl}
+      <button onClick={(e) => { e.stopPropagation(); onToggle(); }}
+        className="ct-btn ct-btn--ghost ct-btn--sm"
+        title={off ? "enable announce for this episode" : "disable announce for this episode"}
+        style={{ fontFamily: "var(--font-mono)", fontSize: 9, letterSpacing: ".5px",
+          color: "var(--fg-muted)", border: "1px solid var(--rule)", padding: "1px 5px",
+          background: "transparent", cursor: "pointer" }}>
+        {off ? "ENABLE" : "DISABLE"}
+      </button>
+    </span>
+  );
+}
+
 export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   goSync, goUpNext, deviceCapacityMB, downloadByUuid = {}, onRetryDownload,
-  playbackSpeed = 1.0, setPlaybackSpeed, boost = false, setBoost, devicePath, setShowMountDialog }) {
+  playbackSpeed = 1.0, setPlaybackSpeed, boost = false, setBoost,
+  announceOn = false, setAnnounceOn, announceOff, setAnnounceEpisode, announceStatus = {},
+  devicePath, setShowMountDialog }) {
+
+  const offSet = announceOff || new Set();
 
   const queue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
   const totalMin = queue.reduce((s, x) => s + x.durMin, 0);
@@ -185,7 +243,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
       <Toolbar
         label={`Ready · ${queue.length} episodes lined up`}
         title="Ready for your swim."
-        subtitle={`${totalHM} · ${totalMB.toFixed(1)}MB · will write ${queue.length} file${queue.length > 1 ? "s" : ""}, remove ${removed.length}${playbackSpeed !== 1.0 ? ` · will re-encode at ${playbackSpeed}× playback speed` : ""}${boost ? " · boost on" : ""}`}
+        subtitle={`${totalHM} · ${totalMB.toFixed(1)}MB · will write ${queue.length} file${queue.length > 1 ? "s" : ""}, remove ${removed.length}${playbackSpeed !== 1.0 ? ` · will re-encode at ${playbackSpeed}× playback speed` : ""}${boost ? " · boost on" : ""}${announceOn ? ` · announce ${queue.filter((q) => effectiveAnnounce(q.uuid, announceOn, offSet)).length}` : ""}`}
         actions={<>
           <Btn variant="secondary" onClick={goUpNext}>+ add more</Btn>
           <Btn variant="cta" onClick={goSync} disabled={overCap}>
@@ -210,6 +268,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
         <div style={{ flex: 1 }}></div>
         {setPlaybackSpeed && <SpeedPicker value={playbackSpeed} onChange={setPlaybackSpeed} />}
         {setBoost && <BoostToggle value={boost} onChange={setBoost} />}
+        {setAnnounceOn && <AnnounceToggle value={announceOn} onChange={setAnnounceOn} />}
         <div className="ct-meta" style={{ color: "var(--fg-muted)" }}>drag to reorder · video → MP3</div>
       </div>
 
@@ -264,7 +323,13 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
                 <DownloadBadge state={downloadByUuid[it.uuid]}
                   onRetry={onRetryDownload ? () => onRetryDownload(it) : null} />
               </div>
-              <div style={{ display: "flex", gap: 2, justifyContent: "flex-end" }}>
+              <div style={{ display: "flex", gap: 2, justifyContent: "flex-end", alignItems: "center" }}>
+                {setAnnounceEpisode && (
+                  <AnnounceBadge globalOn={announceOn}
+                    off={it.uuid ? offSet.has(it.uuid) : false}
+                    status={it.uuid ? announceStatus[it.uuid] : undefined}
+                    onToggle={() => setAnnounceEpisode(it.uuid, offSet.has(it.uuid))} />
+                )}
                 <button className="ct-btn ct-btn--ghost ct-btn--sm" onClick={() => remove(it.id)}
                   style={{ color: "var(--destructive)" }} title="remove">✕</button>
               </div>

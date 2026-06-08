@@ -8,6 +8,11 @@ import { upNext as mockUpNext, deviceCapacityMB } from "./data.js";
 import { adaptUpNext, enrichFromPodcastFull } from "./pocketcastsAdapter.js";
 import { useDownloads } from "./useDownloads.js";
 import { useDevice, formatMB } from "./useDevice.js";
+import {
+  loadAnnounceGlobal, saveAnnounceGlobal,
+  loadAnnounceOff, saveAnnounceOff,
+  effectiveAnnounce,
+} from "./announcePrefs.js";
 
 const pc = () => (typeof window !== "undefined" && window.openswim && window.openswim.pocketcasts) || null;
 
@@ -27,6 +32,25 @@ export default function App() {
     setBoostRaw(!!v);
     localStorage.setItem("os_boost", v ? "1" : "0");
   };
+  // Announce-episode intent (S6). Universal toggle + per-episode OFF overrides,
+  // persisted exactly like speed/boost above. Passive announce status (per uuid)
+  // is collected from the S5 sync:event stream.
+  const [announceOn, setAnnounceOnRaw] = useState(() => loadAnnounceGlobal());
+  const setAnnounceOn = (v) => {
+    setAnnounceOnRaw(!!v);
+    saveAnnounceGlobal(!!v);
+  };
+  const [announceOff, setAnnounceOffRaw] = useState(() => loadAnnounceOff());
+  const setAnnounceEpisode = (uuid, enabled) => {
+    if (!uuid) return;
+    setAnnounceOffRaw((prev) => {
+      const next = new Set(prev);
+      if (enabled) next.delete(uuid); else next.add(uuid);
+      saveAnnounceOff(next);
+      return next;
+    });
+  };
+  const [announceStatus, setAnnounceStatus] = useState({});
   const [selected, setSelected] = useState([]);
   const [order, setOrder] = useState([]);
   const [syncArmed, setSyncArmed] = useState(false);
@@ -40,6 +64,32 @@ export default function App() {
   const { byUuid: downloadByUuid, ensure: ensureDownload, reconcile: reconcileDownloads } = useDownloads();
 
   useEffect(() => { localStorage.setItem("os_route", route); }, [route]);
+
+  // Push the effective per-episode Announce intent to the S5 IPC for every queued
+  // episode. We record an explicit ON or OFF per uuid (never just ON) so the S5
+  // off-intent fix can honour a disable - a stale queued ON must not win over a
+  // chosen OFF. Runs whenever the toggle, overrides, or queue change.
+  useEffect(() => {
+    const api = typeof window !== "undefined" && window.openswim && window.openswim.announce;
+    if (!api || !api.set) return;
+    for (const id of order) {
+      const it = items.find((x) => x.id === id);
+      if (!it || !it.uuid) continue;
+      api.set(it.uuid, effectiveAnnounce(it.uuid, announceOn, announceOff));
+    }
+  }, [announceOn, announceOff, order, items]);
+
+  // Passive announce status badge feed (S5 emits announce events during sync).
+  useEffect(() => {
+    const api = typeof window !== "undefined" && window.openswim && window.openswim.sync;
+    if (!api || !api.onEvent) return;
+    const off = api.onEvent((evt) => {
+      if (evt && evt.type === "announce" && evt.uuid) {
+        setAnnounceStatus((prev) => ({ ...prev, [evt.uuid]: evt.state }));
+      }
+    });
+    return typeof off === "function" ? off : undefined;
+  }, []);
 
   useEffect(() => {
     const api = pc();
@@ -217,6 +267,11 @@ export default function App() {
                 setPlaybackSpeed={setPlaybackSpeed}
                 boost={boost}
                 setBoost={setBoost}
+                announceOn={announceOn}
+                setAnnounceOn={setAnnounceOn}
+                announceOff={announceOff}
+                setAnnounceEpisode={setAnnounceEpisode}
+                announceStatus={announceStatus}
                 devicePath={device.mounted ? device.path : null}
                 setShowMountDialog={setShowMountDialog} />
             )}
