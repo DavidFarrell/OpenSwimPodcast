@@ -38,6 +38,7 @@ const BOOST_FILTER = "acompressor=threshold=-22dB:ratio=3:attack=5:release=80:ma
 async function convert({
   src, dest,
   bitrate = "128k", mono = true, speed = 1.0, boost = false,
+  introPath = null,
   ffmpegPath = defaultFfmpegPath,
   spawn = defaultSpawn,
   onProgress, signal,
@@ -56,22 +57,60 @@ async function convert({
   const tmp = `${dest}.tmp`;
   try { await fsp.unlink(tmp); } catch {}
 
-  const filters = [];
-  if (speed && speed !== 1.0) filters.push(`atempo=${speed}`);
-  if (boost) filters.push(BOOST_FILTER);
+  // The speed-up and boost only ever apply to the EPISODE audio. The spoken
+  // intro must play at normal speed, so it is never run through these filters.
+  const episodeFilters = [];
+  if (speed && speed !== 1.0) episodeFilters.push(`atempo=${speed}`);
+  if (boost) episodeFilters.push(BOOST_FILTER);
 
-  const args = [
-    "-y",
-    "-hide_banner",
-    "-i", src,
-    "-vn",
-    "-acodec", "libmp3lame",
-    "-b:a", bitrate,
-    "-f", "mp3",
-  ];
-  if (filters.length) args.push("-filter:a", filters.join(","));
-  if (mono) args.push("-ac", "1");
-  args.push(tmp);
+  let args;
+  if (introPath) {
+    // Front-concat: [intro] then [episode] as a single mp3. The intro WAV is
+    // 24kHz mono and the episode is 44.1kHz, so a "-c copy" concat will not
+    // work - we use the concat FILTER which re-encodes. The concat filter needs
+    // both inputs at the same sample rate and channel layout, so each stream is
+    // run through aresample + aformat to a common 44.1kHz target first. The
+    // episode stream is additionally filtered (atempo/boost) so it is sped up;
+    // the intro stream is NOT sped up so the spoken intro plays at normal speed.
+    const channels = mono ? 1 : 2;
+    const layout = mono ? "mono" : "stereo";
+    const normalise = `aresample=44100,aformat=sample_fmts=s16:channel_layouts=${layout}`;
+    const introChain = [normalise];
+    const episodeChain = [...episodeFilters, normalise];
+    const filterComplex = [
+      `[0:a]${introChain.join(",")}[intro]`,
+      `[1:a]${episodeChain.join(",")}[ep]`,
+      `[intro][ep]concat=n=2:v=0:a=1[out]`,
+    ].join(";");
+
+    args = [
+      "-y",
+      "-hide_banner",
+      "-i", introPath,
+      "-i", src,
+      "-vn",
+      "-filter_complex", filterComplex,
+      "-map", "[out]",
+      "-acodec", "libmp3lame",
+      "-b:a", bitrate,
+      "-ac", String(channels),
+      "-f", "mp3",
+      tmp,
+    ];
+  } else {
+    args = [
+      "-y",
+      "-hide_banner",
+      "-i", src,
+      "-vn",
+      "-acodec", "libmp3lame",
+      "-b:a", bitrate,
+      "-f", "mp3",
+    ];
+    if (episodeFilters.length) args.push("-filter:a", episodeFilters.join(","));
+    if (mono) args.push("-ac", "1");
+    args.push(tmp);
+  }
 
   return await new Promise((resolve, reject) => {
     let child;

@@ -143,6 +143,94 @@ describe("convert()", () => {
     expect(compPos).toBeGreaterThan(atempoPos);
   });
 
+  it("front-concats the intro using filter_complex with re-encode (no -c copy) when introPath is set", async () => {
+    const src = path.join(tmp, "ep.mp3");
+    const dest = path.join(tmp, "ep-intro.mp3");
+    const intro = path.join(tmp, "intro.wav");
+    fs.writeFileSync(src, "episode audio");
+    fs.writeFileSync(intro, "intro wav");
+
+    const { spawn, calls } = fakeSpawn((child) => {
+      child.stderr.write("Duration: 00:00:10.00, start: 0\n");
+      fs.writeFileSync(calls[0].args.at(-1), "mp3");
+      child.emit("exit", 0);
+    });
+
+    await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, introPath: intro, speed: 1.0 });
+    const args = calls[0].args;
+
+    // Two inputs: intro first, episode second.
+    const inputs = args.reduce((acc, a, i) => (a === "-i" ? [...acc, args[i + 1]] : acc), []);
+    expect(inputs).toEqual([intro, src]);
+
+    // Uses the concat filter, never a stream copy.
+    expect(args.includes("-filter_complex")).toBe(true);
+    expect(args.includes("-c")).toBe(false);
+    expect(args.includes("copy")).toBe(false);
+    const fc = args[args.indexOf("-filter_complex") + 1];
+    expect(fc).toContain("concat=n=2:v=0:a=1");
+    // Resample so the 24kHz intro and 44.1kHz episode reconcile.
+    expect(fc).toContain("aresample=44100");
+    // Re-encodes to mp3 and maps the concat output.
+    expect(args).toEqual(expect.arrayContaining(["-map", "[out]", "-acodec", "libmp3lame", "-f", "mp3"]));
+    expect(args.at(-1)).toBe(`${dest}.tmp`);
+    expect(fs.existsSync(dest)).toBe(true);
+  });
+
+  it("speeds up the episode but NOT the intro in the concat filter graph", async () => {
+    const src = path.join(tmp, "ep.mp3");
+    const dest = path.join(tmp, "ep-intro-fast.mp3");
+    const intro = path.join(tmp, "intro.wav");
+    fs.writeFileSync(src, "episode audio");
+    fs.writeFileSync(intro, "intro wav");
+
+    const { spawn, calls } = fakeSpawn((child) => {
+      child.stderr.write("Duration: 00:00:10.00, start: 0\n");
+      fs.writeFileSync(calls[0].args.at(-1), "mp3");
+      child.emit("exit", 0);
+    });
+
+    await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, introPath: intro, speed: 1.5, boost: true });
+    const args = calls[0].args;
+    const fc = args[args.indexOf("-filter_complex") + 1];
+
+    // The atempo/boost live on the episode stream ([1:a] -> [ep]).
+    const epStage = fc.split(";").find((s) => s.endsWith("[ep]"));
+    expect(epStage).toBeDefined();
+    expect(epStage.startsWith("[1:a]")).toBe(true);
+    expect(epStage).toContain("atempo=1.5");
+    expect(epStage).toContain("acompressor=");
+
+    // The intro stream ([0:a] -> [intro]) is resampled only, never sped up or boosted.
+    const introStage = fc.split(";").find((s) => s.endsWith("[intro]"));
+    expect(introStage).toBeDefined();
+    expect(introStage.startsWith("[0:a]")).toBe(true);
+    expect(introStage).not.toContain("atempo");
+    expect(introStage).not.toContain("acompressor=");
+  });
+
+  it("builds the plain single-input pipeline (no filter_complex) when introPath is not set", async () => {
+    const src = path.join(tmp, "ep.mp4");
+    const dest = path.join(tmp, "ep.mp3");
+    fs.writeFileSync(src, "video");
+
+    const { spawn, calls } = fakeSpawn((child) => {
+      child.stderr.write("Duration: 00:00:10.00, start: 0\n");
+      fs.writeFileSync(calls[0].args.at(-1), "mp3");
+      child.emit("exit", 0);
+    });
+
+    await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, speed: 1.5 });
+    const args = calls[0].args;
+    expect(args.includes("-filter_complex")).toBe(false);
+    const inputs = args.reduce((acc, a, i) => (a === "-i" ? [...acc, args[i + 1]] : acc), []);
+    expect(inputs).toEqual([src]);
+    // Existing -filter:a path still used for the single-input case.
+    const idx = args.indexOf("-filter:a");
+    expect(idx).toBeGreaterThan(-1);
+    expect(args[idx + 1]).toBe("atempo=1.5");
+  });
+
   it("reports monotonic progress from stderr time= lines", async () => {
     const src = path.join(tmp, "ep.mp4");
     const dest = path.join(tmp, "ep.mp3");
