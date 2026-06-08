@@ -6,6 +6,15 @@ const { convert: defaultConvert } = require("./converter.cjs");
 const { transcribe: defaultTranscribe } = require("./transcribe.cjs");
 const { buildAnnouncementText: defaultBuildAnnouncementText } = require("./announce.cjs");
 const { renderIntro: defaultRenderIntro } = require("./tts.cjs");
+const { detectAds: defaultDetectAds, toSegments } = require("./detectAds.cjs");
+
+// A detected ad block is treated as a positional intro/outro (and snapped to the
+// episode edge) when its first/last segment sits within this many seconds of the
+// episode start/end. Snapping the leading block back to 0 also sweeps the
+// "unframed" pre-roll cross-promo gap that has no quoted opening line - the bit of
+// audio before the first quoted ad segment. Trailing blocks are extended to the
+// last segment's end.
+const EDGE_SNAP_SEC = 45;
 
 class AbortError extends Error {
   constructor() { super("aborted"); this.name = "AbortError"; }
@@ -145,7 +154,10 @@ async function defaultCopy(src, dest, { onProgress, signal } = {}) {
 // resamples and re-encodes, so a plain copy will not do.
 function itemNeedsEncode(it, needsEncode) {
   const isVideo = it.ext && it.ext !== "mp3";
-  return isVideo || needsEncode || !!it.announce;
+  // Trim-on episodes MAY need a re-encode (if auto-applyable cuts come back), so
+  // we plan a convert entry for them. The convert loop still degrades to a plain
+  // copy when no cuts (and no intro/speed/boost) materialise.
+  return isVideo || needsEncode || !!it.announce || !!it.trim;
 }
 
 function buildPlan({ queue, existingDeviceFiles = [], existingManifest = [], needsEncode = false }) {
@@ -211,6 +223,98 @@ async function generateIntro({
   }
 }
 
+// Turn a detected ad range into a proposed cut, applying positional intro/outro
+// handling against the full segment list. A detected block whose first segment is
+// near the episode start is snapped back to 0 (this also sweeps the unframed
+// pre-roll cross-promo gap before the first quoted line); a block whose last
+// segment is near the episode end is extended to the very end. Returns a cut
+// descriptor { startSec, endSec, needsReview, reasons, label }. Never throws.
+function adToCut({ ad, segments }) {
+  const reasons = Array.isArray(ad.reasons) ? [...ad.reasons] : [];
+  let startSec = ad.startSec;
+  let endSec = ad.endSec;
+  const labels = [];
+
+  const firstSeg = segments[0];
+  const lastSeg = segments[segments.length - 1];
+  const episodeStart = firstSeg ? firstSeg.start : 0;
+  let episodeEnd = null;
+  if (lastSeg) {
+    episodeEnd = lastSeg.end != null ? lastSeg.end : lastSeg.start;
+  }
+
+  // Leading interstitial: the block opens within EDGE_SNAP_SEC of the episode
+  // start. Snap the cut back to the very beginning so the pre-roll gap (anything
+  // before the first quoted ad segment) is swept too. This is a high-confidence
+  // edge case - the start of an episode is the canonical interstitial slot.
+  if (episodeStart != null && Number.isFinite(startSec) && startSec - episodeStart <= EDGE_SNAP_SEC) {
+    startSec = episodeStart > 0 ? 0 : episodeStart;
+    labels.push("intro");
+  }
+
+  // Trailing interstitial: the block closes within EDGE_SNAP_SEC of the episode
+  // end. Extend the cut to the last segment's end so a sign-off / outro promo is
+  // fully removed.
+  if (episodeEnd != null && Number.isFinite(endSec) && episodeEnd - endSec <= EDGE_SNAP_SEC && endSec <= episodeEnd) {
+    endSec = episodeEnd;
+    labels.push("outro");
+  }
+
+  if (labels.length === 0) labels.push("ad");
+
+  return {
+    startSec,
+    endSec,
+    needsReview: !!ad.needsReview,
+    reasons,
+    label: labels.join("+"),
+  };
+}
+
+// Run the detector over an episode transcript and turn the result into a cut
+// list. Returns { status, cuts } where status is one of:
+//   idle | ready | needs-review | skipped
+// and cuts is the full proposed list (each { startSec, endSec, needsReview,
+// reasons, label }). Only cuts with needsReview === false are auto-applyable; the
+// caller passes those into convert and holds the rest for the review layer.
+//
+// Degrades safely: a missing/failed transcript, an unavailable detector, or any
+// thrown error returns { status: "skipped", cuts: [] } so the episode still
+// converts uncut. Never throws into the pipeline.
+async function generateCuts({
+  src, transcribeFn, detectAdsFn, llmFetch, signal,
+}) {
+  try {
+    let transcript = null;
+    try {
+      transcript = await transcribeFn({ src, signal });
+    } catch {
+      transcript = null;
+    }
+    if (!transcript) return { status: "skipped", cuts: [] };
+
+    const segments = toSegments(transcript);
+    if (segments.length === 0) return { status: "skipped", cuts: [] };
+
+    let result = null;
+    try {
+      result = await detectAdsFn({ transcript, fetch: llmFetch, signal });
+    } catch {
+      result = null;
+    }
+    if (!result || !Array.isArray(result.ads)) return { status: "skipped", cuts: [] };
+
+    const cuts = result.ads.map((ad) => adToCut({ ad, segments }))
+      .filter((c) => Number.isFinite(c.startSec) && Number.isFinite(c.endSec) && c.endSec > c.startSec);
+
+    if (cuts.length === 0) return { status: "ready", cuts: [] };
+    const status = cuts.some((c) => c.needsReview) ? "needs-review" : "ready";
+    return { status, cuts };
+  } catch {
+    return { status: "skipped", cuts: [] };
+  }
+}
+
 async function runSync({
   devicePath, cacheDir, queue,
   speed = 1.0, boost = false,
@@ -219,7 +323,8 @@ async function runSync({
   transcribeFn = defaultTranscribe,
   buildAnnouncementTextFn = defaultBuildAnnouncementText,
   renderIntroFn = defaultRenderIntro,
-  llm,
+  detectAdsFn = defaultDetectAds,
+  llm, llmFetch,
   onEvent,
   signal,
 } = {}) {
@@ -277,6 +382,47 @@ async function runSync({
     }
   }
 
+  // Stage: trim
+  // For every episode with the Trim toggle on, kick off ad detection in the
+  // BACKGROUND (alongside announce) so transcription + the LLM windows overlap
+  // with the delete/copy work below. Each job's result is awaited just before the
+  // episode is converted, so the auto-applyable cut list is ready for the
+  // converter's atrim stage. Degrades safely: any failure leaves the episode
+  // uncut. We reuse the same transcript path as announce (transcribeFn caches by
+  // fingerprint, so a Trim+Announce episode transcribes once).
+  const trimItems = queue
+    .map((it, i) => ({ it, i }))
+    .filter(({ it }) => it.trim);
+  // Per-episode resolved trim result: { status, cuts }. Defaults to idle so the
+  // convert loop can read trimResults[i] unconditionally.
+  const trimResults = new Array(queue.length).fill(null).map(() => ({ status: "idle", cuts: [] }));
+  const trimJobs = new Array(queue.length).fill(null);
+
+  if (trimItems.length) {
+    emit({ type: "stage", stage: "trim", state: "active" });
+    for (const { it, i } of trimItems) {
+      const src = path.join(cacheDir, `${it.uuid}.${it.ext || "mp3"}`);
+      emit({ type: "trim", uuid: it.uuid, slot: it.slot, state: "analysing" });
+      trimJobs[i] = generateCuts({
+        src, transcribeFn, detectAdsFn, llmFetch, signal,
+      }).then((res) => {
+        trimResults[i] = res;
+        emit({
+          type: "trim", uuid: it.uuid, slot: it.slot,
+          state: res.status, cuts: res.cuts,
+        });
+        return res;
+      }).catch(() => {
+        // generateCuts already degrades to skipped, but guard so a rejected
+        // promise never escapes into Promise.allSettled noise / the pipeline.
+        const res = { status: "skipped", cuts: [] };
+        trimResults[i] = res;
+        emit({ type: "trim", uuid: it.uuid, slot: it.slot, state: "skipped", cuts: [] });
+        return res;
+      });
+    }
+  }
+
   // Stage: delete
   emit({ type: "stage", stage: "delete", state: "active" });
   const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
@@ -303,6 +449,14 @@ async function runSync({
     emit({ type: "stage", stage: "announce", state: "done" });
   }
 
+  // Let the background trim/detect jobs settle before we convert, the same way as
+  // the intro jobs - each trimResults[i] is resolved (or degraded to skipped)
+  // before its episode is passed to the converter.
+  if (trimItems.length) {
+    await Promise.allSettled(trimJobs.filter(Boolean));
+    emit({ type: "stage", stage: "trim", state: "done" });
+  }
+
   // Stage: convert
   emit({ type: "stage", stage: "convert", state: "active" });
   const sources = new Array(queue.length);
@@ -318,19 +472,30 @@ async function runSync({
     // else forces a re-encode, the episode is a plain mp3 at speed 1.0 and is
     // copied directly - degrading to the normal episode exactly as required.
     const isVideo = it.ext && it.ext !== "mp3";
-    // Whether the episode would still need a re-encode even with the intro
-    // dropped (video source, or speed/boost on). Drives the convert-failure
-    // fallback below: if false, dropping the intro means a plain copy.
+    // Auto-applyable cuts for this episode: only the cuts that are NOT flagged
+    // needs-review. needs-review cuts are deliberately held back from the
+    // converter (CARDINAL RULE - never auto-trim an ambiguous / over-threshold
+    // boundary); the review layer surfaces them later. The converter takes
+    // [startSec,endSec] pairs on the ORIGINAL timeline.
+    const autoCuts = (trimResults[i].cuts || [])
+      .filter((c) => !c.needsReview)
+      .map((c) => [c.startSec, c.endSec]);
+    // Whether the episode would still need a re-encode even with the intro AND
+    // the cuts dropped (video source, or speed/boost on). Drives the
+    // convert-failure fallback below: if false, dropping both means a plain copy.
     const mustEncodeWithoutIntro = isVideo || needsEncode;
-    const mustEncode = mustEncodeWithoutIntro || !!introPath;
+    const mustEncode = mustEncodeWithoutIntro || !!introPath || autoCuts.length > 0;
     if (!mustEncode) {
       sources[i] = downloadedPath;
       continue;
     }
-    // The intro is baked into the variant key so a cached intro-less encode is
-    // never reused for an intro'd episode (and vice versa).
+    // The intro and the cut set are baked into the variant key so a cached encode
+    // is never reused across a different intro/cut combination.
     const introSuffix = introPath ? "-intro" : "";
-    const variantSuffix = `${speedSuffix}${boostSuffix}${introSuffix}`;
+    const cutSuffix = autoCuts.length
+      ? `-trim${crypto.createHash("sha1").update(JSON.stringify(autoCuts)).digest("hex").slice(0, 8)}`
+      : "";
+    const variantSuffix = `${speedSuffix}${boostSuffix}${introSuffix}${cutSuffix}`;
     const mp3Path = path.join(cacheDir, `${it.uuid}${variantSuffix}.mp3`);
     let cached = false;
     try { cached = (await fsp.stat(mp3Path)).size > 0; } catch {}
@@ -342,7 +507,8 @@ async function runSync({
     emit({ type: "log", stage: "convert", state: "active", uuid: it.uuid, text: it.title });
     try {
       await convertFn({
-        src: downloadedPath, dest: mp3Path, speed, boost, introPath, signal,
+        src: downloadedPath, dest: mp3Path, speed, boost, introPath,
+        cuts: autoCuts.length ? autoCuts : null, signal,
         onProgress: ({ seconds, durationSec }) => emit({
           type: "log", stage: "convert", state: "active", uuid: it.uuid, text: it.title,
           bytes: seconds, total: durationSec,
@@ -352,30 +518,33 @@ async function runSync({
       emit({ type: "log", stage: "convert", state: "done", uuid: it.uuid, text: it.title });
     } catch (e) {
       if (e && e.name === "AbortError") throw e;
-      // The intro front-concat is an extra step layered on top of whatever the
-      // episode would have needed anyway. If the convert fails while an intro
-      // was being prepended, we must never lose the real audio because of the
-      // intro. So for ANY episode type (mp3, sped/boosted, or video) we RETRY
-      // the normal conversion WITHOUT the introPath. Only if that retry also
-      // fails is it a genuine conversion failure that surfaces.
+      // The intro front-concat and the trim atrim stage are extra steps layered
+      // on top of whatever the episode would have needed anyway. If the convert
+      // fails while an intro was being prepended OR cuts were being applied, we
+      // must never lose the real audio because of those extras. So for ANY
+      // episode type we RETRY the normal conversion WITHOUT the introPath AND
+      // WITHOUT the cuts. Only if that retry also fails is it a genuine
+      // conversion failure that surfaces.
       //
-      // - A plain speed-1.0 mp3 has no encode to redo, so the retry is just a
-      //   direct copy of the original (the un-introd episode ships).
-      // - A video / sped / boosted episode is re-encoded without the intro so
-      //   it still ships as a playable mp3, just without the spoken intro.
-      if (introPath) {
+      // - A plain speed-1.0 mp3 has no encode to redo once both are dropped, so
+      //   the retry is just a direct copy of the original.
+      // - A video / sped / boosted episode is re-encoded plainly so it still
+      //   ships as a playable mp3, just without the spoken intro or the trims.
+      if (introPath || autoCuts.length > 0) {
         const fallbackSuffix = `${speedSuffix}${boostSuffix}`;
         const fallbackPath = path.join(cacheDir, `${it.uuid}${fallbackSuffix}.mp3`);
         try {
           if (!mustEncodeWithoutIntro) {
-            // No re-encode needed once the intro is dropped - ship the original.
+            // No re-encode needed once the intro and cuts are dropped - ship the
+            // original untouched episode.
             sources[i] = downloadedPath;
           } else {
             let cachedFallback = false;
             try { cachedFallback = (await fsp.stat(fallbackPath)).size > 0; } catch {}
             if (!cachedFallback) {
               await convertFn({
-                src: downloadedPath, dest: fallbackPath, speed, boost, introPath: null, signal,
+                src: downloadedPath, dest: fallbackPath, speed, boost,
+                introPath: null, cuts: null, signal,
                 onProgress: ({ seconds, durationSec }) => emit({
                   type: "log", stage: "convert", state: "active", uuid: it.uuid, text: it.title,
                   bytes: seconds, total: durationSec,
@@ -384,13 +553,15 @@ async function runSync({
             }
             sources[i] = fallbackPath;
           }
-          emit({ type: "announce", uuid: it.uuid, slot: it.slot, state: "skipped" });
-          emit({ type: "log", stage: "convert", state: "done", uuid: it.uuid, text: `${it.title} · intro skipped (${e.message})` });
+          if (introPath) emit({ type: "announce", uuid: it.uuid, slot: it.slot, state: "skipped" });
+          if (autoCuts.length > 0) emit({ type: "trim", uuid: it.uuid, slot: it.slot, state: "skipped", cuts: [] });
+          const what = [introPath ? "intro" : null, autoCuts.length ? "trim" : null].filter(Boolean).join("+");
+          emit({ type: "log", stage: "convert", state: "done", uuid: it.uuid, text: `${it.title} · ${what} skipped (${e.message})` });
           continue;
         } catch (e2) {
           if (e2 && e2.name === "AbortError") throw e2;
-          // The retry without the intro also failed - this is a real conversion
-          // failure, not an intro problem. Surface it.
+          // The retry without the intro/cuts also failed - this is a real
+          // conversion failure, not an intro/trim problem. Surface it.
           emit({ type: "log", stage: "convert", state: "error", uuid: it.uuid, text: `${it.title}: ${e2.message}` });
           throw e2;
         }
@@ -449,4 +620,4 @@ async function runSync({
   return { ok: true, files: dests };
 }
 
-module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE };
+module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, generateCuts, adToCut, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE, EDGE_SNAP_SEC };

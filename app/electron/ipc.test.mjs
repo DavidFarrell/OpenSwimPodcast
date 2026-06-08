@@ -6,7 +6,10 @@ import { createRequire } from "node:module";
 // it yields undefined - harmless as long as we only touch the pure announce
 // toggle helpers here, which never reach into the electron API.
 const require = createRequire(import.meta.url);
-const { getAnnounce, setAnnounce, listAnnounce, resolveAnnounceQueue } = require("./ipc.cjs");
+const {
+  getAnnounce, setAnnounce, listAnnounce, resolveAnnounceQueue,
+  getTrim, setTrim, listTrim, resolveTrimQueue, getTrimStatus, recordTrimEvent,
+} = require("./ipc.cjs");
 
 describe("announce toggle intent (ipc helpers, { ok, data } surface)", () => {
   beforeEach(() => {
@@ -71,5 +74,68 @@ describe("startSync announce override (resolveAnnounceQueue)", () => {
     ];
     const resolved = resolveAnnounceQueue(queue);
     expect(resolved.map((it) => it.announce)).toEqual([true, false]);
+  });
+});
+
+describe("trim toggle intent (ipc helpers, { ok, data } surface)", () => {
+  beforeEach(() => {
+    for (const uuid of listTrim()) setTrim(uuid, false);
+  });
+
+  it("defaults to off for an unknown episode", () => {
+    expect(getTrim("nope")).toBe(false);
+  });
+
+  it("set on then read back reflects the toggle and shows up in the list", () => {
+    expect(setTrim("ep1", true)).toBe(true);
+    expect(getTrim("ep1")).toBe(true);
+    expect(listTrim()).toContain("ep1");
+  });
+
+  it("set off removes the episode from the enabled set (explicit OFF stored, not deleted)", () => {
+    setTrim("ep2", true);
+    expect(setTrim("ep2", false)).toBe(false);
+    expect(getTrim("ep2")).toBe(false);
+    expect(listTrim()).not.toContain("ep2");
+  });
+
+  it("ignores a missing uuid rather than throwing", () => {
+    expect(setTrim(undefined, true)).toBe(false);
+    expect(getTrim(undefined)).toBe(false);
+  });
+
+  it("resolveTrimQueue: an OFF toggled after the queue was built wins over the stale queued true", () => {
+    const queue = [{ uuid: "ep1", trim: true, filename: "01_x.mp3" }];
+    setTrim("ep1", false);
+    const resolved = resolveTrimQueue(queue);
+    expect(resolved[0].trim).toBe(false);
+  });
+
+  it("resolveTrimQueue: falls back to the queued value when no toggle intent was recorded", () => {
+    const queue = [
+      { uuid: "trim-fresh-1", trim: true, filename: "01_x.mp3" },
+      { uuid: "trim-fresh-2", trim: false, filename: "02_y.mp3" },
+    ];
+    const resolved = resolveTrimQueue(queue);
+    expect(resolved.map((it) => it.trim)).toEqual([true, false]);
+  });
+});
+
+describe("trim status surface (recordTrimEvent / getTrimStatus)", () => {
+  it("defaults to idle with no cuts for an unknown episode", () => {
+    expect(getTrimStatus("never-seen")).toEqual({ status: "idle", cuts: [] });
+  });
+
+  it("records the status + cut list off the sync:event trim stream", () => {
+    const cuts = [{ startSec: 600, endSec: 700, needsReview: false, reasons: [], label: "ad" }];
+    recordTrimEvent({ type: "trim", uuid: "epA", state: "analysing" });
+    expect(getTrimStatus("epA").status).toBe("analysing");
+    recordTrimEvent({ type: "trim", uuid: "epA", state: "ready", cuts });
+    expect(getTrimStatus("epA")).toEqual({ status: "ready", cuts });
+  });
+
+  it("ignores non-trim events", () => {
+    recordTrimEvent({ type: "stage", stage: "convert", state: "done" });
+    expect(getTrimStatus("epB")).toEqual({ status: "idle", cuts: [] });
   });
 });

@@ -73,13 +73,63 @@ function resolveAnnounceQueue(queue) {
   }));
 }
 
+// Per-episode "Trim" toggle intent, keyed by episode uuid. Mirrors announcePrefs
+// exactly (an explicit OFF is stored, not deleted, so a toggle flipped after the
+// queue was built wins over the stale queued value).
+const trimPrefs = new Map();
+
+function getTrim(uuid) {
+  return uuid ? !!trimPrefs.get(uuid) : false;
+}
+
+function setTrim(uuid, enabled) {
+  if (!uuid) return false;
+  const on = !!enabled;
+  trimPrefs.set(uuid, on);
+  return on;
+}
+
+function listTrim() {
+  return Array.from(trimPrefs.entries()).filter(([, on]) => on).map(([uuid]) => uuid);
+}
+
+function resolveTrimQueue(queue) {
+  return (queue || []).map((it) => ({
+    ...it,
+    trim: it.uuid && trimPrefs.has(it.uuid) ? getTrim(it.uuid) : !!it.trim,
+  }));
+}
+
+// Latest trim status + proposed cut list per episode uuid, fed by the sync:event
+// stream so the renderer can read it back ({ status, cuts }). status is one of
+// idle | analysing | ready | needs-review | skipped.
+const trimStatus = new Map();
+
+function getTrimStatus(uuid) {
+  if (!uuid) return { status: "idle", cuts: [] };
+  return trimStatus.get(uuid) || { status: "idle", cuts: [] };
+}
+
+function recordTrimEvent(e) {
+  if (!e || e.type !== "trim" || !e.uuid) return;
+  trimStatus.set(e.uuid, {
+    status: e.state || "idle",
+    cuts: Array.isArray(e.cuts) ? e.cuts : (trimStatus.get(e.uuid)?.cuts || []),
+  });
+}
+
 let syncController = null;
 
 async function startSync(spec) {
   if (syncController) throw Object.assign(new Error("sync already in progress"), { code: "SYNC_IN_PROGRESS" });
   syncController = new AbortController();
   const cacheDir = path.join(app.getPath("userData"), "cache", "episodes");
-  const queue = resolveAnnounceQueue(spec.queue);
+  const queue = resolveTrimQueue(resolveAnnounceQueue(spec.queue));
+  // Reset trim status for the episodes about to be processed so a prior run's
+  // result does not linger in the renderer while this one analyses.
+  for (const it of queue) {
+    if (it.trim && it.uuid) trimStatus.set(it.uuid, { status: "idle", cuts: [] });
+  }
   try {
     const res = await runSync({
       devicePath: spec.devicePath,
@@ -88,7 +138,7 @@ async function startSync(spec) {
       boost: !!spec.boost,
       cacheDir,
       signal: syncController.signal,
-      onEvent: (e) => broadcast("sync:event", e),
+      onEvent: (e) => { recordTrimEvent(e); broadcast("sync:event", e); },
     });
     broadcast("sync:event", { type: "finished", ok: true });
     return res;
@@ -157,6 +207,11 @@ function registerAll() {
     "announce:get": (_, uuid) => getAnnounce(uuid),
     "announce:set": (_, { uuid, enabled }) => setAnnounce(uuid, enabled),
     "announce:list": () => listAnnounce(),
+
+    "trim:get": (_, uuid) => getTrim(uuid),
+    "trim:set": (_, { uuid, enabled }) => setTrim(uuid, enabled),
+    "trim:list": () => listTrim(),
+    "trim:status": (_, uuid) => getTrimStatus(uuid),
   };
   for (const [ch, fn] of Object.entries(handlers)) {
     ipcMain.handle(ch, async (ev, arg) => {
@@ -166,4 +221,8 @@ function registerAll() {
   }
 }
 
-module.exports = { registerPocketCasts: registerAll, getAnnounce, setAnnounce, listAnnounce, resolveAnnounceQueue };
+module.exports = {
+  registerPocketCasts: registerAll,
+  getAnnounce, setAnnounce, listAnnounce, resolveAnnounceQueue,
+  getTrim, setTrim, listTrim, resolveTrimQueue, getTrimStatus, recordTrimEvent,
+};
