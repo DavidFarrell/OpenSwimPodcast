@@ -80,6 +80,10 @@ export default function App() {
   // list alongside the state. Kept separate from the string status above so the
   // badge can stay a simple string while the review surface reads the cuts.
   const [trimCuts, setTrimCuts] = useState({});
+  // Transcript segments per episode, fed by the same trim event. The Advanced
+  // transcript-as-evidence view (P3d) reads these to highlight the detected ad
+  // ranges in context. Optional - the view renders nothing without segments.
+  const [trimSegments, setTrimSegments] = useState({});
   // Recorded keep/remove decisions for FLAGGED cuts, keyed by uuid then cut key
   // ({ uuid: { "start-end": "keep" | "remove" } }). Default is keep everywhere
   // (cardinal rule); only an explicit remove lets a flagged cut be applied.
@@ -172,6 +176,9 @@ export default function App() {
         setTrimStatus((prev) => ({ ...prev, [evt.uuid]: evt.state }));
         if (Array.isArray(evt.cuts)) {
           setTrimCuts((prev) => ({ ...prev, [evt.uuid]: evt.cuts }));
+        }
+        if (Array.isArray(evt.segments)) {
+          setTrimSegments((prev) => ({ ...prev, [evt.uuid]: evt.segments }));
         }
       }
     });
@@ -365,6 +372,7 @@ export default function App() {
                 setTrimEpisode={setTrimEpisode}
                 trimStatus={trimStatus}
                 trimCuts={trimCuts}
+                trimSegments={trimSegments}
                 trimDecisions={trimDecisions}
                 onTrimDecide={onTrimDecide}
                 onTrimEdit={onTrimEdit}

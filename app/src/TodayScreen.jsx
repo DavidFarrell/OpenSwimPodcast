@@ -4,6 +4,7 @@ import { Toolbar } from "./Shell.jsx";
 import { effectiveAnnounce } from "./announcePrefs.js";
 import { effectiveTrim } from "./trimPrefs.js";
 import { CutlistReview } from "./CutlistReview.jsx";
+import { TranscriptEvidence } from "./TranscriptEvidence.jsx";
 
 import { fnameFor } from "./slugShow.js";
 export { fnameFor };
@@ -214,6 +215,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   announceOn = false, setAnnounceOn, announceOff, setAnnounceEpisode, announceStatus = {},
   trimOn = false, setTrimOn, trimOff, setTrimEpisode, trimStatus = {},
   trimCuts = {}, trimDecisions = {}, onTrimDecide, onTrimEdit, trimAudioUrls = {},
+  trimSegments = {},
   devicePath, setShowMountDialog }) {
 
   const offSet = announceOff || new Set();
@@ -402,12 +404,17 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
               </div>
             </div>
             {trimOn && it.uuid && !trimOffSet.has(it.uuid) && (
-              <CutlistReview uuid={it.uuid}
-                trimEntry={{ cuts: trimCuts[it.uuid] || [] }}
-                decisions={trimDecisions[it.uuid] || {}}
-                audioUrl={trimAudioUrls[it.uuid]}
-                onDecide={onTrimDecide}
-                onEditCut={onTrimEdit} />
+              <>
+                <CutlistReview uuid={it.uuid}
+                  trimEntry={{ cuts: trimCuts[it.uuid] || [] }}
+                  decisions={trimDecisions[it.uuid] || {}}
+                  audioUrl={trimAudioUrls[it.uuid]}
+                  onDecide={onTrimDecide}
+                  onEditCut={onTrimEdit} />
+                <TranscriptEvidence uuid={it.uuid}
+                  transcript={trimSegments[it.uuid]}
+                  trimEntry={{ cuts: trimCuts[it.uuid] || [] }} />
+              </>
             )}
             </div>
           );

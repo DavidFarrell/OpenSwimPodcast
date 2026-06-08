@@ -327,9 +327,11 @@ async function generateCuts({
     }
     const cuts = applyDecisions(detected, decisions);
 
-    if (cuts.length === 0) return { status: "ready", cuts: [] };
+    if (cuts.length === 0) return { status: "ready", cuts: [], segments: [] };
     const status = cuts.some((c) => c.needsReview) ? "needs-review" : "ready";
-    return { status, cuts };
+    // Carry the normalised segments so the renderer's Advanced transcript-as-
+    // evidence view (P3d) can highlight the cut ranges in context. Read-only data.
+    return { status, cuts, segments };
   } catch {
     return { status: "skipped", cuts: [] };
   }
@@ -431,6 +433,7 @@ async function runSync({
         emit({
           type: "trim", uuid: it.uuid, slot: it.slot,
           state: res.status, cuts: res.cuts,
+          segments: Array.isArray(res.segments) ? res.segments : [],
         });
         return res;
       }).catch(() => {
