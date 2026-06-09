@@ -40,6 +40,7 @@ contextBridge.exposeInMainWorld("openswim", {
   sync: {
     start: (spec) => invoke("sync:start", spec),
     cancel: () => invoke("sync:cancel"),
+    resolveReview: () => invoke("sync:review:resolve"),
     onEvent: (cb) => {
       const listener = (_e, evt) => cb(evt);
       ipcRenderer.on("sync:event", listener);

@@ -11,6 +11,7 @@ const {
   getTrim, setTrim, listTrim, resolveTrimQueue, getTrimStatus, recordTrimEvent,
   setTrimDecision, getTrimDecisions, cutKey, buildHandlers,
   setTrimEdit, getTrimEdits, mergeDecisionsWithEdits,
+  resolveReview, cancelSync,
 } = require("./ipc.cjs");
 
 describe("announce toggle intent (ipc helpers, { ok, data } surface)", () => {
@@ -276,5 +277,16 @@ describe("mergeDecisionsWithEdits (P3c - fold adjusted boundaries into the persi
     const cut = { startSec: 600, endSec: 700 };
     setTrimEdit("epMerge4", cut, { startSec: 615, endSec: 690 });
     expect(mergeDecisionsWithEdits("epMerge4")).toEqual({});
+  });
+});
+
+describe("review gate handshake (resolveReview / cancelSync guards)", () => {
+  it("resolveReview is a no-op (false) when nothing is awaiting review", () => {
+    expect(resolveReview()).toBe(false);
+  });
+
+  it("cancelSync returns false when no sync and no review are in flight", () => {
+    // Nothing parked: cancel has nothing to release or abort.
+    expect(cancelSync()).toBe(false);
   });
 });

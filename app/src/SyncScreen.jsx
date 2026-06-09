@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Btn, CoverArt, Progress } from "./Atoms.jsx";
 import { Toolbar } from "./Shell.jsx";
 import { fnameFor } from "./TodayScreen.jsx";
 import { formatMB } from "./useDevice.js";
+import { CutlistReview } from "./CutlistReview.jsx";
+import { TranscriptEvidence } from "./TranscriptEvidence.jsx";
+import { buildTrimAudioUrls, applyCutEdit } from "./trimAudio.js";
 
 function buildStages({ hasVideo, playbackSpeed, boost }) {
   const reEncode = playbackSpeed !== 1.0 || boost;
@@ -122,6 +125,30 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   const [logByKey, setLogByKey] = useState({});
   const [steps, setSteps] = useState({});
   const [error, setError] = useState(null);
+  // The review gate (approve-cuts step). When the backend holds the pipeline on
+  // uncertain cuts it emits a `review` event carrying the flagged episodes; we
+  // raise an overlay over the running view until the user clicks Continue, then
+  // call sync.resolveReview() to release the pipeline. `null` = no gate open.
+  const [review, setReview] = useState(null);
+  // Decisions/edits the user makes IN the overlay, mirrored locally for an
+  // immediate redraw (the per-cut IPC is the persistence layer the backend reads
+  // back on resume). Keyed by uuid.
+  const [reviewDecisions, setReviewDecisions] = useState({});
+  const [reviewEditedCuts, setReviewEditedCuts] = useState({});
+  const reviewAudioUrls = useMemo(() => buildTrimAudioUrls(downloadByUuid), [downloadByUuid]);
+  // The gate is correct by construction: keep/remove/edit update ONLY local state
+  // while the overlay is open (no incremental IPC), then Continue RE-SENDS the
+  // authoritative current state to the backend, awaits every write, and only
+  // resolves if all landed. This removes any dependence on earlier writes having
+  // succeeded - a failed or dropped write can never leave the backend on stale
+  // state, because Continue re-establishes it from scratch and fails closed.
+  // A synchronous lock (ref, not state) is taken the instant Continue is pressed
+  // so no decision/edit can mutate state mid-send; the boolean mirror drives the
+  // disabled buttons + error line.
+  const reviewLock = useRef(false);
+  const [reviewResolving, setReviewResolving] = useState(false);
+  const [reviewError, setReviewError] = useState(null);
+  const cutKeyOf = (cut) => `${Math.round(Number(cut.startSec) * 1000)}-${Math.round(Number(cut.endSec) * 1000)}`;
 
   // Base stages + any analysis stages that have started. Title lookup for log lines.
   const stages = useMemo(() => insertAnalysisStages(STAGES, stageState), [STAGES, stageState]);
@@ -144,7 +171,18 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
 
     const off = api.onEvent((evt) => {
       if (evt.type === "plan") setServerPlan(evt.plan);
-      else if (evt.type === "stage") setStageState((m) => ({ ...m, [evt.stage]: evt.state }));
+      else if (evt.type === "stage") {
+        setStageState((m) => ({ ...m, [evt.stage]: evt.state }));
+        // The pipeline resumes past the gate by emitting stage:review done -
+        // tear the overlay down so the progress view shows the finish.
+        if (evt.stage === "review" && evt.state === "done") setReview(null);
+      }
+      else if (evt.type === "review") {
+        reviewLock.current = false;
+        setReviewResolving(false);
+        setReviewError(null);
+        setReview({ items: Array.isArray(evt.items) ? evt.items : [] });
+      }
       else if (evt.type === "log") setLogByKey((m) => ({ ...m, [logKey(evt)]: evt }));
       else if (evt.type === "transcribe" || evt.type === "trim" || evt.type === "announce") {
         // Per-episode analysis progress: keep the latest event per (type, uuid).
@@ -165,6 +203,112 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     if (api) await api.cancel();
     onBack();
   };
+
+  // --- Review gate handlers ---
+  // Keep/remove choice - LOCAL state only (the authoritative re-send happens at
+  // Continue). Default stays KEEP - only an explicit REMOVE ever cuts (cardinal
+  // rule). Keyed by the cut's CURRENT key so an edited-then-decided cut records
+  // under its edited key; Continue reconciles both keys.
+  const reviewDecide = (uuid, cut, decision) => {
+    if (reviewLock.current) return; // gate is resolving - state is frozen
+    if (!uuid || !cut) return;
+    const key = cutKeyOf(cut);
+    const value = decision === "remove" ? "remove" : "keep";
+    setReviewDecisions((p) => ({ ...p, [uuid]: { ...(p[uuid] || {}), [key]: value } }));
+  };
+  // Boundary nudge/typed edit - LOCAL state only. Swaps the new boundaries into
+  // the displayed cut list (it only changes WHAT a later REMOVE would cut).
+  const reviewEdit = (uuid, originalCut, newCut) => {
+    if (reviewLock.current) return; // gate is resolving - state is frozen
+    if (!uuid || !originalCut || !newCut) return;
+    setReviewEditedCuts((p) => {
+      const cur = p[uuid] || (review && review.items.find((x) => x.uuid === uuid)?.cuts) || [];
+      const next = applyCutEdit(cur, originalCut, newCut);
+      if (next === cur) return p;
+      return { ...p, [uuid]: next };
+    });
+  };
+  // Release the pipeline. CARDINAL-RULE-SAFE ORDERING:
+  // (1) take the synchronous lock so no decision/edit can mutate state mid-send;
+  // (2) RE-SEND the authoritative current state to the backend - for every flagged
+  //     DETECTED cut, send its current keep/remove (keyed by the detected cut so
+  //     the backend's applyDecisions finds it), plus the boundary edit when the
+  //     user adjusted it (so a remove applies at the adjusted range). This
+  //     overrides any earlier dropped/failed write - the backend store is rebuilt
+  //     from what is on screen RIGHT NOW;
+  // (3) await every write and verify each LANDED (a rejected promise OR an
+  //     { ok:false } reply = FAIL CLOSED: keep the gate open, show an error, do
+  //     NOT resolve - never resume on uncertain state);
+  // (4) only when all writes landed, resolve - itself fail-closed: if resolve
+  //     errors, restore the gate rather than leaving the pipeline released-but-
+  //     overlay-gone. The backend then resumes and emits stage:review done.
+  const continueReview = async () => {
+    if (reviewLock.current) return;
+    reviewLock.current = true;
+    setReviewResolving(true);
+    setReviewError(null);
+    // Any abnormal path keeps the gate OPEN with an error - never resume on
+    // uncertain state. A missing bridge, a missing required edit, a rejected or
+    // { ok:false } write, or a thrown call ALL fail closed here.
+    const failClosed = (msg) => {
+      reviewLock.current = false;
+      setReviewResolving(false);
+      setReviewError(msg);
+    };
+
+    try {
+      const trimApi = window.openswim && window.openswim.trim;
+      const syncApi = window.openswim && window.openswim.sync;
+      // The bridges that actually commit + release MUST be present.
+      if (!syncApi || !syncApi.resolveReview) { failClosed("Sync bridge unavailable - cannot resume. Try again."); return; }
+      if (!trimApi || !trimApi.decide) { failClosed("Decision bridge unavailable - cannot save choices. Try again."); return; }
+
+      const sends = [];
+      let editMissing = false;
+      for (const item of (review ? review.items : [])) {
+        const detected = item.cuts || [];
+        const current = reviewEditedCuts[item.uuid] || detected;
+        const decs = reviewDecisions[item.uuid] || {};
+        detected.forEach((dcut, k) => {
+          if (!dcut || !dcut.needsReview) return;
+          const ccut = current[k] || dcut;
+          const dKey = cutKeyOf(dcut);
+          const cKey = cutKeyOf(ccut);
+          // Decision may be recorded under the edited key (decided after editing)
+          // or the detected key (decided before). Either reads as the intent.
+          const value = (decs[cKey] || decs[dKey]) === "remove" ? "remove" : "keep";
+          // A REMOVE at an adjusted boundary REQUIRES the edit to land first, else
+          // the backend would cut the original (wider) detected range - the exact
+          // cardinal-rule violation. Fail closed if the edit bridge is missing.
+          if (value === "remove" && cKey !== dKey) {
+            if (!trimApi.edit) { editMissing = true; return; }
+            sends.push(Promise.resolve(trimApi.edit(item.uuid, dcut, { startSec: ccut.startSec, endSec: ccut.endSec })));
+          }
+          // Decision keyed by the DETECTED cut (backend looks it up there).
+          sends.push(Promise.resolve(trimApi.decide(item.uuid, dcut, value)));
+        });
+      }
+      if (editMissing) { failClosed("Couldn't save an adjusted boundary. Try again."); return; }
+
+      const results = await Promise.allSettled(sends);
+      const failed = results.some((r) => r.status === "rejected" || (r.value && r.value.ok === false));
+      if (failed) { failClosed("A decision didn't save. Check the choices and press Continue again."); return; }
+
+      const r = await syncApi.resolveReview();
+      if (r && r.ok === false) { failClosed("Couldn't resume the transfer. Press Continue again."); return; }
+
+      setReview(null);
+      setReviewResolving(false);
+      reviewLock.current = false;
+    } catch {
+      failClosed("Something went wrong saving your choices. Press Continue again.");
+    }
+  };
+
+  const reviewFlaggedCount = review
+    ? review.items.reduce((n, it) =>
+        n + ((reviewEditedCuts[it.uuid] || it.cuts || []).filter((c) => c && c.needsReview).length), 0)
+    : 0;
 
   const stageCounts = stages.map((st) => ({
     ...st,
@@ -302,6 +446,57 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       <div style={{ padding: "0 20px" }}>
         <Progress value={overall * 100} />
       </div>
+
+      {review && (
+        <div className="ct-overlay">
+          <div className="ct-dialog" onClick={(e) => e.stopPropagation()}
+            style={{ minWidth: 640, maxWidth: 780, maxHeight: "86vh", display: "flex", flexDirection: "column" }}>
+            <div className="ct-dialog__head">
+              <div>
+                <div className="ct-label" style={{ color: "var(--ct-amber)" }}>Review before sending</div>
+                <div className="ct-subhead" style={{ marginTop: 4 }}>
+                  {reviewFlaggedCount} cut{reviewFlaggedCount !== 1 ? "s" : ""} across {review.items.length} episode{review.items.length !== 1 ? "s" : ""} need a decision
+                </div>
+              </div>
+              <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--ct-amber)" }}></div>
+            </div>
+            <div className="ct-dialog__body" style={{ overflow: "auto", flex: 1, padding: 0 }}>
+              <div className="ct-meta" style={{ color: "var(--fg-muted)", padding: "12px 20px 4px" }}>
+                These were left intact because they were ambiguous or over the safe length.
+                Confident cuts have already been applied. Anything you don't mark{" "}
+                <span style={{ color: "var(--ct-amber)" }}>REMOVE</span> is kept.
+              </div>
+              {review.items.map((item) => {
+                const cuts = reviewEditedCuts[item.uuid] || item.cuts || [];
+                return (
+                  <div key={item.uuid} style={{ marginTop: 8 }}>
+                    <div className="ct-label" style={{ padding: "0 20px" }}>{item.title}</div>
+                    <CutlistReview
+                      uuid={item.uuid}
+                      trimEntry={{ cuts }}
+                      decisions={reviewDecisions[item.uuid] || {}}
+                      audioUrl={reviewAudioUrls[item.uuid]}
+                      onDecide={reviewDecide}
+                      onEditCut={reviewEdit} />
+                    <TranscriptEvidence uuid={item.uuid} transcript={item.segments} trimEntry={{ cuts }} />
+                  </div>
+                );
+              })}
+            </div>
+            {reviewError && (
+              <div className="ct-meta" style={{ color: "var(--ct-error)", padding: "0 20px 8px" }}>
+                ✗ {reviewError}
+              </div>
+            )}
+            <div className="ct-dialog__actions">
+              <Btn variant="ghost" onClick={cancel} disabled={reviewResolving}>cancel transfer</Btn>
+              <Btn variant="cta" onClick={continueReview} disabled={reviewResolving}>
+                {reviewResolving ? "SAVING…" : "CONTINUE · FINISH TRANSFER"}
+              </Btn>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div style={{ flex: 1, display: "grid", gridTemplateColumns: "300px 1fr",
         minHeight: 0, borderTop: "1px solid var(--rule)" }}>

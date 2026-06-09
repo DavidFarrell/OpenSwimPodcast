@@ -1209,4 +1209,152 @@ describe("runSync trim stage", () => {
     expect(res.ok).toBe(true);
     expect(detectAdsFn).toHaveBeenCalledOnce();
   });
+
+  // --- Review gate (approve-cuts step) ---
+
+  // A mid-roll flagged cut (away from the episode edges so adToCut does not snap
+  // it to intro/outro), at a stable [200,380] range -> decision key "200000-380000".
+  function flaggedTranscribe() {
+    return vi.fn(async () => ({ segments: [
+      { start: 0, end: 50, text: "open" },
+      { start: 200, end: 380, text: "long sketchy mid-roll" },
+      { start: 380, end: 1200, text: "rest of the show" },
+    ] }));
+  }
+  function flaggedDetect() {
+    return vi.fn(async () => ({
+      ads: [{ startSec: 200, endSec: 380, needsReview: true, reasons: ["over-threshold"] }],
+      stats: {},
+    }));
+  }
+
+  it("holds the pipeline on a flagged cut: emits a review event and awaits the gate", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+    const convertFn = vi.fn(async ({ dest }) => { fs.writeFileSync(dest, Buffer.from("x")); return { bytes: 1, durationSec: 60, fromCache: false }; });
+
+    let gateSawItems = null;
+    const awaitReview = vi.fn(async (items) => { gateSawItems = items; return {}; });
+
+    const events = [];
+    await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: flaggedTranscribe(), detectAdsFn: flaggedDetect(), convertFn,
+      awaitReview, onEvent: (e) => events.push(e),
+    });
+
+    // The gate ran, and was handed the flagged episode + its cut.
+    expect(awaitReview).toHaveBeenCalledOnce();
+    expect(gateSawItems).toHaveLength(1);
+    expect(gateSawItems[0].uuid).toBe("a");
+    expect(gateSawItems[0].cuts.some((c) => c.needsReview)).toBe(true);
+    // A review event reached the renderer, bracketed by stage:review active/done.
+    const review = events.find((e) => e.type === "review");
+    expect(review).toBeTruthy();
+    expect(review.items[0].cuts).toHaveLength(1);
+    const reviewStages = events.filter((e) => e.type === "stage" && e.stage === "review").map((e) => e.state);
+    expect(reviewStages).toEqual(["active", "done"]);
+  });
+
+  it("an approved (remove) decision from the gate un-flags the cut and it is applied", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+    const convertFn = vi.fn(async ({ dest, cuts }) => {
+      // The user approved the [200,380] cut at the gate, so it must reach convert.
+      expect(cuts).toEqual([[200, 380]]);
+      fs.writeFileSync(dest, Buffer.from("trimmed"));
+      return { bytes: 7, durationSec: 60, fromCache: false };
+    });
+    // Approve the flagged cut by its decision key.
+    const awaitReview = vi.fn(async () => ({ a: { "200000-380000": "remove" } }));
+
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: flaggedTranscribe(), detectAdsFn: flaggedDetect(), convertFn,
+      awaitReview, onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    expect(convertFn).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).toString()).toBe("trimmed");
+  });
+
+  it("an undecided flagged cut stays held back (cardinal rule): nothing is cut", async () => {
+    const payload = Buffer.from("episode audio that must survive untouched");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);
+    // No decisions returned -> the flagged cut is held back -> plain mp3 copied,
+    // converter never invoked.
+    const convertFn = vi.fn();
+    const awaitReview = vi.fn(async () => ({}));
+
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: flaggedTranscribe(), detectAdsFn: flaggedDetect(), convertFn,
+      awaitReview, onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    expect(convertFn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
+  });
+
+  it("a 'keep' decision drops the cut: nothing is cut even though it was reviewed", async () => {
+    const payload = Buffer.from("keep me whole");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);
+    const convertFn = vi.fn();
+    const awaitReview = vi.fn(async () => ({ a: { "200000-380000": "keep" } }));
+
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: flaggedTranscribe(), detectAdsFn: flaggedDetect(), convertFn,
+      awaitReview, onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    expect(convertFn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
+  });
+
+  it("no gate when every cut is confident: awaitReview is never called", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+    const transcribeFn = flaggedTranscribe();
+    const detectAdsFn = vi.fn(async () => ({
+      ads: [{ startSec: 200, endSec: 380, needsReview: false, reasons: [] }],
+      stats: {},
+    }));
+    const convertFn = vi.fn(async ({ dest, cuts }) => {
+      expect(cuts).toEqual([[200, 380]]);
+      fs.writeFileSync(dest, Buffer.from("auto-trimmed"));
+      return { bytes: 12, durationSec: 60, fromCache: false };
+    });
+    const awaitReview = vi.fn(async () => ({}));
+
+    const events = [];
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn, detectAdsFn, convertFn, awaitReview,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(res.ok).toBe(true);
+    expect(awaitReview).not.toHaveBeenCalled();
+    expect(events.some((e) => e.type === "review")).toBe(false);
+    expect(convertFn).toHaveBeenCalledOnce();
+  });
+
+  it("a cancel during review aborts before convert (cut nothing) via an aborting gate", async () => {
+    const payload = Buffer.from("must not be cut on cancel");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);
+    const convertFn = vi.fn();
+    const ac = new AbortController();
+    // Model the IPC cancel path: the gate resolves with no decisions AND the run
+    // is aborted, so the throwIfAborted right after the gate raises.
+    const awaitReview = vi.fn(async () => { ac.abort(); return {}; });
+
+    await expect(runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: flaggedTranscribe(), detectAdsFn: flaggedDetect(), convertFn,
+      awaitReview, signal: ac.signal, onEvent: () => {},
+    })).rejects.toThrow();
+
+    expect(convertFn).not.toHaveBeenCalled();
+  });
 });

@@ -234,6 +234,30 @@ function getTrimEdits(uuid) {
 
 let syncController = null;
 
+// The in-flight review gate. When runSync hands us flagged cuts, we park a
+// resolver here and broadcast the `review` event (runSync already emits it via
+// onEvent); the renderer shows its review surface and calls sync:review:resolve
+// when the user clicks Continue. We then build the decision map from the SAME
+// in-memory stores the per-cut IPC already maintains (mergeDecisionsWithEdits) -
+// authoritative and synchronous, so there is no race with the async sidecar
+// write - and resolve, releasing the pipeline. `uuids` records which episodes
+// are under review so we only read decisions for those.
+let pendingReview = null; // { resolve, uuids }
+
+// Resolve the parked review gate with the user's decisions, releasing runSync to
+// continue to encode + transfer. No-op (returns false) if nothing is awaiting
+// review. Building from mergeDecisionsWithEdits means an undecided flagged cut
+// simply has no entry, so it stays held back (cardinal rule).
+function resolveReview() {
+  if (!pendingReview) return false;
+  const { resolve, uuids } = pendingReview;
+  pendingReview = null;
+  const decisionsByUuid = {};
+  for (const uuid of uuids || []) decisionsByUuid[uuid] = mergeDecisionsWithEdits(uuid);
+  resolve(decisionsByUuid);
+  return true;
+}
+
 async function startSync(spec) {
   if (syncController) throw Object.assign(new Error("sync already in progress"), { code: "SYNC_IN_PROGRESS" });
   syncController = new AbortController();
@@ -261,6 +285,13 @@ async function startSync(spec) {
         : undefined,
       cacheDir,
       signal: syncController.signal,
+      // The interactive review gate: park a resolver and let the renderer release
+      // it via sync:review:resolve. The `review` event itself is broadcast through
+      // onEvent below, so the renderer knows to show its review surface.
+      awaitReview: (items) => new Promise((resolve) => {
+        const uuids = (items || []).map((it) => it && it.uuid).filter(Boolean);
+        pendingReview = { resolve, uuids };
+      }),
       onEvent: (e) => { recordTrimEvent(e); broadcast("sync:event", e); },
     });
     broadcast("sync:event", { type: "finished", ok: true });
@@ -274,6 +305,11 @@ async function startSync(spec) {
 }
 
 function cancelSync() {
+  // Release a parked review FIRST (with no decisions) so the awaited promise
+  // settles, then abort. runSync's throwIfAborted() right after the gate then
+  // raises AbortError and nothing reaches the converter - a cancel mid-review
+  // cuts nothing, exactly as expected.
+  if (pendingReview) { const { resolve } = pendingReview; pendingReview = null; resolve({}); }
   if (syncController) { syncController.abort(); return true; }
   return false;
 }
@@ -326,6 +362,7 @@ function buildHandlers() {
 
     "sync:start": (_, spec) => startSync(spec),
     "sync:cancel": () => cancelSync(),
+    "sync:review:resolve": () => resolveReview(),
 
     "announce:get": (_, uuid) => getAnnounce(uuid),
     "announce:set": (_, { uuid, enabled }) => setAnnounce(uuid, enabled),
@@ -379,4 +416,5 @@ module.exports = {
   getTrim, setTrim, listTrim, resolveTrimQueue, getTrimStatus, recordTrimEvent,
   setTrimDecision, getTrimDecisions, cutKey,
   setTrimEdit, getTrimEdits, mergeDecisionsWithEdits,
+  resolveReview, cancelSync,
 };

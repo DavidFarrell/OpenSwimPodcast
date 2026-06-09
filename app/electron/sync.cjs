@@ -376,6 +376,16 @@ async function generateCuts({
   }
 }
 
+// The review gate. When an episode has cuts still flagged needs-review after
+// detection, the pipeline HOLDS here and hands the flagged items to this
+// callback, which resolves to a per-uuid decision map ({ uuid: { cutKey: "keep"
+// | "remove" | {action,startSec,endSec} } }) once the user has decided. The
+// default resolves to {} immediately - no decisions, so every flagged cut stays
+// held back (never auto-applied; cardinal rule) and the run continues exactly as
+// it did before the gate existed. The IPC layer injects the real interactive
+// implementation; unit tests inject their own, so this default never blocks them.
+async function defaultAwaitReview() { return {}; }
+
 async function runSync({
   devicePath, cacheDir, queue,
   speed = 1.0, boost = false,
@@ -386,6 +396,7 @@ async function runSync({
   renderIntroFn = defaultRenderIntro,
   detectAdsFn = defaultDetectAds,
   readDecisionsFn = defaultReadDecisions,
+  awaitReview = defaultAwaitReview,
   llm, llmFetch, model, needsReviewMaxSec,
   onEvent,
   signal,
@@ -538,6 +549,61 @@ async function runSync({
   if (analyseItems.length) emit({ type: "stage", stage: "transcribe", state: "done" });
   if (trimItems.length) emit({ type: "stage", stage: "trim", state: "done" });
   if (announceItems.length) emit({ type: "stage", stage: "announce", state: "done" });
+
+  // Stage: review gate.
+  // If any trim episode still has cuts flagged needs-review (uncertain: over the
+  // safe length, or an ambiguous boundary the detector couldn't pin), HOLD the
+  // pipeline here and let the user approve / reject / adjust them before anything
+  // is encoded or written to the device. CONFIDENT cuts are untouched - they
+  // already auto-apply - so a run with no uncertain cuts skips this gate entirely
+  // and continues exactly as before. CARDINAL RULE: a flagged cut left undecided
+  // stays held back (never auto-applied); only an explicit "remove" cuts it.
+  const reviewItems = trimItems
+    .map(({ it, i }) => {
+      const cuts = (trimResults[i] && trimResults[i].cuts) || [];
+      if (!cuts.some((c) => c && c.needsReview)) return null;
+      return {
+        i, uuid: it.uuid, slot: it.slot, title: it.title, ext: it.ext || "mp3",
+        cuts,
+        segments: Array.isArray(trimResults[i].segments) ? trimResults[i].segments : [],
+      };
+    })
+    .filter(Boolean);
+
+  if (reviewItems.length) {
+    throwIfAborted();
+    const payload = reviewItems.map(({ i, ...rest }) => rest);
+    logEvent("review", `holding for review: ${reviewItems.length} episode(s) with flagged cuts`);
+    emit({ type: "stage", stage: "review", state: "active" });
+    emit({ type: "review", items: payload });
+    let decisionsByUuid = {};
+    try {
+      decisionsByUuid = (await awaitReview(payload)) || {};
+    } catch (e) {
+      if (e && e.name === "AbortError") throw e;
+      // A failed gate must not cut anything the user never approved: treat as no
+      // decisions, so flagged cuts stay held back.
+      decisionsByUuid = {};
+    }
+    throwIfAborted();
+    // Fold the user's decisions into each reviewed episode's cut list. A decided
+    // "remove" un-flags the cut so the converter applies it; "keep" drops it; an
+    // undecided flagged cut stays flagged and is therefore held back below.
+    for (const item of reviewItems) {
+      const d = (decisionsByUuid && decisionsByUuid[item.uuid]) || {};
+      const updated = applyDecisions(trimResults[item.i].cuts, d);
+      trimResults[item.i] = { ...trimResults[item.i], cuts: updated };
+      const auto = updated.filter((c) => !c.needsReview).length;
+      const held = updated.filter((c) => c && c.needsReview).length;
+      logEvent("review", `"${item.title}": resolved -> ${auto} to apply, ${held} held`);
+      emit({
+        type: "trim", uuid: item.uuid, slot: item.slot,
+        state: updated.some((c) => c && c.needsReview) ? "needs-review" : "ready",
+        cuts: updated, segments: item.segments,
+      });
+    }
+    emit({ type: "stage", stage: "review", state: "done" });
+  }
 
   // Stage: convert
   emit({ type: "stage", stage: "convert", state: "active" });
