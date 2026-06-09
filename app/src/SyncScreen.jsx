@@ -35,6 +35,52 @@ function logKey(evt) {
   return evt.uuid ? `${evt.stage}:${evt.uuid}` : `${evt.stage}:${evt.text}`;
 }
 
+// The optional analysis stages (only present when Trim / Announce are on). They
+// run between Remove-old and Encode. We surface each one the moment its first
+// event arrives so the user can see the slow GPU work (transcribe -> detect ->
+// speak) happening instead of staring at a frozen "Encode".
+const ANALYSIS_STAGE_DEFS = {
+  transcribe: { id: "transcribe", label: "Transcribe", detail: "speech to text" },
+  trim: { id: "trim", label: "Find cuts", detail: "detect ads + intros" },
+  announce: { id: "announce", label: "Write intros", detail: "summarise + speak" },
+};
+const ANALYSIS_ORDER = ["transcribe", "trim", "announce"];
+
+function insertAnalysisStages(base, stageState) {
+  const present = ANALYSIS_ORDER.filter((id) => stageState[id]);
+  if (!present.length) return base;
+  const extra = present.map((id) => ANALYSIS_STAGE_DEFS[id]);
+  const ci = base.findIndex((s) => s.id === "convert");
+  if (ci < 0) return [...base, ...extra];
+  return [...base.slice(0, ci), ...extra, ...base.slice(ci)];
+}
+
+// Turn the accumulated per-episode analysis events into human log lines.
+function analysisLine(evt, title) {
+  const t = title || "episode";
+  if (evt.type === "transcribe") {
+    if (evt.state === "active") return { state: "active", text: `Transcribing ${t}…` };
+    if (evt.state === "skipped") return { state: "error", text: `Transcribe failed: ${t}` };
+    return { state: "done", text: `Transcribed ${t}` };
+  }
+  if (evt.type === "trim") {
+    if (evt.state === "analysing") return { state: "active", text: `Looking for cuts in ${t}…` };
+    if (evt.state === "skipped" || evt.state === "idle") return { state: "done", text: `${t}: no cuts found` };
+    const cuts = Array.isArray(evt.cuts) ? evt.cuts : [];
+    const review = cuts.filter((c) => c && c.needsReview).length;
+    const auto = cuts.length - review;
+    const parts = [`${auto} cut${auto !== 1 ? "s" : ""}`];
+    if (review) parts.push(`${review} need${review !== 1 ? "" : "s"} review`);
+    return { state: "done", text: `${t}: ${parts.join(" · ")}` };
+  }
+  if (evt.type === "announce") {
+    if (evt.state === "analysing") return { state: "active", text: `Writing intro for ${t}…` };
+    if (evt.state === "skipped") return { state: "error", text: `Intro skipped: ${t}` };
+    return { state: "done", text: `Intro ready: ${t}` };
+  }
+  return null;
+}
+
 export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onArm, setMountState, devicePath, downloadByUuid = {}, playbackSpeed = 1.0, boost = false, model, needsReviewMaxSec }) {
   const fullQueue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
   const readyQueue = fullQueue.filter((it) => downloadByUuid[it.uuid]?.state === "ready");
@@ -74,7 +120,16 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   const [serverPlan, setServerPlan] = useState([]);
   const [stageState, setStageState] = useState({});
   const [logByKey, setLogByKey] = useState({});
+  const [steps, setSteps] = useState({});
   const [error, setError] = useState(null);
+
+  // Base stages + any analysis stages that have started. Title lookup for log lines.
+  const stages = useMemo(() => insertAnalysisStages(STAGES, stageState), [STAGES, stageState]);
+  const titleByUuid = useMemo(() => {
+    const m = {};
+    for (const it of fullQueue) if (it.uuid) m[it.uuid] = it.title;
+    return m;
+  }, [fullQueue]);
 
   useEffect(() => {
     if (phase === "running") setMountState && setMountState("busy");
@@ -91,6 +146,10 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       if (evt.type === "plan") setServerPlan(evt.plan);
       else if (evt.type === "stage") setStageState((m) => ({ ...m, [evt.stage]: evt.state }));
       else if (evt.type === "log") setLogByKey((m) => ({ ...m, [logKey(evt)]: evt }));
+      else if (evt.type === "transcribe" || evt.type === "trim" || evt.type === "announce") {
+        // Per-episode analysis progress: keep the latest event per (type, uuid).
+        setSteps((m) => ({ ...m, [`${evt.type}:${evt.uuid}`]: evt }));
+      }
       else if (evt.type === "finished") {
         if (evt.ok) setPhase("done");
         else { setError(evt.error?.message || "sync failed"); setPhase("error"); }
@@ -107,24 +166,38 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     onBack();
   };
 
-  const stageCounts = STAGES.map((st) => ({
+  const stageCounts = stages.map((st) => ({
     ...st,
     count: serverPlan.filter((p) => p.stage === st.id).length,
   }));
 
-  const planWithLog = serverPlan.map((p) => ({ ...p, log: logByKey[logKey(p)] }));
+  // Announce is now narrated as an analysis stage (per-episode lines below), not a
+  // plan line item - it never emits a "done" log, so leaving it in planWithLog
+  // would stall the progress bar. Drop it here.
+  const planWithLog = serverPlan
+    .filter((p) => p.stage !== "announce")
+    .map((p) => ({ ...p, log: logByKey[logKey(p)] }));
   const doneCount = planWithLog.filter((p) => p.log?.state === "done").length;
   const overall = planWithLog.length ? doneCount / planWithLog.length : 0;
 
   const currentStage = (() => {
-    for (const st of STAGES) {
+    for (const st of stages) {
       if (stageState[st.id] === "active") return st.id;
     }
-    return STAGES.find((st) => stageState[st.id] !== "done")?.id || "verify";
+    return stages.find((st) => stageState[st.id] !== "done")?.id || "verify";
   })();
-  const currentStageIdx = STAGES.findIndex((s) => s.id === currentStage);
+  const currentStageIdx = stages.findIndex((s) => s.id === currentStage);
 
-  const stageProgress = STAGES.map((st) => {
+  // Per-episode analysis lines for the right-hand log, ordered by slot then step.
+  const analysisLines = ANALYSIS_ORDER.flatMap((type) =>
+    Object.values(steps)
+      .filter((e) => e.type === type)
+      .sort((a, b) => (a.slot || 0) - (b.slot || 0))
+      .map((e) => ({ key: `${type}:${e.uuid}`, ...analysisLine(e, titleByUuid[e.uuid]) }))
+      .filter((l) => l && l.text)
+  );
+
+  const stageProgress = stages.map((st) => {
     const stageItems = planWithLog.filter((p) => p.stage === st.id);
     const done = stageItems.filter((p) => p.log?.state === "done").length;
     const active = stageItems.some((p) => p.log?.state === "active");
@@ -150,7 +223,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
           subtitle={error || "unknown error"}
           actions={<>
             <Btn variant="ghost" onClick={onBack}>back to today</Btn>
-            <Btn variant="cta" onClick={() => { setError(null); setLogByKey({}); setStageState({}); setServerPlan([]); setPhase("running"); }}>
+            <Btn variant="cta" onClick={() => { setError(null); setLogByKey({}); setStageState({}); setSteps({}); setServerPlan([]); setPhase("running"); }}>
               RETRY
             </Btn>
           </>}
@@ -206,7 +279,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
             alignItems: "flex-start", justifyContent: "center", gap: 16 }}>
             <div className="ct-label">awaiting start</div>
             <div className="ct-subhead" style={{ maxWidth: 440 }}>
-              Five stages. Lock the line-up, remove yesterday's files, convert any video, copy to the headphones, verify.
+              Lock the line-up, remove yesterday's files, transcribe and find cuts, write intros, encode, copy to the headphones, verify.
             </div>
             <div className="ct-meta" style={{ color: "var(--fg-dim)", maxWidth: 440, lineHeight: 1.8 }}>
               Nothing is written to your headphones until you press{" "}
@@ -221,7 +294,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
       <Toolbar
-        label={`Transfer · stage ${Math.max(1, currentStageIdx + 1)}/5 · ${STAGES[Math.max(0, currentStageIdx)].id}`}
+        label={`Transfer · stage ${Math.max(1, currentStageIdx + 1)}/${stages.length} · ${stages[Math.max(0, currentStageIdx)].id}`}
         title="Sending to your headphones."
         subtitle={`${doneCount}/${planWithLog.length} · ${(overall * 100).toFixed(0)}%`}
         actions={<Btn variant="ghost" onClick={cancel}>cancel</Btn>}
@@ -258,9 +331,25 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
 
         <div style={{ padding: "16px 20px", overflow: "auto", background: "var(--ct-coffee-deep)" }}>
           <div className="ct-log">
-            {planWithLog.length === 0 && (
+            {planWithLog.length === 0 && analysisLines.length === 0 && (
               <div className="ct-log__line--active">▸ preparing sync…</div>
             )}
+            {analysisLines.map((l) => {
+              const cls = l.state === "done" ? "ct-log__line--done"
+                : l.state === "active" ? "ct-log__line--active"
+                : l.state === "error" ? "ct-log__line--pending"
+                : "ct-log__line--pending";
+              const prefix = l.state === "done" ? "✓" : l.state === "active" ? "▸" : l.state === "error" ? "✗" : "·";
+              return (
+                <div key={l.key} className={cls} style={{ display: "grid",
+                  gridTemplateColumns: "18px 1fr auto", gap: 10,
+                  color: l.state === "error" ? "var(--ct-error)" : undefined }}>
+                  <span>{prefix}</span>
+                  <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{l.text}</span>
+                  <span></span>
+                </div>
+              );
+            })}
             {planWithLog.map((p, i) => {
               const state = p.log?.state || "pending";
               const cls = state === "done" ? "ct-log__line--done"

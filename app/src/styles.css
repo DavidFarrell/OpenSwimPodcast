@@ -189,7 +189,8 @@ body.openswim{background:var(--ct-coffee-ink);color:var(--fg);font-family:var(--
 .today-row__drag:active{cursor:grabbing}
 
 /* Today rows */
-.today-row{display:grid;grid-template-columns:40px 36px 1fr 110px 80px 70px 36px;gap:12px;padding:10px 16px;align-items:center;border-bottom:1px solid var(--rule);transition:background var(--dur-fast) var(--ease)}
+.today-row{display:grid;grid-template-columns:40px 36px minmax(0,1fr) 92px 72px auto;gap:12px;padding:10px 16px;align-items:center;border-bottom:1px solid var(--rule);transition:background var(--dur-fast) var(--ease)}
+.today-row__actions{display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:nowrap;white-space:nowrap}
 .today-row:hover{background:var(--ct-tea-ghost)}
 .today-row[data-fate=rename]{background:rgba(232,180,79,.04)}
 .today-row[data-fate=remove]{opacity:.45}

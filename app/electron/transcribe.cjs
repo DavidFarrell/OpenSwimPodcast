@@ -3,6 +3,7 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 const { spawn: defaultSpawn } = require("node:child_process");
+const { logEvent } = require("./logger.cjs");
 
 // fast-diarise lives outside this repo and is driven through `uv run`. We keep
 // the command here so the caller does not have to know the layout - tests inject
@@ -136,19 +137,32 @@ async function transcribe({
       finish(null);
     }, timeoutMs);
 
-    // Drain stdio so the child never blocks on a full pipe.
+    // Drain stdio so the child never blocks on a full pipe, keeping the tail of
+    // stderr so a real failure (a crash in fast-diarise, a bad PATH, etc.) can be
+    // logged instead of vanishing into a silent "no transcript".
+    let errTail = "";
     if (child.stdout) child.stdout.on("data", () => {});
-    if (child.stderr) child.stderr.on("data", () => {});
+    if (child.stderr) child.stderr.on("data", (d) => {
+      errTail = (errTail + d.toString()).slice(-1200);
+    });
 
-    child.on("error", () => finish(null));
+    child.on("error", (e) => {
+      logEvent("transcribe", `spawn error (is uv on PATH?): ${e && e.message ? e.message : e}`);
+      finish(null);
+    });
     child.on("exit", async (code) => {
-      if (code !== 0) return finish(null);
+      if (code !== 0) {
+        const last = errTail.trim().split("\n").slice(-3).join(" | ");
+        logEvent("transcribe", `fast-diarise exited ${code}: ${last || "(no stderr)"}`);
+        return finish(null);
+      }
       try {
         const raw = await fsp.readFile(outJson, "utf8");
         const parsed = normalise(JSON.parse(raw));
         finish(parsed);
-      } catch {
+      } catch (e) {
         // No JSON emitted, or it was unparseable.
+        logEvent("transcribe", `no/invalid JSON from fast-diarise: ${e && e.message ? e.message : e}`);
         finish(null);
       }
     });

@@ -353,6 +353,41 @@ describe("runSync announce stage", () => {
     expect(stagesDone).toContain("announce");
   });
 
+  it("trim+announce on one episode: transcribes ONCE and runs steps sequentially (transcribe -> detect -> intro)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+
+    const order = [];
+    const transcribeFn = vi.fn(async () => { order.push("transcribe"); return { segments: [{ start: 0, end: 5, text: "an ad here" }, { start: 5, end: 600, text: "real content" }] }; });
+    const detectAdsFn = vi.fn(async ({ transcript }) => {
+      order.push("detect");
+      expect(transcript).toBeTruthy(); // detector got the shared transcript
+      return { ads: [], stats: {} };
+    });
+    const buildAnnouncementTextFn = vi.fn(async ({ transcript }) => {
+      order.push("intro-text");
+      expect(transcript).toBeTruthy(); // intro builder got the SAME transcript
+      return "This is HARD FORK. Ep.";
+    });
+    const renderIntroFn = vi.fn(async ({ outPath }) => { order.push("tts"); fs.writeFileSync(outPath, Buffer.from("wav")); return outPath; });
+    const convertFn = vi.fn(async ({ dest }) => { fs.writeFileSync(dest, Buffer.from("out")); return { bytes: 3, durationSec: 60, fromCache: false }; });
+
+    const events = [];
+    const res = await runSync({
+      devicePath, cacheDir, queue: [announceItem({ trim: true })],
+      transcribeFn, detectAdsFn, buildAnnouncementTextFn, renderIntroFn, convertFn,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(res.ok).toBe(true);
+    // The whole point of the fix: ONE transcription shared by both steps.
+    expect(transcribeFn).toHaveBeenCalledOnce();
+    // Sequential, not overlapped: transcribe finished before detect, detect before intro.
+    expect(order).toEqual(["transcribe", "detect", "intro-text", "tts"]);
+    // A visible transcribe stage was emitted for the episode.
+    const tr = events.filter((e) => e.type === "transcribe" && e.uuid === "a").map((e) => e.state);
+    expect(tr).toEqual(["active", "done"]);
+  });
+
   it("a failing TTS skips the intro and degrades to the normal episode (plain mp3 copied, no introPath)", async () => {
     const payload = Buffer.from("episode audio");
     fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);

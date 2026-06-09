@@ -8,7 +8,8 @@ import os from "node:os";
 const require = createRequire(import.meta.url);
 const {
   renderIntro,
-  buildSpeakCommand,
+  buildSpeakArgs,
+  buildSpeakEnv,
   buildAssembleArgs,
   parseSpeechPath,
   TTS_VOICE,
@@ -37,19 +38,25 @@ function fakeSpawn(program) {
   return { spawn, calls };
 }
 
-describe("buildSpeakCommand()", () => {
-  it("runs qwen-speak with the documented cd/venv/python recipe and voice Ryan", () => {
-    const cmd = buildSpeakCommand("This is the show.");
-    expect(cmd).toContain("cd '/Users/david/git/ai-sandbox/projects/qwentts'");
-    expect(cmd).toContain("source .venv/bin/activate");
-    expect(cmd).toContain("python tts_engine_v2.py speak 'This is the show.'");
-    expect(cmd).toContain("--voice 'Ryan'");
+describe("buildSpeakArgs()", () => {
+  it("invokes the qwen-speak script with speak + voice Ryan, text as a plain argv item", () => {
+    const args = buildSpeakArgs("This is the show.");
+    expect(args).toEqual(["tts_engine_v2.py", "speak", "This is the show.", "--voice", "Ryan"]);
     expect(TTS_VOICE).toBe("Ryan");
   });
 
-  it("escapes single quotes in the spoken text so it survives the shell", () => {
-    const cmd = buildSpeakCommand("David's episode");
-    expect(cmd).toContain(`speak 'David'\\''s episode'`);
+  it("passes text with quotes/metacharacters verbatim (no shell, no escaping needed)", () => {
+    const args = buildSpeakArgs("David's \"weird\" $episode & co");
+    expect(args[2]).toBe("David's \"weird\" $episode & co");
+  });
+});
+
+describe("buildSpeakEnv()", () => {
+  it("activates the venv via VIRTUAL_ENV + venv bin on PATH", () => {
+    const env = buildSpeakEnv();
+    expect(env.VIRTUAL_ENV).toContain("/qwentts/.venv");
+    expect(env.PATH.startsWith(env.VIRTUAL_ENV + "/bin:")).toBe(true);
+    expect(env.PYTHONUNBUFFERED).toBe("1");
   });
 });
 
@@ -141,12 +148,10 @@ describe("renderIntro()", () => {
     expect(result).toBe(outPath);
     expect(calls).toHaveLength(2);
 
-    // First spawn is the TTS shell call, invoking qwen-speak with voice Ryan.
+    // First spawn invokes the venv python directly (no shell) with the speak args.
     const ttsCall = calls[0];
-    const ttsCmdline = ttsCall.args.join(" ");
-    expect(ttsCmdline).toContain("python tts_engine_v2.py speak");
-    expect(ttsCmdline).toContain("--voice 'Ryan'");
-    expect(ttsCmdline).toContain("This is the show. Episode one.");
+    expect(ttsCall.cmd).toContain("/.venv/bin/python");
+    expect(ttsCall.args).toEqual(["tts_engine_v2.py", "speak", "This is the show. Episode one.", "--voice", "Ryan"]);
 
     // Second spawn is ffmpeg, with the chime preceding the speech in the concat.
     const ffCall = calls[1];

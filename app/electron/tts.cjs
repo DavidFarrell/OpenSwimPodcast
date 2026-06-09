@@ -20,6 +20,7 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 const { spawn: defaultSpawn } = require("node:child_process");
+const { logEvent } = require("./logger.cjs");
 
 let defaultFfmpegPath = null;
 try {
@@ -37,20 +38,31 @@ const QWENTTS_DIR = "/Users/david/git/ai-sandbox/projects/qwentts";
 const TTS_VOICE = "Ryan";
 const CHIME_SECONDS = 0.5;
 
-// Build the shell command that runs qwen-speak. The CLI requires a cd into the
-// project, a venv activation, then `python tts_engine_v2.py speak "<text>"
-// --voice Ryan`. The text is single-quoted (with any embedded single quotes
-// escaped) so it survives the shell as one argument.
-function shellQuote(s) {
-  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+// qwen-speak runs from its own venv. We spawn the venv's python directly (NOT via
+// `bash -lc "cd .. && source activate && python .."`). The shell recipe was
+// fragile in a packaged GUI app - a login shell re-sourcing profiles, quoting, or
+// a restricted spawn could fail instantly. Spawning the absolute venv python with
+// an explicit env (VIRTUAL_ENV + venv bin on PATH) is the documented, robust way
+// to run a venv tool without activation.
+const VENV_DIR = path.join(QWENTTS_DIR, ".venv");
+const VENV_PYTHON = path.join(VENV_DIR, "bin", "python");
+const SPEAK_SCRIPT = "tts_engine_v2.py";
+
+// Argv for the qwen-speak invocation (text passed as a normal argv item - no
+// shell, so no quoting needed).
+function buildSpeakArgs(text, voice = TTS_VOICE) {
+  return [SPEAK_SCRIPT, "speak", String(text), "--voice", String(voice)];
 }
 
-function buildSpeakCommand(text, voice = TTS_VOICE) {
-  return [
-    `cd ${shellQuote(QWENTTS_DIR)}`,
-    "source .venv/bin/activate",
-    `python tts_engine_v2.py speak ${shellQuote(text)} --voice ${shellQuote(voice)}`,
-  ].join(" && ");
+// The environment for the venv python: activation-equivalent.
+function buildSpeakEnv() {
+  return {
+    ...process.env,
+    VIRTUAL_ENV: VENV_DIR,
+    PATH: `${path.join(VENV_DIR, "bin")}:${process.env.PATH || ""}`,
+    PYTHONUNBUFFERED: "1",
+    PYTHONIOENCODING: "utf-8",
+  };
 }
 
 // qwen-speak prints "Audio saved to: <path>" once it has written the WAV. Pull
@@ -94,18 +106,24 @@ function buildAssembleArgs({ speechPath, outPath, chimeSeconds = CHIME_SECONDS }
 
 // Spawn a child and resolve { code, stdout } once it exits, or null on any
 // failure (spawn throws, error event, timeout). Never rejects.
-function runChild(spawn, cmd, args, { timeoutMs, signal } = {}) {
+function runChild(spawn, cmd, args, { timeoutMs, signal, cwd, env } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(cmd, args);
-    } catch {
-      return resolve(null);
+      const opts = {};
+      if (cwd) opts.cwd = cwd;
+      if (env) opts.env = env;
+      child = spawn(cmd, args, opts);
+    } catch (e) {
+      // Synchronous spawn failure (e.g. command not found). Surface the reason
+      // instead of an opaque null so the caller can log it.
+      return resolve({ code: null, stdout: "", stderr: "", failed: `spawn-threw: ${e && e.message ? e.message : e}` });
     }
 
     let settled = false;
     let timer = null;
     let stdout = "";
+    let stderr = "";
 
     const finish = (value) => {
       if (settled) return;
@@ -117,7 +135,7 @@ function runChild(spawn, cmd, args, { timeoutMs, signal } = {}) {
 
     const onAbort = () => {
       try { child.kill && child.kill("SIGTERM"); } catch {}
-      finish(null);
+      finish({ code: null, stdout, stderr, failed: "aborted" });
     };
 
     if (signal) {
@@ -128,17 +146,24 @@ function runChild(spawn, cmd, args, { timeoutMs, signal } = {}) {
     if (timeoutMs) {
       timer = setTimeout(() => {
         try { child.kill && child.kill("SIGTERM"); } catch {}
-        finish(null);
+        finish({ code: null, stdout, stderr, failed: `timeout-${timeoutMs}ms` });
       }, timeoutMs);
     }
 
     if (child.stdout) child.stdout.on("data", (buf) => { stdout += String(buf); });
-    // Drain stderr so a full pipe never blocks the child.
-    if (child.stderr) child.stderr.on("data", () => {});
+    // Keep the tail of stderr so a real failure (missing venv, model load error)
+    // is diagnosable instead of vanishing.
+    if (child.stderr) child.stderr.on("data", (buf) => { stderr = (stderr + String(buf)).slice(-1500); });
 
-    child.on("error", () => finish(null));
-    child.on("exit", (code) => finish({ code, stdout }));
+    child.on("error", (e) => finish({ code: null, stdout, stderr, failed: `error-event: ${e && e.message ? e.message : e}` }));
+    child.on("exit", (code) => finish({ code, stdout, stderr }));
   });
+}
+
+// Short tail of a string for log lines.
+function tail(s, n = 300) {
+  const t = String(s || "").trim().replace(/\s+/g, " ");
+  return t.length > n ? "…" + t.slice(-n) : t;
 }
 
 // Render `text` to a chime+speech WAV at `outPath`. Returns outPath on success,
@@ -154,24 +179,42 @@ async function renderIntro({
   ffmpegTimeoutMs = 60 * 1000,
   signal,
 } = {}) {
-  if (!text || !String(text).trim()) return null;
-  if (!outPath) return null;
-  if (!ffmpegPath) return null;
+  if (!text || !String(text).trim()) { logEvent("tts", "renderIntro: empty text"); return null; }
+  if (!outPath) { logEvent("tts", "renderIntro: no outPath"); return null; }
+  if (!ffmpegPath) { logEvent("tts", "renderIntro: ffmpegPath unresolved (ffmpeg-static missing?)"); return null; }
 
   try {
     await fsp.mkdir(path.dirname(outPath), { recursive: true });
-  } catch {
+  } catch (e) {
+    logEvent("tts", `renderIntro: mkdir failed: ${e && e.message ? e.message : e}`);
     return null;
   }
 
-  // 1. Synthesise the speech with qwen-speak (run through a shell because the CLI
-  //    needs cd + venv activation). Parse the WAV path back out of its stdout.
-  const speakCmd = buildSpeakCommand(text, voice);
-  const ttsResult = await runChild(spawn, shell, ["-lc", speakCmd], { timeoutMs: ttsTimeoutMs, signal });
-  if (!ttsResult || ttsResult.code !== 0) return null;
+  // 1. Synthesise the speech with qwen-speak by running the venv python directly
+  //    (no shell). Parse the WAV path back out of its stdout.
+  const speakArgs = buildSpeakArgs(text, voice);
+  const t0 = Date.now();
+  // Preflight (real runs only - tests inject their own spawn): if the venv python
+  // is missing, say so explicitly (a common packaging / relocated-venv failure)
+  // rather than an opaque spawn error.
+  if (spawn === defaultSpawn) {
+    try { await fsp.access(VENV_PYTHON, fs.constants.X_OK); }
+    catch { logEvent("tts", `venv python not executable/missing: ${VENV_PYTHON}`); return null; }
+  }
+  const ttsResult = await runChild(spawn, VENV_PYTHON, speakArgs, {
+    timeoutMs: ttsTimeoutMs, signal, cwd: QWENTTS_DIR, env: buildSpeakEnv(),
+  });
+  const ttsMs = Date.now() - t0;
+  if (!ttsResult || ttsResult.code !== 0) {
+    logEvent("tts", `qwen-speak failed in ${ttsMs}ms: ${ttsResult ? (ttsResult.failed || `exit ${ttsResult.code}`) : "no result"} | stderr: ${tail(ttsResult && ttsResult.stderr)} | python: ${VENV_PYTHON} cwd: ${QWENTTS_DIR}`);
+    return null;
+  }
 
   const speechPath = parseSpeechPath(ttsResult.stdout);
-  if (!speechPath) return null;
+  if (!speechPath) {
+    logEvent("tts", `qwen-speak ok (${ttsMs}ms) but could not parse 'Audio saved to:' path | stdout tail: ${tail(ttsResult.stdout)}`);
+    return null;
+  }
 
   // Verify qwen-speak actually produced the file it printed before handing the
   // path to ffmpeg. A stale or bogus printed path (no file on disk) is a failure
@@ -180,32 +223,39 @@ async function renderIntro({
   try {
     await fsp.access(speechPath, fs.constants.F_OK);
   } catch {
+    logEvent("tts", `parsed speech path does not exist on disk: ${speechPath}`);
     return null;
   }
 
   // 2. Front-concat the chime onto the speech with ffmpeg.
   const args = buildAssembleArgs({ speechPath, outPath });
   const ffResult = await runChild(spawn, ffmpegPath, args, { timeoutMs: ffmpegTimeoutMs, signal });
-  if (!ffResult || ffResult.code !== 0) return null;
+  if (!ffResult || ffResult.code !== 0) {
+    logEvent("tts", `ffmpeg chime-assembly failed: ${ffResult ? (ffResult.failed || `exit ${ffResult.code}`) : "no result"} | stderr: ${tail(ffResult && ffResult.stderr)} | ffmpeg: ${ffmpegPath}`);
+    return null;
+  }
 
   // 3. Confirm the file is actually there and non-empty before claiming success.
   try {
     const st = await fsp.stat(outPath);
-    if (!st.size) return null;
+    if (!st.size) { logEvent("tts", "assembled intro file is empty"); return null; }
   } catch {
+    logEvent("tts", "assembled intro file missing after ffmpeg");
     return null;
   }
 
+  logEvent("tts", `intro built ok in ${Date.now() - t0}ms -> ${outPath}`);
   return outPath;
 }
 
 module.exports = {
   renderIntro,
-  buildSpeakCommand,
+  buildSpeakArgs,
+  buildSpeakEnv,
   buildAssembleArgs,
   parseSpeechPath,
-  shellQuote,
   TTS_VOICE,
   QWENTTS_DIR,
+  VENV_PYTHON,
   CHIME_SECONDS,
 };

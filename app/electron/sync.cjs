@@ -8,6 +8,7 @@ const { buildAnnouncementText: defaultBuildAnnouncementText } = require("./annou
 const { renderIntro: defaultRenderIntro } = require("./tts.cjs");
 const { detectAds: defaultDetectAds, toSegments } = require("./detectAds.cjs");
 const { readDecisions: defaultReadDecisions, applyDecisions } = require("./decisionCache.cjs");
+const { logEvent } = require("./logger.cjs");
 
 // A detected ad block is treated as a positional intro/outro (and snapped to the
 // episode edge) when its first/last segment sits within this many seconds of the
@@ -205,21 +206,39 @@ async function generateIntro({
   it, src, outPath,
   transcribeFn, buildAnnouncementTextFn, renderIntroFn,
   llm, signal,
+  transcript: providedTranscript, hasTranscript = false,
 }) {
   try {
-    let transcript = null;
-    try {
-      transcript = await transcribeFn({ src, signal });
-    } catch {
-      transcript = null; // no transcript -> metadata-only intro, keep going
+    // The orchestrator transcribes once per episode and passes the result in
+    // (hasTranscript=true even when the value is null, so we never re-transcribe).
+    // Older callers/tests omit it, so we still transcribe here as a fallback.
+    let transcript = providedTranscript || null;
+    if (!hasTranscript) {
+      try {
+        transcript = await transcribeFn({ src, signal });
+      } catch (e) {
+        transcript = null; // no transcript -> metadata-only intro, keep going
+        logEvent("announce", `transcribe failed for "${it.title}": ${e && e.message ? e.message : e}`);
+      }
     }
     const text = await buildAnnouncementTextFn({
       show: it.show, title: it.title, transcript, llm,
     });
-    if (!text || !String(text).trim()) return null;
-    const intro = await renderIntroFn({ text, outPath, signal });
+    if (!text || !String(text).trim()) {
+      logEvent("announce", `no announcement text for "${it.title}" - intro skipped`);
+      return null;
+    }
+    let intro = await renderIntroFn({ text, outPath, signal });
+    // One retry: TTS (qwen-speak/MLX) can fail transiently under load. Only retry
+    // a clean null (not an abort), so the happy path still calls render once.
+    if (!intro && !(signal && signal.aborted)) {
+      logEvent("announce", `TTS render returned null for "${it.title}" - retrying once`);
+      intro = await renderIntroFn({ text, outPath, signal });
+    }
+    if (!intro) logEvent("announce", `TTS/render failed for "${it.title}" - intro skipped (check qwen-speak / ffmpeg)`);
     return intro || null;
-  } catch {
+  } catch (e) {
+    logEvent("announce", `intro generation threw for "${it.title}": ${e && e.message ? e.message : e}`);
     return null;
   }
 }
@@ -293,18 +312,25 @@ function adToCut({ ad, segments }) {
 async function generateCuts({
   src, transcribeFn, detectAdsFn, llmFetch, model, needsReviewMaxSec, signal,
   readDecisionsFn = defaultReadDecisions,
+  transcript: providedTranscript, hasTranscript = false,
 }) {
   try {
-    let transcript = null;
-    try {
-      transcript = await transcribeFn({ src, signal });
-    } catch {
-      transcript = null;
+    // The orchestrator transcribes once per episode and passes it in
+    // (hasTranscript=true even when null, so we never re-transcribe). Older
+    // callers/tests omit it, so we fall back to transcribing here.
+    let transcript = providedTranscript || null;
+    if (!hasTranscript) {
+      try {
+        transcript = await transcribeFn({ src, signal });
+      } catch (e) {
+        transcript = null;
+        logEvent("trim", `transcribe failed: ${e && e.message ? e.message : e}`);
+      }
     }
-    if (!transcript) return { status: "skipped", cuts: [] };
+    if (!transcript) { logEvent("trim", "no transcript - trim skipped (is fast-diarise/uv on PATH? is LM Studio running?)"); return { status: "skipped", cuts: [] }; }
 
     const segments = toSegments(transcript);
-    if (segments.length === 0) return { status: "skipped", cuts: [] };
+    if (segments.length === 0) { logEvent("trim", "transcript had no usable segments - trim skipped"); return { status: "skipped", cuts: [] }; }
 
     let result = null;
     try {
@@ -321,10 +347,11 @@ async function generateCuts({
         detectArgs.needsReviewMaxSec = needsReviewMaxSec;
       }
       result = await detectAdsFn(detectArgs);
-    } catch {
+    } catch (e) {
       result = null;
+      logEvent("trim", `detector failed: ${e && e.message ? e.message : e}`);
     }
-    if (!result || !Array.isArray(result.ads)) return { status: "skipped", cuts: [] };
+    if (!result || !Array.isArray(result.ads)) { logEvent("trim", "detector returned no result - trim skipped (is LM Studio running with the model loaded?)"); return { status: "skipped", cuts: [] }; }
 
     const detected = result.ads.map((ad) => adToCut({ ad, segments }))
       .filter((c) => Number.isFinite(c.startSec) && Number.isFinite(c.endSec) && c.endSec > c.startSec);
@@ -368,6 +395,19 @@ async function runSync({
   if (!Array.isArray(queue)) throw new Error("queue is required");
   const needsEncode = (speed && speed !== 1.0) || !!boost;
 
+  // The trim detector and the announce summary both reach the local LLM through a
+  // fetch. The IPC caller does not inject one, so default to the main process's
+  // global fetch. WITHOUT this, detectAds saw fetch=undefined and silently
+  // returned zero ads (no log), and the announce summary was skipped - the exact
+  // "no trim, metadata-only intro" failure. Unit tests inject their own mocks, so
+  // this default never touches them.
+  if (typeof llmFetch !== "function" && typeof globalThis.fetch === "function") {
+    llmFetch = globalThis.fetch.bind(globalThis);
+  }
+  if ((!llm || typeof llm.fetch !== "function") && typeof llmFetch === "function") {
+    llm = { ...(llm || {}), fetch: llmFetch };
+  }
+
   const emit = (e) => { try { onEvent && onEvent(e); } catch {} };
   const throwIfAborted = () => {
     if (signal && signal.aborted) throw new AbortError();
@@ -384,86 +424,19 @@ async function runSync({
   emit({ type: "stage", stage: "finalise", state: "active" });
   emit({ type: "stage", stage: "finalise", state: "done" });
 
-  // Stage: announce
-  // For every episode with the Announce toggle on, kick off intro generation in
-  // the BACKGROUND so transcription/summarisation/TTS overlap with the delete
-  // and copy work happening below. Each episode's intro promise is awaited just
-  // before that episode is converted, so the intro is always ready in time for
-  // the front-concat. A failed intro degrades to a normal converted episode.
   const announceItems = queue
     .map((it, i) => ({ it, i }))
     .filter(({ it }) => it.announce);
-  const introPaths = new Array(queue.length).fill(null);
-  const introJobs = new Array(queue.length).fill(null);
-
-  if (announceItems.length) {
-    emit({ type: "stage", stage: "announce", state: "active" });
-    for (const { it, i } of announceItems) {
-      const src = path.join(cacheDir, `${it.uuid}.${it.ext || "mp3"}`);
-      const outPath = path.join(cacheDir, `${it.uuid}.intro.wav`);
-      emit({ type: "announce", uuid: it.uuid, slot: it.slot, state: "analysing" });
-      // Thread the user-picked model id (P4a) into the announce summary. We
-      // only add it when present so an unset model leaves announce.cjs on its
-      // own LMSTUDIO_MODEL default. Spread the existing llm (fetch etc.) first.
-      const introLlm = model ? { ...(llm || {}), model } : llm;
-      introJobs[i] = generateIntro({
-        it, src, outPath,
-        transcribeFn, buildAnnouncementTextFn, renderIntroFn,
-        llm: introLlm, signal,
-      }).then((intro) => {
-        introPaths[i] = intro;
-        emit({
-          type: "announce", uuid: it.uuid, slot: it.slot,
-          state: intro ? "ready" : "skipped",
-        });
-        return intro;
-      });
-    }
-  }
-
-  // Stage: trim
-  // For every episode with the Trim toggle on, kick off ad detection in the
-  // BACKGROUND (alongside announce) so transcription + the LLM windows overlap
-  // with the delete/copy work below. Each job's result is awaited just before the
-  // episode is converted, so the auto-applyable cut list is ready for the
-  // converter's atrim stage. Degrades safely: any failure leaves the episode
-  // uncut. We reuse the same transcript path as announce (transcribeFn caches by
-  // fingerprint, so a Trim+Announce episode transcribes once).
   const trimItems = queue
     .map((it, i) => ({ it, i }))
     .filter(({ it }) => it.trim);
-  // Per-episode resolved trim result: { status, cuts }. Defaults to idle so the
-  // convert loop can read trimResults[i] unconditionally.
+  // Per-episode resolved outputs the convert loop reads unconditionally.
+  const introPaths = new Array(queue.length).fill(null);
   const trimResults = new Array(queue.length).fill(null).map(() => ({ status: "idle", cuts: [] }));
-  const trimJobs = new Array(queue.length).fill(null);
-
-  if (trimItems.length) {
-    emit({ type: "stage", stage: "trim", state: "active" });
-    for (const { it, i } of trimItems) {
-      const src = path.join(cacheDir, `${it.uuid}.${it.ext || "mp3"}`);
-      emit({ type: "trim", uuid: it.uuid, slot: it.slot, state: "analysing" });
-      trimJobs[i] = generateCuts({
-        src, transcribeFn, detectAdsFn, readDecisionsFn, llmFetch, model, needsReviewMaxSec, signal,
-      }).then((res) => {
-        trimResults[i] = res;
-        emit({
-          type: "trim", uuid: it.uuid, slot: it.slot,
-          state: res.status, cuts: res.cuts,
-          segments: Array.isArray(res.segments) ? res.segments : [],
-        });
-        return res;
-      }).catch(() => {
-        // generateCuts already degrades to skipped, but guard so a rejected
-        // promise never escapes into Promise.allSettled noise / the pipeline.
-        const res = { status: "skipped", cuts: [] };
-        trimResults[i] = res;
-        emit({ type: "trim", uuid: it.uuid, slot: it.slot, state: "skipped", cuts: [] });
-        return res;
-      });
-    }
-  }
 
   // Stage: delete
+  // Run the device IO first, before the GPU-heavy analysis, so a removal error
+  // surfaces fast and nothing wastes a transcription.
   emit({ type: "stage", stage: "delete", state: "active" });
   const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
   for (const r of removals) {
@@ -481,21 +454,90 @@ async function runSync({
   }
   emit({ type: "stage", stage: "delete", state: "done" });
 
-  // Let the background intro jobs settle before we convert. They have been
-  // running during the delete stage; awaiting here guarantees each introPath is
-  // resolved (or null) before its episode is front-concatenated.
-  if (announceItems.length) {
-    await Promise.allSettled(introJobs.filter(Boolean));
-    emit({ type: "stage", stage: "announce", state: "done" });
+  // Stage: analyse (transcribe -> detect cuts -> build intro)
+  // SEQUENTIAL, one episode at a time, one GPU-heavy step at a time. Running
+  // transcription (Parakeet/MLX), ad-detection (gemma/Metal) and TTS (qwen/MLX)
+  // concurrently starved each other: detection silently returned empty and TTS
+  // failed under GPU contention, so nothing got trimmed. Doing one thing at a
+  // time is slower but reliable, and it makes each step a visible stage.
+  // We transcribe ONCE per episode and feed the same transcript to both the
+  // detector and the intro builder, so a Trim+Announce episode transcribes once.
+  const analyseItems = queue
+    .map((it, i) => ({ it, i }))
+    .filter(({ it }) => it.announce || it.trim);
+
+  if (analyseItems.length) emit({ type: "stage", stage: "transcribe", state: "active" });
+  if (trimItems.length) emit({ type: "stage", stage: "trim", state: "active" });
+  if (announceItems.length) emit({ type: "stage", stage: "announce", state: "active" });
+
+  for (const { it, i } of analyseItems) {
+    throwIfAborted();
+    const src = path.join(cacheDir, `${it.uuid}.${it.ext || "mp3"}`);
+    logEvent("analyse", `"${it.title}": trim=${!!it.trim} announce=${!!it.announce} llmFetch=${typeof llmFetch === "function"}`);
+
+    // 1. Transcribe once (shared by detect + intro).
+    emit({ type: "transcribe", uuid: it.uuid, slot: it.slot, state: "active" });
+    let transcript = null;
+    const tT0 = Date.now();
+    try {
+      transcript = await transcribeFn({ src, signal });
+    } catch (e) {
+      transcript = null;
+      logEvent("transcribe", `failed for "${it.title}": ${e && e.message ? e.message : e}`);
+    }
+    const segCount = transcript && Array.isArray(transcript.segments) ? transcript.segments.length : 0;
+    logEvent("transcribe", `"${it.title}": ok=${!!transcript} segments=${segCount} in ${Date.now() - tT0}ms`);
+    emit({ type: "transcribe", uuid: it.uuid, slot: it.slot, state: transcript ? "done" : "skipped" });
+
+    // 2. Detect cuts (trim).
+    if (it.trim) {
+      emit({ type: "trim", uuid: it.uuid, slot: it.slot, state: "analysing" });
+      let res;
+      try {
+        res = await generateCuts({
+          src, transcribeFn, detectAdsFn, readDecisionsFn, llmFetch, model, needsReviewMaxSec, signal,
+          transcript, hasTranscript: true,
+        });
+      } catch (e) {
+        res = { status: "skipped", cuts: [] };
+        logEvent("trim", `generateCuts threw for "${it.title}": ${e && e.message ? e.message : e}`);
+      }
+      trimResults[i] = res;
+      const auto = res.cuts.filter((c) => !c.needsReview).length;
+      logEvent("trim", `"${it.title}": status=${res.status} cuts=${res.cuts.length} (auto-apply=${auto})`);
+      emit({
+        type: "trim", uuid: it.uuid, slot: it.slot,
+        state: res.status, cuts: res.cuts,
+        segments: Array.isArray(res.segments) ? res.segments : [],
+      });
+    }
+
+    // 3. Build the spoken intro (announce).
+    if (it.announce) {
+      const outPath = path.join(cacheDir, `${it.uuid}.intro.wav`);
+      emit({ type: "announce", uuid: it.uuid, slot: it.slot, state: "analysing" });
+      // Thread the user-picked model id (P4a) into the announce summary; omit it
+      // when unset so announce.cjs keeps its own default.
+      const introLlm = model ? { ...(llm || {}), model } : llm;
+      let intro = null;
+      try {
+        intro = await generateIntro({
+          it, src, outPath,
+          transcribeFn, buildAnnouncementTextFn, renderIntroFn,
+          llm: introLlm, signal,
+          transcript, hasTranscript: true,
+        });
+      } catch {
+        intro = null;
+      }
+      introPaths[i] = intro;
+      emit({ type: "announce", uuid: it.uuid, slot: it.slot, state: intro ? "ready" : "skipped" });
+    }
   }
 
-  // Let the background trim/detect jobs settle before we convert, the same way as
-  // the intro jobs - each trimResults[i] is resolved (or degraded to skipped)
-  // before its episode is passed to the converter.
-  if (trimItems.length) {
-    await Promise.allSettled(trimJobs.filter(Boolean));
-    emit({ type: "stage", stage: "trim", state: "done" });
-  }
+  if (analyseItems.length) emit({ type: "stage", stage: "transcribe", state: "done" });
+  if (trimItems.length) emit({ type: "stage", stage: "trim", state: "done" });
+  if (announceItems.length) emit({ type: "stage", stage: "announce", state: "done" });
 
   // Stage: convert
   emit({ type: "stage", stage: "convert", state: "active" });
@@ -520,6 +562,10 @@ async function runSync({
     const autoCuts = (trimResults[i].cuts || [])
       .filter((c) => !c.needsReview)
       .map((c) => [c.startSec, c.endSec]);
+    if (it.trim) {
+      const cutSec = autoCuts.reduce((s, [a, b]) => s + Math.max(0, (b || 0) - (a || 0)), 0);
+      logEvent("convert", `"${it.title}": applying ${autoCuts.length} cut(s) totalling ${cutSec.toFixed(0)}s; introPath=${!!introPath}`);
+    }
     // Whether the episode would still need a re-encode even with the intro AND
     // the cuts dropped (video source, or speed/boost on). Drives the
     // convert-failure fallback below: if false, dropping both means a plain copy.

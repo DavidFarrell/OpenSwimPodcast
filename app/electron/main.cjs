@@ -1,7 +1,23 @@
 const { app, BrowserWindow, shell } = require("electron");
 const path = require("node:path");
 
+// Repair PATH before anything spawns a subprocess. A Finder/Spotlight-launched
+// .app inherits a stripped PATH and would otherwise fail to find `uv`
+// (fast-diarise), the qwen-speak venv tools, etc., silently degrading every smart
+// step to "skipped". No-op when launched from a terminal.
+const { fixEnv } = require("./fixEnv.cjs");
+fixEnv();
+
 app.setPath("userData", path.join(app.getPath("appData"), "openswim-podcast"));
+
+// Point the diagnostics logger at a file in userData so silent skips (no
+// transcript, TTS failure, detector unreachable) leave a trail. Path is shown to
+// the user in the app's About/help if they need to find it.
+process.env.OSW_LOG = path.join(app.getPath("userData"), "openswim.log");
+
+const { logEvent } = require("./logger.cjs");
+logEvent("startup", `Open Swimcast ${app.getVersion()} - packaged=${app.isPackaged}`);
+logEvent("startup", `PATH=${process.env.PATH}`);
 
 const { registerPocketCasts } = require("./ipc.cjs");
 

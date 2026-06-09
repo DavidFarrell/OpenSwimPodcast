@@ -23,6 +23,8 @@
 // LM Studio endpoint. Any tool outage, parse failure or unexpected shape degrades
 // to an empty result (no cuts) - this never throws into the pipeline.
 
+const { logEvent } = require("./logger.cjs");
+
 const LMSTUDIO_URL = "http://localhost:1234/v1/chat/completions";
 const LMSTUDIO_MODEL = "google/gemma-4-12b-qat";
 const LMSTUDIO_TIMEOUT_MS = 10 * 60 * 1000;
@@ -37,26 +39,42 @@ const NEEDS_REVIEW_MAX_SEC = 150; // ~2.5 minutes
 
 // The prompt is identical in spirit to the reference VERIFY_INSTRUCTION. Kept
 // verbatim so the detector behaves exactly as the locked evaluation proved.
-const VERIFY_INSTRUCTION = `You are given a WINDOW of consecutive podcast transcript segments, each line prefixed with its index. Some windows contain one or more READ ADVERTISEMENTS, sponsor messages, or cross-promos for another show; many do not, and some contain several.
+// v_inject: teaches the model that INJECTED third-party spots (pre/mid/post-roll
+// commercials with no "brought to you by" framing, often a different speaker) are
+// ads, not content. This fixes the documented gap where dynamically-inserted
+// pre-roll ads (e.g. Bloomberg, EE on "The Rest Is Classified") were read as a
+// cold open. Tuned + measured on real RiC episodes: catches the injected pre-roll
+// with ZERO false positives and holds the content boundary at the episode start
+// (does not bleed into an archival clip / the host welcome). See
+// docs/smart-processing/PROMPT_EXPERIMENT.md.
+const VERIFY_INSTRUCTION = `You are given a WINDOW of consecutive podcast transcript segments, each line prefixed with its index. Some windows contain one or more ADVERTISEMENTS; many do not, and some contain several. Your job is to find every advertisement and quote its exact boundaries.
 
-Find EVERY genuine ad / sponsor / promo read in this window. For EACH one, return its boundaries as VERBATIM quotes copied exactly from the segment text:
-- first_line = the exact sentence where the hosts pivot from conversation INTO the ad (often "our show today is brought to you by X", or the opening line of the pitch).
-- last_line = the exact LAST promotional sentence of that same ad - the URL, the discount code, or the sign-off ("thanks to X for supporting the show"). The ad ENDS there. The instant the hosts resume the actual topic or banter ("we're back", "so anyway", returning to the subject), that is CONTENT and must NOT be included.
+An ADVERTISEMENT is any segment whose purpose is to sell or promote a product, service, brand, app, or another show - rather than to discuss the episode's actual topic. Ads come in THREE forms, and you must catch ALL of them:
+
+1. HOST-READ SPONSOR READS. The hosts pivot from the conversation into a pitch, usually framed ("our show today is brought to you by X", "this episode is sponsored by X"). They end with a URL, a discount code, or a sign-off ("thanks to X for supporting the show").
+
+2. INJECTED THIRD-PARTY SPOTS (pre-roll, mid-roll or post-roll). These are pre-recorded commercials dropped into the feed. They are NOT framed as "brought to you by" - they just START as a polished sales pitch, often in a DIFFERENT voice/speaker from the hosts, and often back-to-back with other spots near the very start of the episode. Tell-tale signs: a brand talking about itself in marketing language ("Some follow the noise. Bloomberg follows the money..."), a slogan, a call to action ("Subscribe now at Bloomberg.com", "Search EE Yes Boys", "Available wherever you listen"), a charity/cause campaign tied to a brand. If a stretch of text reads like a TV/radio commercial and is not the hosts discussing the topic, it is an ad - even with no host introduction.
+
+3. CROSS-PROMOS for another podcast or show, even with no URL or discount code.
+
+For EACH ad, return its boundaries as VERBATIM quotes copied exactly from the segment text:
+- first_line = the exact sentence that STARTS the ad (the first line of the pitch, or the host's pivot into it).
+- last_line = the exact LAST promotional sentence of that same ad - the URL, discount code, slogan, or sign-off. The ad ENDS there. The instant the hosts resume the actual topic or banter ("we're back", "so anyway", returning to the subject, or - at the start of an episode - the first line of real content such as an archival clip or the host welcoming listeners), that is CONTENT and must NOT be included.
 
 RULES:
-- Catch ALL of them - a 30-minute window may contain two or three separate ad reads; return one entry per ad.
-- A cross-promo for another podcast or show counts as an ad/promo even with no URL or discount code - include it.
-- A passing mention of a brand, product, or website during normal conversation is NOT an ad - do not include it.
-- Quote EXACTLY from the provided text (so the lines can be found by string match). Copy a full distinctive sentence, not a fragment.
-- If there is NO actual ad read in this window, return {"ads":[]}. When in doubt, return [] - never invent an ad in normal conversation.
+- A 30-minute window may contain several separate ads, especially a run of back-to-back spots at the very beginning of the episode. Return one entry per distinct ad (different brand = different ad).
+- A passing mention of a brand, product, or website during normal conversation is NOT an ad - do not include it. The test is purpose: is this text TRYING TO SELL something, or DISCUSSING the topic?
+- Quote EXACTLY from the provided text so the lines can be matched. Copy a full distinctive sentence, not a fragment.
+- If there is NO ad in this window, return {"ads":[]}. Never invent an ad in genuine conversation - trimming real content is far worse than missing an ad.
 
-EXAMPLE window:
-40. and honestly that ending wrecked me, best film of the year.
-41. Our show today is brought to you by Acme VPN. Going online without protection is like leaving your door unlocked.
-42. Acme encrypts everything. Visit Acme.com slash show for three months free.
-43. We're back. So anyway, where were we on the Scorsese thing?
-CORRECT OUTPUT: {"ads":[{"first_line":"Our show today is brought to you by Acme VPN.","last_line":"Visit Acme.com slash show for three months free."}]}
-(Segment 43 is content - the hosts resumed the topic - so it is excluded.)`;
+EXAMPLE window (note three back-to-back pre-roll spots, none framed as "brought to you by"):
+1. SPEAKER_01: For exclusive interviews and ad-free listening, join the club at exampleshow.com.
+2. SPEAKER_04: Some follow the noise. Acme follows the money. Behind every headline is a bottom line. Subscribe now at Acme.com.
+3. SPEAKER_05: The internet is shaping our kids. We have to be louder. Search Brand Yes Kids.
+4. SPEAKER_03: From the archive: the President is dead. This is where our story begins.
+5. SPEAKER_01: Welcome to the show. Today we are looking at a dark story.
+CORRECT OUTPUT: {"ads":[{"first_line":"For exclusive interviews and ad-free listening, join the club at exampleshow.com.","last_line":"For exclusive interviews and ad-free listening, join the club at exampleshow.com."},{"first_line":"Some follow the noise. Acme follows the money. Behind every headline is a bottom line. Subscribe now at Acme.com.","last_line":"Some follow the noise. Acme follows the money. Behind every headline is a bottom line. Subscribe now at Acme.com."},{"first_line":"The internet is shaping our kids. We have to be louder. Search Brand Yes Kids.","last_line":"The internet is shaping our kids. We have to be louder. Search Brand Yes Kids."}]}
+(Segment 4 is an archival clip = real content; segment 5 is the host welcoming listeners = real content. Both excluded.)`;
 
 // Strict json_schema forcing {ads:[{first_line,last_line}]} - identical to the
 // reference SCHEMA so the model can only answer in the shape we map from.
@@ -305,7 +323,11 @@ function classifyRange({ startIndex, endIndex, segments, endQuoteMapped, needsRe
 // per-ad failures are isolated so one bad window never loses the rest.
 async function detectAds({
   transcript,
-  fetch,
+  // Default to the process global fetch. Previously this was undefined when the
+  // caller forgot to inject it, which made detectAds silently return zero ads.
+  fetch = (typeof globalThis !== "undefined" && typeof globalThis.fetch === "function")
+    ? globalThis.fetch.bind(globalThis)
+    : undefined,
   url = LMSTUDIO_URL,
   model = LMSTUDIO_MODEL,
   timeoutMs = LMSTUDIO_TIMEOUT_MS,
@@ -318,8 +340,14 @@ async function detectAds({
   const empty = { ads: [], stats: { windowsRun: 0, adsReturned: 0, quoteMapFailures: 0 } };
 
   const segments = toSegments(transcript);
-  if (segments.length === 0) return empty;
-  if (typeof fetch !== "function") return empty;
+  if (segments.length === 0) {
+    logEvent("detect", "no usable segments in transcript - 0 cuts (was this transcript empty?)");
+    return empty;
+  }
+  if (typeof fetch !== "function") {
+    logEvent("detect", "no fetch available - 0 cuts (LLM unreachable / fetch not injected)");
+    return empty;
+  }
 
   // Precompute normalised segment text, aligned by absolute index.
   const normSegs = segments.map((s) => norm(s.text));
@@ -348,7 +376,13 @@ async function detectAds({
       // window must never abort the rest of the episode.
       parsed = null;
     }
-    if (!parsed || !Array.isArray(parsed.ads)) continue;
+    if (!parsed || !Array.isArray(parsed.ads)) {
+      // A window the model could not answer (timeout, error, bad shape). This is
+      // the silent-failure path that made detection look like "no ads" under GPU
+      // contention - log it so an empty result is never invisible again.
+      logEvent("detect", `window ${windowsRun}/${windows.length}: model returned nothing (timeout/error/bad shape)`);
+      continue;
+    }
 
     for (const ad of parsed.ads) {
       adsReturned += 1;
@@ -406,6 +440,7 @@ async function detectAds({
       };
     });
 
+  logEvent("detect", `done: ${windowsRun}/${windows.length} windows, ${adsReturned} raw ads, ${quoteMapFailures} quote-map fails -> ${ads.length} final cut(s)`);
   return { ads, stats: { windowsRun, adsReturned, quoteMapFailures } };
 }
 

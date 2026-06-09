@@ -399,8 +399,11 @@ describe("detectAds()", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("returns no cuts when no fetch is injected", async () => {
-    const { ads } = await detectAds({ transcript: AD_TRANSCRIPT });
+  it("returns no cuts when fetch is explicitly unavailable (guard still holds)", async () => {
+    // detectAds defaults fetch to globalThis.fetch, so omitting it would try the
+    // real LLM. Passing fetch:null exercises the no-fetch guard - it must fail
+    // safe to zero cuts rather than throw.
+    const { ads } = await detectAds({ transcript: AD_TRANSCRIPT, fetch: null });
     expect(ads).toEqual([]);
   });
 

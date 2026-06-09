@@ -447,7 +447,7 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
                 <DownloadBadge state={downloadByUuid[it.uuid]}
                   onRetry={onRetryDownload ? () => onRetryDownload(it) : null} />
               </div>
-              <div style={{ display: "flex", gap: 2, justifyContent: "flex-end", alignItems: "center" }}>
+              <div className="today-row__actions">
                 {setAnnounceEpisode && (
                   <AnnounceBadge globalOn={announceOn}
                     off={it.uuid ? offSet.has(it.uuid) : false}
