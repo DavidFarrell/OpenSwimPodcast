@@ -6,7 +6,7 @@ import path from "node:path";
 import os from "node:os";
 
 const require = createRequire(import.meta.url);
-const { convert, parseDuration, parseTime, normaliseCuts, buildCutFilters } = require("./converter.cjs");
+const { convert, parseDuration, parseTime, normaliseCuts, buildCutFilters, probeDurationSec } = require("./converter.cjs");
 
 function mkTmp() { return fs.mkdtempSync(path.join(os.tmpdir(), "os-conv-")); }
 function rmTmp(d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
@@ -39,6 +39,32 @@ describe("converter parsers", () => {
   it("parseTime extracts time= from a stderr progress line", () => {
     expect(parseTime("size=100kB time=00:02:30.50 bitrate=128 speed=2x")).toBeCloseTo(150.5, 2);
     expect(parseTime("no time in here")).toBe(null);
+  });
+});
+
+describe("probeDurationSec()", () => {
+  it("parses the duration off ffmpeg stderr (exit code irrelevant)", async () => {
+    const { spawn } = fakeSpawn((child) => {
+      child.stderr.write("  Duration: 00:33:53.04, start: 0.0, bitrate: 128 kb/s\n");
+      // ffmpeg with only -i exits non-zero, but we still parse the duration.
+      child.emit("close", 1);
+    });
+    const sec = await probeDurationSec("/x/out.mp3", { spawn, ffmpegPath: "ffmpeg" });
+    expect(sec).toBeCloseTo(33 * 60 + 53.04, 2);
+  });
+
+  it("returns null when no ffmpeg path is available (no spawn)", async () => {
+    expect(await probeDurationSec("/x/out.mp3", { spawn: () => { throw new Error("nope"); }, ffmpegPath: null })).toBe(null);
+  });
+
+  it("returns null when stderr has no Duration line", async () => {
+    const { spawn } = fakeSpawn((child) => { child.stderr.write("garbage\n"); child.emit("close", 1); });
+    expect(await probeDurationSec("/x/out.mp3", { spawn, ffmpegPath: "ffmpeg" })).toBe(null);
+  });
+
+  it("never throws on a spawn error - resolves null", async () => {
+    const spawn = () => { const c = makeFakeChild(); setTimeout(() => c.emit("error", new Error("ENOENT")), 0); return c; };
+    expect(await probeDurationSec("/x/out.mp3", { spawn, ffmpegPath: "ffmpeg" })).toBe(null);
   });
 });
 

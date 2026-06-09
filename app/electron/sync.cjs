@@ -397,6 +397,11 @@ async function runSync({
   detectAdsFn = defaultDetectAds,
   readDecisionsFn = defaultReadDecisions,
   awaitReview = defaultAwaitReview,
+  // Best-effort probe of an output file's real duration (seconds). Defaults to a
+  // null no-op so unit tests stay hermetic (no ffmpeg spawn); the IPC layer
+  // injects the real ffmpeg-based probe so the success screen can report the
+  // ACTUAL processed duration instead of the original feed length.
+  probeDurationFn = async () => null,
   llm, llmFetch, model, needsReviewMaxSec,
   onEvent,
   signal,
@@ -768,8 +773,46 @@ async function runSync({
   try { await writeManifest(devicePath, queue); }
   catch (e) { emit({ type: "log", stage: "verify", state: "error", text: `manifest: ${e.message}` }); }
 
+  // Build the AUTHORITATIVE transferred set from the files we actually copied and
+  // just checksum-verified on the device - never from the caller's queue, which
+  // the success screen must NOT trust (a download finishing mid-run could inflate
+  // the live queue and make the UI claim an un-transferred episode is on the
+  // device). Per episode: real on-device bytes (stat the dest), real processed
+  // duration (probe the output, best-effort), whether it was converted vs copied
+  // straight through, and verified=true (we only reach here past verify).
+  const transferred = [];
+  for (let i = 0; i < queue.length; i++) {
+    const it = queue[i];
+    const raw = path.join(cacheDir, `${it.uuid}.${it.ext || "mp3"}`);
+    let bytes = null;
+    try { bytes = (await fsp.stat(dests[i])).size; } catch {}
+    let durationSec = null;
+    try { durationSec = await probeDurationFn(dests[i]); } catch { durationSec = null; }
+    if (!Number.isFinite(durationSec) || durationSec < 0) durationSec = null;
+    transferred.push({
+      uuid: it.uuid,
+      title: it.title,
+      show: it.show,
+      fname: it.filename,
+      slot: it.slot,
+      bytes,
+      durationSec,
+      converted: sources[i] !== raw,
+      verified: true,
+    });
+  }
+  const totals = {
+    files: transferred.length,
+    bytes: transferred.reduce((s, t) => s + (t.bytes || 0), 0),
+    listenTimeSec: transferred.reduce((s, t) => s + (t.durationSec || 0), 0),
+    // True only when EVERY transferred file's duration is known, so the UI can
+    // avoid presenting a partial sum as if it were the complete listen time.
+    listenTimeComplete: transferred.length > 0 && transferred.every((t) => t.durationSec != null),
+    converted: transferred.filter((t) => t.converted).length,
+  };
+
   emit({ type: "complete", summary: { count: queue.length } });
-  return { ok: true, files: dests };
+  return { ok: true, files: dests, transferred, totals };
 }
 
 module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, generateCuts, adToCut, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE, EDGE_SNAP_SEC };

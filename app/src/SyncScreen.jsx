@@ -125,6 +125,11 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   const [logByKey, setLogByKey] = useState({});
   const [steps, setSteps] = useState({});
   const [error, setError] = useState(null);
+  // The authoritative result of THIS run ({ transferred, totals, ... }) from the
+  // awaited api.start(). SuccessScreen renders this - the files actually copied
+  // and verified - NOT the live readyQueue, which can drift if a download
+  // finishes mid-run.
+  const [result, setResult] = useState(null);
   // The review gate (approve-cuts step). When the backend holds the pipeline on
   // uncertain cuts it emits a `review` event carrying the flagged episodes; we
   // raise an overlay over the running view until the user clicks Continue, then
@@ -188,13 +193,19 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
         // Per-episode analysis progress: keep the latest event per (type, uuid).
         setSteps((m) => ({ ...m, [`${evt.type}:${evt.uuid}`]: evt }));
       }
-      else if (evt.type === "finished") {
-        if (evt.ok) setPhase("done");
-        else { setError(evt.error?.message || "sync failed"); setPhase("error"); }
-      }
+      // NOTE: the `finished` event is intentionally NOT used to transition phase
+      // or build the success screen. We drive both from the awaited api.start()
+      // result below, which is inherently correlated to THIS run - a stale event
+      // from an earlier/other run can never flip this screen to done.
     });
 
-    api.start(spec).catch(() => {});
+    // The awaited result IS the authoritative outcome of THIS run: { ok, files,
+    // transferred, totals }. SuccessScreen renders `transferred` (what was really
+    // copied + verified), never the live queue.
+    api.start(spec).then((r) => {
+      if (r && r.ok) { setResult(r.data || null); setPhase("done"); }
+      else { setError((r && r.error && r.error.message) || "sync failed"); setPhase("error"); }
+    }).catch((e) => { setError((e && e.message) || "sync failed"); setPhase("error"); });
     return () => off && off();
   }, [phase, devicePath]);
 
@@ -355,7 +366,14 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   });
 
   if (phase === "done") {
-    return <SuccessScreen queue={queue} totalMB={totalMB} onDone={onDone} videoCount={videoCount} skippedCount={skipped.length} />;
+    const transferred = (result && Array.isArray(result.transferred)) ? result.transferred : [];
+    // Episodes that are ready NOW but were NOT in this run's transferred set -
+    // e.g. a download that finished mid-sync. We must not imply they were sent;
+    // surface them honestly so the user can run the transfer again.
+    const sentUuids = new Set(transferred.map((t) => t.uuid));
+    const pending = readyQueue.filter((it) => it.uuid && !sentUuids.has(it.uuid));
+    return <SuccessScreen result={result} transferred={transferred} pending={pending}
+      onDone={onDone} skippedCount={skipped.length} />;
   }
 
   if (phase === "error") {
@@ -579,42 +597,91 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   );
 }
 
-function SuccessScreen({ queue, totalMB, onDone, videoCount, skippedCount = 0 }) {
-  const totalMin = queue.reduce((s, x) => s + x.durMin, 0);
-  const totalHM = `${Math.floor(totalMin / 60)}h ${Math.floor(totalMin % 60)}m`;
-  const skipNote = skippedCount ? ` · ${skippedCount} skipped (unreachable)` : "";
+// Format a seconds value as "Xh Ym" / "Ym" / "Ms", or null -> "—".
+function hmFromSec(sec) {
+  if (!Number.isFinite(sec) || sec <= 0) return "—";
+  const total = Math.round(sec);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${total}s`;
+}
+// h:mm:ss / mm:ss for a single episode duration, or "—" when unknown.
+function clockFromSec(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return "—";
+  const total = Math.round(sec);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const ss = String(s).padStart(2, "0");
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${ss}`;
+  return `${m}:${ss}`;
+}
+
+// Renders ONLY what was actually copied and verified this run (the authoritative
+// `transferred` set + `totals` from runSync), never the live queue. `pending` is
+// any episode that is ready now but was NOT in this run (e.g. a download that
+// finished mid-sync) - surfaced honestly so the user can run the transfer again.
+function SuccessScreen({ result, transferred = [], pending = [], onDone, skippedCount = 0 }) {
+  const totals = (result && result.totals) || {
+    files: transferred.length,
+    bytes: transferred.reduce((s, t) => s + (t.bytes || 0), 0),
+    listenTimeSec: transferred.reduce((s, t) => s + (t.durationSec || 0), 0),
+    listenTimeComplete: transferred.length > 0 && transferred.every((t) => t.durationSec != null),
+    converted: transferred.filter((t) => t.converted).length,
+  };
+  const files = totals.files != null ? totals.files : transferred.length;
+  // Don't present a partial duration sum as the full listen time. When some
+  // durations are unknown, mark it approximate ("~") rather than imply exactness.
+  const listenComplete = totals.listenTimeComplete !== false;
+  const listenLabel = totals.listenTimeSec > 0
+    ? (listenComplete ? hmFromSec(totals.listenTimeSec) : `~${hmFromSec(totals.listenTimeSec)}`)
+    : "—";
+  const notes = [];
+  if (pending.length) notes.push(`${pending.length} ready but not sent`);
+  if (skippedCount) notes.push(`${skippedCount} skipped (unreachable)`);
+  const noteStr = notes.length ? ` · ${notes.join(" · ")}` : "";
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }} className="ct-slide-in">
       <Toolbar
         label="transfer complete · safe to unplug"
         title="On your headphones."
-        subtitle={`${queue.length} episode${queue.length !== 1 ? "s" : ""} renamed, converted, transferred, verified${skipNote}.`}
+        subtitle={`${files} episode${files !== 1 ? "s" : ""} transferred and verified${noteStr}.`}
         actions={<>
           <Btn variant="secondary" onClick={onDone}>Back to queue</Btn>
           <Btn variant="cta" onClick={onDone}>DONE</Btn>
         </>}
       />
       <div style={{ padding: "20px", display: "grid", gap: 16, overflow: "auto" }}>
+        {pending.length > 0 && (
+          <div style={{ border: "1px solid var(--ct-amber)", padding: "10px 14px",
+            background: "var(--ct-amber-ghost, rgba(230,170,80,0.12))", color: "var(--ct-amber)",
+            fontFamily: "var(--font-mono)", fontSize: 12 }}>
+            ⚠ {pending.length} episode{pending.length !== 1 ? "s" : ""} finished downloading after this transfer started and {pending.length !== 1 ? "were" : "was"} not copied:
+            {" "}{pending.map((p) => p.title).join(", ")}. Run the transfer again to send {pending.length !== 1 ? "them" : "it"}.
+          </div>
+        )}
         <div className="stats">
           <div className="stats__cell">
             <div className="stats__label">Files</div>
-            <div className="stats__value">{queue.length}</div>
-            <div className="stats__sub">{queue.length} written</div>
+            <div className="stats__value">{files}</div>
+            <div className="stats__sub">verified on device</div>
           </div>
           <div className="stats__cell">
             <div className="stats__label">Listen time</div>
-            <div className="stats__value">{totalHM}</div>
-            <div className="stats__sub">≈ 2–3 swims</div>
+            <div className="stats__value">{listenLabel}</div>
+            <div className="stats__sub">{listenComplete ? "after trim + speed" : "partial (some unknown)"}</div>
           </div>
           <div className="stats__cell">
             <div className="stats__label">Transferred</div>
-            <div className="stats__value">{totalMB.toFixed(0)}<span style={{ fontSize: 14, color: "var(--fg-muted)", marginLeft: 4 }}>MB</span></div>
-            <div className="stats__sub">on device</div>
+            <div className="stats__value">{formatMB((totals.bytes || 0) / (1024 * 1024))}</div>
+            <div className="stats__sub">actual bytes</div>
           </div>
           <div className="stats__cell">
             <div className="stats__label">Converted</div>
-            <div className="stats__value">{videoCount}</div>
-            <div className="stats__sub">video → audio</div>
+            <div className="stats__value">{totals.converted || 0}</div>
+            <div className="stats__sub">re-encoded</div>
           </div>
         </div>
 
@@ -624,22 +691,24 @@ function SuccessScreen({ queue, totalMB, onDone, videoCount, skippedCount = 0 })
           <div>
             <div className="ct-label">on device</div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 2, marginTop: 10 }}>
-              {queue.map((it, i) => {
-                const fname = fnameFor(it.show, i + 1, "mp3");
-                return (
-                  <div key={it.id} style={{ display: "grid", gridTemplateColumns: "24px 1fr auto",
-                    gap: 10, padding: "6px 0", alignItems: "center",
-                    borderBottom: "1px solid var(--rule)" }}>
-                    <CoverArt show={it.show} size={20} />
-                    <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--fg)" }}>
-                      {fname}
-                    </div>
-                    <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--fg-muted)" }}>
-                      {it.dur}
-                    </div>
+              {transferred.length === 0 && (
+                <div className="ct-meta" style={{ color: "var(--fg-muted)", padding: "6px 0" }}>
+                  Nothing was transferred this run.
+                </div>
+              )}
+              {transferred.map((t) => (
+                <div key={t.uuid || t.fname} style={{ display: "grid", gridTemplateColumns: "24px 1fr auto",
+                  gap: 10, padding: "6px 0", alignItems: "center",
+                  borderBottom: "1px solid var(--rule)" }}>
+                  <CoverArt show={t.show} size={20} />
+                  <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--fg)" }}>
+                    {t.fname}
                   </div>
-                );
-              })}
+                  <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--fg-muted)" }}>
+                    {clockFromSec(t.durationSec)}
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>

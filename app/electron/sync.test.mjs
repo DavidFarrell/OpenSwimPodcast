@@ -105,6 +105,65 @@ describe("runSync happy path", () => {
     expect(events.at(-1).type).toBe("complete");
   });
 
+  // The success screen MUST render this authoritative set (files actually copied
+  // and verified), never the caller's live queue - else a download finishing
+  // mid-run could make the UI claim an un-transferred episode is on the device.
+  it("returns an authoritative transferred set built from the verified device files", async () => {
+    const audioBytes = Buffer.from("plain mp3 copied straight through");
+    const convertedBytes = Buffer.from("re-encoded video to mp3 here");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), audioBytes);
+    fs.writeFileSync(path.join(cacheDir, "b.mp4"), Buffer.from("video"));
+    const convertFn = vi.fn(async ({ dest }) => { fs.writeFileSync(dest, convertedBytes); return { bytes: convertedBytes.length, durationSec: 120, fromCache: false }; });
+    // Inject a deterministic probe so the test is hermetic (default returns null).
+    const probeDurationFn = vi.fn(async (file) => (file.endsWith("01_hardfork.mp3") ? 1800 : 1200));
+
+    const queue = [
+      makeItem({ uuid: "a", show: "HARD FORK", title: "Plain Ep", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" }),
+      makeItem({ uuid: "b", show: "ACQUIRED", title: "Video Ep", slot: 2, ext: "mp4", filename: "02_acquired.mp3" }),
+    ];
+    const res = await runSync({ devicePath, cacheDir, queue, convertFn, probeDurationFn, onEvent: () => {} });
+
+    expect(res.ok).toBe(true);
+    expect(res.transferred).toHaveLength(2);
+    const a = res.transferred.find((t) => t.uuid === "a");
+    const b = res.transferred.find((t) => t.uuid === "b");
+    // Real on-device bytes (stat of the dest), not queue metadata.
+    expect(a.bytes).toBe(audioBytes.length);
+    expect(b.bytes).toBe(convertedBytes.length);
+    // Real processed duration from the probe.
+    expect(a.durationSec).toBe(1800);
+    expect(b.durationSec).toBe(1200);
+    // converted=false for the straight copy, true for the re-encoded video.
+    expect(a.converted).toBe(false);
+    expect(b.converted).toBe(true);
+    expect(a.verified).toBe(true);
+    expect(a.fname).toBe("01_hardfork.mp3");
+    expect(a.title).toBe("Plain Ep");
+    // Totals are summed from the real per-file values.
+    expect(res.totals).toEqual({
+      files: 2,
+      bytes: audioBytes.length + convertedBytes.length,
+      listenTimeSec: 3000,
+      listenTimeComplete: true,
+      converted: 1,
+    });
+  });
+
+  it("a null/failing duration probe degrades to null duration, never throws", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("audio"));
+    const probeDurationFn = vi.fn(async () => { throw new Error("ffmpeg missing"); });
+    const res = await runSync({
+      devicePath, cacheDir,
+      queue: [makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" })],
+      convertFn: async () => {}, probeDurationFn, onEvent: () => {},
+    });
+    expect(res.ok).toBe(true);
+    expect(res.transferred[0].durationSec).toBe(null);
+    expect(res.totals.listenTimeSec).toBe(0);
+    // A run with any unknown duration must not claim a complete listen time.
+    expect(res.totals.listenTimeComplete).toBe(false);
+  });
+
   it("deletes our old files from the device but leaves foreign files alone", async () => {
     const payload = Buffer.from("new ep");
     fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);

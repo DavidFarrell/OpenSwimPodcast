@@ -4,6 +4,7 @@ const pc = require("./pocketcasts.cjs");
 const { DownloadManager } = require("./downloader.cjs");
 const { createDeviceWatcher } = require("./device.cjs");
 const { runSync, readManifest } = require("./sync.cjs");
+const { probeDurationSec } = require("./converter.cjs");
 const { writeDecisions } = require("./decisionCache.cjs");
 
 function serializeError(e) {
@@ -292,9 +293,14 @@ async function startSync(spec) {
         const uuids = (items || []).map((it) => it && it.uuid).filter(Boolean);
         pendingReview = { resolve, uuids };
       }),
+      // Real processed-duration probe for the authoritative success report (the
+      // renderer uses the returned `res` as the source of truth, not its live
+      // queue - so a download finishing mid-run can never be reported as
+      // transferred).
+      probeDurationFn: (f) => probeDurationSec(f),
       onEvent: (e) => { recordTrimEvent(e); broadcast("sync:event", e); },
     });
-    broadcast("sync:event", { type: "finished", ok: true });
+    broadcast("sync:event", { type: "finished", ok: true, result: res });
     return res;
   } catch (e) {
     broadcast("sync:event", { type: "finished", ok: false, error: { message: e.message, code: e.code, name: e.name } });

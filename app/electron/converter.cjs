@@ -228,4 +228,30 @@ async function convert({
   });
 }
 
-module.exports = { convert, parseDuration, parseTime, AbortError, BOOST_FILTER, normaliseCuts, buildCutFilters };
+// Read the duration (seconds) of a media file by asking ffmpeg to open it and
+// parsing the "Duration:" line off stderr. ffmpeg with only `-i` exits non-zero
+// ("At least one output file must be specified") but still prints the duration,
+// so we parse stderr regardless of exit code. Best-effort: resolves null on any
+// failure (no ffmpeg, spawn error, unparseable) and NEVER throws. Used to report
+// the ACTUAL processed/output duration on the success screen rather than the
+// original feed length. Tests inject their own (or use the null default in
+// sync.cjs), so this only runs against real files in the packaged app.
+function probeDurationSec(file, { spawn = defaultSpawn, ffmpegPath = defaultFfmpegPath } = {}) {
+  return new Promise((resolve) => {
+    if (!file || !ffmpegPath) return resolve(null);
+    let child;
+    try { child = spawn(ffmpegPath, ["-hide_banner", "-i", file]); }
+    catch { return resolve(null); }
+    let stderr = "";
+    let settled = false;
+    const done = (v) => { if (settled) return; settled = true; resolve(v); };
+    if (child.stderr) child.stderr.on("data", (b) => { stderr += String(b); });
+    child.on("error", () => done(null));
+    child.on("close", () => {
+      const d = parseDuration(stderr);
+      done(Number.isFinite(d) && d >= 0 ? d : null);
+    });
+  });
+}
+
+module.exports = { convert, parseDuration, parseTime, AbortError, BOOST_FILTER, normaliseCuts, buildCutFilters, probeDurationSec };
