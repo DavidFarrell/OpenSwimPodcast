@@ -284,6 +284,14 @@ async function startSync(spec) {
       needsReviewMaxSec: (typeof spec.needsReviewMaxSec === "number" && Number.isFinite(spec.needsReviewMaxSec) && spec.needsReviewMaxSec > 0)
         ? spec.needsReviewMaxSec
         : undefined,
+      // Detector: the production default is the GEPA champion ("gepa") - validated
+      // head-to-head against the prior "legacy" detector on the golden corpus and
+      // proven STRICTLY safer (auto-applied false-positive seconds 11.7s vs legacy
+      // 99.2s) with higher ad-recall, because char-interpolation cuts the sold
+      // portion of a turn instead of the whole turn and the hard guard holds
+      // anything long/ambiguous for review. Passed EXPLICITLY so the shipped path
+      // is never env-dependent. Revert to "legacy" here to roll back the detector.
+      detectorMode: "gepa",
       cacheDir,
       signal: syncController.signal,
       // The interactive review gate: park a resolver and let the renderer release
