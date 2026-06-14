@@ -105,6 +105,134 @@ const ADS_SCHEMA = {
   },
 };
 
+// --- GEPA "gepa" mode (selectable, NON-default) ---------------------------------
+//
+// A second, opt-in detector mode that adopts the GEPA champion first-pass
+// (seed_checklist_v1). It is OFF by default: detectAds({mode:"legacy"}) (the
+// default) keeps the VERIFY_INSTRUCTION + ADS_SCHEMA + whole-segment behaviour
+// above byte-for-byte. gepa mode swaps three things - the system prompt, the
+// response schema, and the window line format - and maps each returned quote to a
+// TIME by CHAR-INTERPOLATION within its coarse diarized segment (recovers ~81% of
+// full sentence re-segmentation's precision with NO word-timings). A hard 45s cap
+// and several guards route the residual risk (one ad filling most of a long turn,
+// a fuzzy/non-unique map) to needsReview. See docs/smart-processing/
+// DESIGN_GEPA_ADOPTION.md + OVERNIGHT_BUILD_PLAN.md (the P0 ablation verdict).
+
+// The detector mode. "legacy" is the locked, deployed default; "gepa" is the
+// opt-in GEPA champion path. process.env.OSW_DETECTOR_MODE overrides only when the
+// caller leaves mode unset (used by the eval harness); an unknown value falls back
+// to "legacy" so the shipped behaviour can never be changed by a stray env value.
+const DEFAULT_MODE = "legacy";
+function resolveMode(mode) {
+  const m = (typeof mode === "string" && mode.trim())
+    ? mode.trim().toLowerCase()
+    : (typeof process !== "undefined" && process.env && process.env.OSW_DETECTOR_MODE
+      ? String(process.env.OSW_DETECTOR_MODE).trim().toLowerCase()
+      : "");
+  return m === "gepa" ? "gepa" : DEFAULT_MODE;
+}
+
+// HARD auto-cut cap (seconds). A mapped span (and, in sync.cjs, the post-edge-snap
+// final cut) longer than this is ALWAYS flagged needs-review, never auto-applied.
+// This is INDEPENDENT of the caller's needsReviewMaxSec / sensitivity: sensitivity
+// may only make flagging MORE aggressive (a lower threshold), it can NEVER raise
+// this cap. fast-diarise caps turns at ~60s, so an ad that fills most of one long
+// turn lands just under here - the long-turn guard below catches that case too.
+const HARD_AUTOCUT_MAX_SEC = 45;
+
+// When start_quote and end_quote map to the SAME segment and that segment is at
+// least this long, a mapped span covering most of it (>= LONG_TURN_COVER_FRAC) is
+// the "one ad fills a whole ~60s turn" danger case - flagged needs-review.
+const LONG_TURN_MIN_SEC = 45;
+const LONG_TURN_COVER_FRAC = 0.7;
+
+// The GEPA champion FIRST-PASS prompt, ported VERBATIM from
+// GEPA_podcast_ad_identifier/prompts/seed_checklist_v1.txt (@45caa6a). Used as the
+// gepa-mode system prompt. Richer FAFF taxonomy (ad/intro/outro/housekeeping), a
+// checklist, and an explicit "when unsure KEEP" - the cardinal rule, in the model's
+// own instructions. Kept exactly so gepa mode behaves as the GEPA eval proved.
+const GEPA_INSTRUCTION = `Find FAFF in this podcast transcript window. Faff = anything a listener who only wants the episode's actual content would skip. Lines look like "#idx [mm:ss] SPEAKER: text".
+
+TYPES
+- ad: sells or promotes any third-party product, service, brand, charity campaign, or other show. Host-read or pre-recorded. subtype: pre-roll | mid-roll | post-roll.
+- intro: pure show packaging with zero episode information. Rare.
+- outro: credits, thanks-for-listening, see-you-next-week, final next-episode tease.
+- housekeeping: the show promoting ITSELF (patreon, merch, live tour, own network).
+
+CHECKLIST - a stretch is an AD if ANY of:
+[ ] "brought to you by / sponsored by / support comes from" framing
+[ ] different voice reading polished marketing copy
+[ ] slogan, discount code, or URL call-to-action
+[ ] casual chat that pivots into selling a named product
+[ ] promo for a different podcast
+CHECKLIST - a stretch is NOT faff if ANY of:
+[ ] it names this episode's topics or guests (billboard = content)
+[ ] it is a joke or recurring gag that throws to the break (the gag is content; only the actual advert after it is faff)
+[ ] it is a passing brand mention inside normal conversation
+[ ] it is shorter than ~5 seconds
+[ ] you are not sure (when unsure: KEEP. Cutting real content is the worst failure.)
+
+OUTPUT - for each faff stretch:
+- start_quote: the exact first sentence, copied verbatim from the window.
+- end_quote: the exact last sentence (URL / code / slogan / sign-off), copied verbatim.
+- Boundaries at clean sentence edges; the moment hosts resume the topic it is content.
+- Back-to-back ads for different brands = separate entries.
+
+Return strict JSON only: {"spans":[{"type":...,"subtype":...,"start_quote":...,"end_quote":...}]}
+subtype only for ads, else null. No faff -> {"spans":[]}.
+`;
+
+// Strict json_schema forcing {spans:[{type,subtype,start_quote,end_quote}]} -
+// mirrors GEPA detector.py SPANS_SCHEMA so the gepa-mode model can only answer in
+// the shape the char-interp mapper reads. type is enum-constrained; subtype is a
+// nullable string (only meaningful for ads).
+const SPANS_SCHEMA = {
+  type: "json_schema",
+  json_schema: {
+    name: "faff_spans",
+    strict: true,
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["spans"],
+      properties: {
+        spans: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "subtype", "start_quote", "end_quote"],
+            properties: {
+              type: { type: "string", enum: ["ad", "intro", "outro", "housekeeping"] },
+              subtype: { type: ["string", "null"] },
+              start_quote: { type: "string" },
+              end_quote: { type: "string" },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
+const GEPA_VALID_TYPES = new Set(["ad", "intro", "outro", "housekeeping"]);
+
+// Render one window line in the GEPA format: "#<idx> [mm:ss] <speaker>: <text>".
+// mm:ss is derived from segment.start (floored to whole seconds, divmod 60, as
+// GEPA's dataset._render does); speaker falls back to "SPEAKER" when absent.
+function gepaLine(idx, seg) {
+  const start = seg && Number.isFinite(seg.start) ? seg.start : 0;
+  const total = Math.max(0, Math.floor(start));
+  const mm = Math.floor(total / 60);
+  const ss = total % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  const speaker = seg && typeof seg.speaker === "string" && seg.speaker.trim()
+    ? seg.speaker
+    : "SPEAKER";
+  const text = seg && typeof seg.text === "string" ? seg.text : "";
+  return `#${idx} [${pad(mm)}:${pad(ss)}] ${speaker}: ${text}`;
+}
+
 // Normalise a quote / segment text for substring matching. Lowercase, drop a
 // leading "SPEAKER_xx: " prefix, strip everything that is not a letter/digit/
 // space, then collapse whitespace. Mirrors the reference norm().
@@ -196,6 +324,9 @@ function toSegments(transcript) {
       start: s && typeof s.start === "number" && Number.isFinite(s.start) ? s.start : null,
       end: s && typeof s.end === "number" && Number.isFinite(s.end) ? s.end : null,
       text: s && typeof s.text === "string" ? s.text : "",
+      // Carried through for the gepa-mode line format ("#idx [mm:ss] speaker:");
+      // legacy mode never reads it, so this is additive and behaviour-neutral.
+      speaker: s && typeof s.speaker === "string" ? s.speaker : null,
     }))
     .filter((s) => s.text.trim().length > 0 && s.start != null);
 }
@@ -228,13 +359,18 @@ function buildWindows(segments) {
   return windows;
 }
 
-// Call the LLM for one window. Returns the parsed object ({ads:[...]}) or null on
-// any failure (network, non-ok, unparseable). Degrades safely; never throws.
+// Call the LLM for one window. Returns the parsed object (legacy {ads:[...]} or
+// gepa {spans:[...]}) or null on any failure (network, non-ok, unparseable).
+// Degrades safely; never throws. The system prompt and the response schema are
+// chosen by `mode` (legacy default keeps VERIFY_INSTRUCTION + ADS_SCHEMA exactly).
 async function callModel({
-  lines, fetch, url, model, timeoutMs, signal,
+  lines, fetch, url, model, timeoutMs, signal, mode,
 }) {
   if (typeof fetch !== "function") return null;
   const user = lines.join("\n");
+  const resolved = resolveMode(mode);
+  const system = resolved === "gepa" ? GEPA_INSTRUCTION : VERIFY_INSTRUCTION;
+  const schema = resolved === "gepa" ? SPANS_SCHEMA : ADS_SCHEMA;
 
   const controller = typeof AbortController === "function" ? new AbortController() : null;
   let timer = null;
@@ -250,9 +386,9 @@ async function callModel({
     model,
     temperature: 0,
     max_tokens: 4000,
-    response_format: ADS_SCHEMA,
+    response_format: schema,
     messages: [
-      { role: "system", content: VERIFY_INSTRUCTION },
+      { role: "system", content: system },
       { role: "user", content: user },
     ],
   };
@@ -313,6 +449,160 @@ function classifyRange({ startIndex, endIndex, segments, endQuoteMapped, needsRe
   return { needsReview: reasons.length > 0, reasons };
 }
 
+// --- gepa-mode quote -> time mapping (char interpolation) ------------------------
+//
+// Map a single normalised quote to a segment index AND an exact char offset within
+// that segment's NORMALISED text, so a start offset and an end offset are computed
+// in the SAME normalised space the match used and stay consistent. We do this by
+// finding norm(quote) with indexOf inside the one segment normSegs[si] - that is
+// byte-for-byte the string findSeg searched, so the offset is exact.
+//
+// Returns { si, charOff, exact } or null:
+//   - si       absolute segment index the quote maps to (via findSeg, so the same
+//              widening passes - exact containment, then 10- then 6-word prefix);
+//   - charOff  the char offset of the (normalised) quote inside normSegs[si];
+//   - exact    true iff norm(quote) is an exact substring of normSegs[si] (so the
+//              offset is trustworthy). false when findSeg matched via a prefix /
+//              fuzzy fallback - the caller treats that as a GUARD case (needsReview)
+//              and uses the segment boundary, never a fabricated interpolation.
+// `nonUnique` (out) is set true when norm(quote) appears in MORE THAN ONE window
+// segment (an ambiguous map the guard must flag).
+function mapQuoteToOffset(quote, normSegs, idxList, out) {
+  const si = findSeg(quote, normSegs, idxList);
+  if (si == null) return null;
+  const nq = norm(quote);
+  const segText = normSegs[si] || "";
+  const charOff = segText.indexOf(nq);
+  // Non-unique check: the same normalised quote contained by 2+ window segments.
+  if (out && nq) {
+    let hits = 0;
+    for (const idx of idxList) {
+      if (normSegs[idx] && normSegs[idx].includes(nq)) hits += 1;
+      if (hits > 1) break;
+    }
+    if (hits > 1) out.nonUnique = true;
+  }
+  // charOff < 0 means findSeg matched on a prefix/fuzzy pass, not exact containment:
+  // we cannot trust an interpolated offset. Map to the segment, flag it inexact, and
+  // anchor the offset at the segment start (the caller will clamp + flag review).
+  return { si, charOff: charOff >= 0 ? charOff : 0, exact: charOff >= 0 };
+}
+
+// Interpolate a time within segment si from a char offset into its normalised text.
+// startSec = seg.start + (charOff / max(1, len(norm(seg.text)))) * (seg.end -
+// seg.start), clamped to [seg.start, seg.end]. The char offset must come from the
+// same normalised space as the match (see mapQuoteToOffset) so start and end stay
+// consistent. A segment with no/zero duration collapses to seg.start.
+function interpTime(seg, charOff, normLen) {
+  const start = seg.start;
+  let end = seg.end;
+  if (end == null || !Number.isFinite(end)) end = start;
+  if (!(end > start)) return start;
+  const denom = Math.max(1, normLen);
+  const frac = Math.min(1, Math.max(0, charOff / denom));
+  const t = start + frac * (end - start);
+  return Math.min(end, Math.max(start, t));
+}
+
+// Resolve one gepa-mode span ({type,subtype,start_quote,end_quote}) to a cut over
+// the absolute segment list. Returns null to SKIP (quote-map fail on the opening
+// line - fail safe to no-cut, exactly like legacy), or a cut descriptor
+//   { startIndex, endIndex, startSec, endSec, needsReview, reasons, type, subtype }.
+// The HARD GUARD (GPT-5 spec) flags needsReview - never auto-applies - when ANY of:
+//   - the mapped span duration > HARD_AUTOCUT_MAX_SEC (independent of sensitivity);
+//   - the quote map was fuzzy/prefix/non-exact OR matched more than one segment;
+//   - start and end map to the SAME long (>= LONG_TURN_MIN_SEC) segment and the
+//     span covers most (>= LONG_TURN_COVER_FRAC) of it;
+//   - end <= start after interpolation (fall back to the whole [si.start, sj.end]
+//     span AND flag).
+// TYPE POLICY: type "ad" is auto-cut-eligible (still subject to the guard +
+// classifyRange); intro/outro/housekeeping are forced needsReview (held) because
+// sync.cjs edge-snaps near-edge blocks to 0/end regardless of type. The full guard
+// is the UNION with classifyRange's own needs-review logic.
+function mapGepaSpan({
+  span, segments, normSegs, idxList, needsReviewMaxSec,
+}) {
+  const rawType = span && span.type != null ? String(span.type).trim().toLowerCase() : "";
+  const type = GEPA_VALID_TYPES.has(rawType) ? rawType : "ad";
+  const subtype = span && span.subtype != null ? span.subtype : null;
+  const startQuote = span && span.start_quote != null ? span.start_quote : "";
+  const endQuote = span && span.end_quote != null ? span.end_quote : "";
+
+  const flags = {};
+  const startMap = mapQuoteToOffset(startQuote, normSegs, idxList, flags);
+  if (!startMap) return null; // opening line maps nowhere - SKIP (never cut)
+
+  const reasons = [];
+  let inexact = !startMap.exact;
+
+  // End quote. If it maps nowhere we fall back to the start segment (single-segment
+  // span) and flag the boundary ambiguous, mirroring the legacy ei = si fallback.
+  let endMap = mapQuoteToOffset(endQuote, normSegs, idxList, flags);
+  let endQuoteMapped = true;
+  if (!endMap || endMap.si < startMap.si) {
+    endQuoteMapped = false;
+    endMap = { si: startMap.si, charOff: (normSegs[startMap.si] || "").length, exact: false };
+  }
+  if (!endMap.exact) inexact = true;
+
+  const si = startMap.si;
+  const sj = endMap.si;
+  const startSeg = segments[si];
+  const endSeg = segments[sj];
+  const startNormLen = (normSegs[si] || "").length;
+  const endNormLen = (normSegs[sj] || "").length;
+
+  // Char-interpolated boundaries. The end offset is the END of the matched end_quote
+  // (offset + its normalised length) so the cut closes after the quoted sentence.
+  let startSec = interpTime(startSeg, startMap.charOff, startNormLen);
+  const endCharOffEnd = endMap.charOff + norm(endQuote).length;
+  let endSec = interpTime(endSeg, endCharOffEnd, endNormLen);
+
+  // If interpolation produced a non-positive span, fall back to the whole-segment
+  // span [si.start, sj.end] and flag - we never emit an inverted/zero cut.
+  if (!(endSec > startSec)) {
+    startSec = startSeg.start;
+    endSec = endSeg.end != null && Number.isFinite(endSeg.end) ? endSeg.end : endSeg.start;
+    reasons.push("interp-degenerate");
+  }
+
+  // Guard branches (union with classifyRange below).
+  const durationSec = endSec - startSec;
+  if (Number.isFinite(durationSec) && durationSec > HARD_AUTOCUT_MAX_SEC) {
+    reasons.push("hard-cap");
+  }
+  if (inexact) reasons.push("fuzzy-map");
+  if (flags.nonUnique) reasons.push("non-unique-quote");
+  // One ad filling most of a single long turn.
+  if (si === sj) {
+    const segEnd = endSeg.end != null && Number.isFinite(endSeg.end) ? endSeg.end : endSeg.start;
+    const segDur = segEnd - startSeg.start;
+    if (Number.isFinite(segDur) && segDur >= LONG_TURN_MIN_SEC
+        && Number.isFinite(durationSec) && durationSec >= LONG_TURN_COVER_FRAC * segDur) {
+      reasons.push("long-turn-most");
+    }
+  }
+  // intro/outro/housekeeping are never auto-cut (edge-snap magnification).
+  if (type !== "ad") reasons.push(`type-${type}`);
+
+  // Compose with the existing classifyRange needs-review logic - take the UNION.
+  const cls = classifyRange({
+    startIndex: si, endIndex: sj, segments, endQuoteMapped, needsReviewMaxSec,
+  });
+  for (const r of cls.reasons) if (!reasons.includes(r)) reasons.push(r);
+
+  return {
+    startIndex: si,
+    endIndex: sj,
+    startSec,
+    endSec,
+    needsReview: reasons.length > 0,
+    reasons,
+    type,
+    subtype,
+  };
+}
+
 // Detect ads across the whole transcript. Returns:
 //   {
 //     ads: [{ startIndex, endIndex, startSec, endSec, needsReview, reasons }],
@@ -335,8 +625,14 @@ async function detectAds({
   // are auto-applied vs flagged; never weakens the cardinal rule or the quote-map
   // fail-safe. Falls back to the locked default inside classifyRange.
   needsReviewMaxSec,
+  // Detector mode: "legacy" (DEFAULT - the locked VERIFY_INSTRUCTION + ADS_SCHEMA +
+  // whole-segment mapping, unchanged) or "gepa" (the GEPA champion first-pass +
+  // char-interpolation mapping + hard guard). Unset -> OSW_DETECTOR_MODE env ->
+  // "legacy". sync.cjs never passes this, so the deployed pipeline stays legacy.
+  mode,
   signal,
 } = {}) {
+  const detectorMode = resolveMode(mode);
   const empty = { ads: [], stats: { windowsRun: 0, adsReturned: 0, quoteMapFailures: 0 } };
 
   const segments = toSegments(transcript);
@@ -363,20 +659,26 @@ async function detectAds({
 
   for (const wsegs of windows) {
     windowsRun += 1;
-    // Lines as "<index>. <text>" - the model quotes back the text, not the index,
-    // and we map via normSegs, so the absolute index prefix is just for the model
-    // to reason over the window order.
-    const lines = wsegs.map((i) => `${i}. ${segments[i].text}`);
+    // Window line format depends on the mode. legacy: "<index>. <text>" (the model
+    // quotes back the text, not the index). gepa: "#<idx> [mm:ss] <speaker>: <text>"
+    // (the GEPA format the seed_checklist prompt expects). In both, the quote is
+    // mapped via normSegs so the prefix is only for the model to reason over order.
+    const lines = detectorMode === "gepa"
+      ? wsegs.map((i) => gepaLine(i, segments[i]))
+      : wsegs.map((i) => `${i}. ${segments[i].text}`);
 
     let parsed = null;
     try {
-      parsed = await callModel({ lines, fetch, url, model, timeoutMs, signal });
+      parsed = await callModel({ lines, fetch, url, model, timeoutMs, signal, mode: detectorMode });
     } catch {
       // callModel already swallows its own errors, but guard anyway - one bad
       // window must never abort the rest of the episode.
       parsed = null;
     }
-    if (!parsed || !Array.isArray(parsed.ads)) {
+    const list = detectorMode === "gepa"
+      ? (parsed && Array.isArray(parsed.spans) ? parsed.spans : null)
+      : (parsed && Array.isArray(parsed.ads) ? parsed.ads : null);
+    if (!list) {
       // A window the model could not answer (timeout, error, bad shape). This is
       // the silent-failure path that made detection look like "no ads" under GPU
       // contention - log it so an empty result is never invisible again.
@@ -384,7 +686,37 @@ async function detectAds({
       continue;
     }
 
-    for (const ad of parsed.ads) {
+    if (detectorMode === "gepa") {
+      for (const span of list) {
+        adsReturned += 1;
+        const cut = mapGepaSpan({ span, segments, normSegs, idxList: wsegs, needsReviewMaxSec });
+        if (cut == null) {
+          // Quote-map failure on the OPENING line - cannot place the span. SKIP it
+          // entirely (fail safe to no-cut), exactly like legacy.
+          quoteMapFailures += 1;
+          continue;
+        }
+        const key = `${cut.startIndex}-${cut.endIndex}`;
+        const prev = seen.get(key);
+        if (!prev) {
+          seen.set(key, cut);
+        } else {
+          // De-dupe across overlapping windows. The merged cut is SAFE: needsReview
+          // if EITHER sighting was (OR the flags), and the UNION of both sightings'
+          // reasons. A second, unflagged sighting must NEVER clear a flag the first
+          // set (cardinal rule), and vice-versa. We keep prev's geometry (same key
+          // == same index range, so startSec/endSec already agree) and only widen
+          // its review status.
+          const mergedReasons = [...prev.reasons];
+          for (const r of cut.reasons) if (!mergedReasons.includes(r)) mergedReasons.push(r);
+          prev.needsReview = prev.needsReview || cut.needsReview;
+          prev.reasons = mergedReasons;
+        }
+      }
+      continue;
+    }
+
+    for (const ad of list) {
       adsReturned += 1;
       const fl = ad && ad.first_line != null ? ad.first_line : "";
       const ll = ad && ad.last_line != null ? ad.last_line : "";
@@ -418,29 +750,34 @@ async function detectAds({
     }
   }
 
-  const ads = [...seen.values()]
-    .sort((a, b) => a.startIndex - b.startIndex)
-    .map(({ startIndex, endIndex, endQuoteMapped }) => {
-      const { needsReview, reasons } = classifyRange({
-        startIndex, endIndex, segments, endQuoteMapped, needsReviewMaxSec,
+  // gepa mode: each `seen` entry is already a complete cut (mapped + guarded during
+  // mapGepaSpan). Just sort. legacy mode: classify each collected range here, as
+  // before (this path is byte-for-byte unchanged).
+  const ads = detectorMode === "gepa"
+    ? [...seen.values()].sort((a, b) => a.startIndex - b.startIndex)
+    : [...seen.values()]
+      .sort((a, b) => a.startIndex - b.startIndex)
+      .map(({ startIndex, endIndex, endQuoteMapped }) => {
+        const { needsReview, reasons } = classifyRange({
+          startIndex, endIndex, segments, endQuoteMapped, needsReviewMaxSec,
+        });
+        const startSeg = segments[startIndex];
+        const endSeg = segments[endIndex];
+        let endSec = endSeg.end;
+        if (endSec == null) {
+          endSec = endIndex + 1 < segments.length ? segments[endIndex + 1].start : endSeg.start;
+        }
+        return {
+          startIndex,
+          endIndex,
+          startSec: startSeg.start,
+          endSec,
+          needsReview,
+          reasons,
+        };
       });
-      const startSeg = segments[startIndex];
-      const endSeg = segments[endIndex];
-      let endSec = endSeg.end;
-      if (endSec == null) {
-        endSec = endIndex + 1 < segments.length ? segments[endIndex + 1].start : endSeg.start;
-      }
-      return {
-        startIndex,
-        endIndex,
-        startSec: startSeg.start,
-        endSec,
-        needsReview,
-        reasons,
-      };
-    });
 
-  logEvent("detect", `done: ${windowsRun}/${windows.length} windows, ${adsReturned} raw ads, ${quoteMapFailures} quote-map fails -> ${ads.length} final cut(s)`);
+  logEvent("detect", `done [${detectorMode}]: ${windowsRun}/${windows.length} windows, ${adsReturned} raw ads, ${quoteMapFailures} quote-map fails -> ${ads.length} final cut(s)`);
   return { ads, stats: { windowsRun, adsReturned, quoteMapFailures } };
 }
 
@@ -454,6 +791,17 @@ module.exports = {
   buildWindows,
   classifyRange,
   callModel,
+  // gepa mode (selectable; legacy stays the default)
+  resolveMode,
+  gepaLine,
+  mapQuoteToOffset,
+  interpTime,
+  mapGepaSpan,
+  GEPA_INSTRUCTION,
+  SPANS_SCHEMA,
+  HARD_AUTOCUT_MAX_SEC,
+  LONG_TURN_MIN_SEC,
+  LONG_TURN_COVER_FRAC,
   VERIFY_INSTRUCTION,
   ADS_SCHEMA,
   LMSTUDIO_URL,

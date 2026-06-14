@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
@@ -11,6 +11,16 @@ const {
   toSegments,
   buildWindows,
   classifyRange,
+  resolveMode,
+  gepaLine,
+  mapQuoteToOffset,
+  interpTime,
+  mapGepaSpan,
+  GEPA_INSTRUCTION,
+  SPANS_SCHEMA,
+  HARD_AUTOCUT_MAX_SEC,
+  LONG_TURN_MIN_SEC,
+  LONG_TURN_COVER_FRAC,
   VERIFY_INSTRUCTION,
   ADS_SCHEMA,
   LMSTUDIO_URL,
@@ -467,5 +477,518 @@ describe("detectAds()", () => {
     expect(ads.length).toBe(1);
     expect(ads[0].startIndex).toBe(1);
     expect(ads[0].endIndex).toBe(2);
+  });
+});
+
+// =====================================================================================
+// GEPA "gepa" mode (selectable; legacy is the default). The deployed pipeline keeps
+// calling detectAds with the default (legacy), so these tests opt in via mode:"gepa"
+// or OSW_DETECTOR_MODE. The legacy suite above pins zero regression.
+// =====================================================================================
+
+// A fake fetch returning a chat-completion body carrying {spans:[...]} (the gepa
+// shape). Mirrors fetchReturning but for the SPANS schema.
+function fetchSpans(spans, { inReasoning = false, ok = true } = {}) {
+  const payload = JSON.stringify({ spans });
+  const message = inReasoning
+    ? { content: "", reasoning_content: payload }
+    : { content: payload };
+  return vi.fn(async () => ({ ok, json: async () => ({ choices: [{ message }] }) }));
+}
+
+describe("resolveMode()", () => {
+  const saved = process.env.OSW_DETECTOR_MODE;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.OSW_DETECTOR_MODE;
+    else process.env.OSW_DETECTOR_MODE = saved;
+  });
+  it("defaults to legacy when unset and no env", () => {
+    delete process.env.OSW_DETECTOR_MODE;
+    expect(resolveMode(undefined)).toBe("legacy");
+    expect(resolveMode("")).toBe("legacy");
+  });
+  it("honours an explicit mode option (case/space-insensitive)", () => {
+    expect(resolveMode("gepa")).toBe("gepa");
+    expect(resolveMode("  GEPA ")).toBe("gepa");
+    expect(resolveMode("legacy")).toBe("legacy");
+  });
+  it("falls back to OSW_DETECTOR_MODE only when the option is unset", () => {
+    process.env.OSW_DETECTOR_MODE = "gepa";
+    expect(resolveMode(undefined)).toBe("gepa");
+    // An explicit option always wins over the env.
+    expect(resolveMode("legacy")).toBe("legacy");
+  });
+  it("an unknown value (option or env) falls back to legacy - never silently changes the shipped default", () => {
+    expect(resolveMode("banana")).toBe("legacy");
+    process.env.OSW_DETECTOR_MODE = "banana";
+    expect(resolveMode(undefined)).toBe("legacy");
+  });
+});
+
+describe("gepaLine()", () => {
+  it("renders '#idx [mm:ss] speaker: text' from start + speaker", () => {
+    expect(gepaLine(3, { start: 75, end: 80, speaker: "SPEAKER_02", text: "buy now" }))
+      .toBe("#3 [01:15] SPEAKER_02: buy now");
+  });
+  it("falls back to SPEAKER when the speaker is missing", () => {
+    expect(gepaLine(0, { start: 0, end: 2, text: "hello" }))
+      .toBe("#0 [00:00] SPEAKER: hello");
+  });
+});
+
+describe("interpTime()", () => {
+  it("interpolates a time from a char offset within the segment", () => {
+    // offset 50 of 100 chars over a 0..100s segment -> 50s.
+    expect(interpTime({ start: 0, end: 100 }, 50, 100)).toBe(50);
+  });
+  it("clamps to the segment bounds and never divides by zero", () => {
+    expect(interpTime({ start: 10, end: 20 }, 9999, 5)).toBe(20); // clamp high
+    expect(interpTime({ start: 10, end: 20 }, -5, 5)).toBe(10); // clamp low
+    // len 0 -> denom max(1,0)=1 -> frac = 3/1 = 3, clamped to 1 -> end of segment.
+    expect(interpTime({ start: 10, end: 20 }, 3, 0)).toBe(20);
+    expect(interpTime({ start: 5, end: 5 }, 3, 4)).toBe(5); // zero-duration segment
+  });
+});
+
+describe("mapQuoteToOffset()", () => {
+  const segText = "Our show today is brought to you by Acme VPN.";
+  const normSegs = [null, norm(segText), norm("Visit acme dot com for a deal.")];
+  it("maps an exact quote and reports its char offset + exact=true", () => {
+    const out = {};
+    const m = mapQuoteToOffset("brought to you by Acme VPN.", normSegs, [1, 2], out);
+    expect(m.si).toBe(1);
+    expect(m.charOff).toBe(norm(segText).indexOf(norm("brought to you by Acme VPN.")));
+    expect(m.exact).toBe(true);
+    expect(out.nonUnique).toBeUndefined();
+  });
+  it("flags exact=false (offset anchored at 0) when only a prefix/fuzzy pass matched", () => {
+    // Shares the first words but is not an exact substring -> findSeg prefix pass.
+    const m = mapQuoteToOffset("Our show today is brought to you by a totally different sponsor", normSegs, [1, 2], {});
+    expect(m.si).toBe(1);
+    expect(m.exact).toBe(false);
+    expect(m.charOff).toBe(0);
+  });
+  it("returns null when the quote maps to no segment", () => {
+    expect(mapQuoteToOffset("nowhere at all in here", normSegs, [1, 2], {})).toBeNull();
+  });
+  it("sets nonUnique when the same quote is contained by >1 window segment", () => {
+    const segs = [norm("subscribe now at example dot com"), norm("subscribe now at example dot com")];
+    const out = {};
+    mapQuoteToOffset("subscribe now at example dot com", segs, [0, 1], out);
+    expect(out.nonUnique).toBe(true);
+  });
+});
+
+describe("mapGepaSpan() - char interpolation + guards + type policy", () => {
+  // A clean two-segment ad. Segment 1 holds the opening pitch, segment 2 the close.
+  const segments = [
+    { speaker: "S", start: 0, end: 4, text: "And that ending wrecked me." },
+    { speaker: "S", start: 100, end: 110, text: "Our show today is brought to you by Acme VPN." },
+    { speaker: "S", start: 110, end: 118, text: "Visit acme dot com slash show for three months free." },
+    { speaker: "S", start: 200, end: 210, text: "So anyway, where were we." },
+  ];
+  const normSegs = segments.map((s) => norm(s.text));
+  const idxList = [0, 1, 2, 3];
+
+  it("interpolates start within the start segment and end within the end segment", () => {
+    const cut = mapGepaSpan({
+      span: {
+        type: "ad", subtype: "mid-roll",
+        start_quote: "brought to you by Acme VPN.",
+        end_quote: "Visit acme dot com slash show for three months free.",
+      },
+      segments, normSegs, idxList,
+    });
+    // start_quote sits at char 18 of seg1 (norm len 44) over 100..110 -> ~104.09s.
+    expect(cut.startIndex).toBe(1);
+    expect(cut.endIndex).toBe(2);
+    expect(cut.startSec).toBeCloseTo(100 + (18 / 44) * 10, 4);
+    // end_quote is the whole of seg2, so its end offset == norm length -> seg2.end.
+    expect(cut.endSec).toBeCloseTo(118, 4);
+    expect(cut.type).toBe("ad");
+    expect(cut.subtype).toBe("mid-roll");
+    expect(cut.needsReview).toBe(false); // clean, <45s, exact, unique, ad
+    expect(cut.reasons).toEqual([]);
+  });
+
+  it("SKIPS (returns null) when the opening quote maps to no segment - fail safe, never cut", () => {
+    const cut = mapGepaSpan({
+      span: { type: "ad", subtype: null, start_quote: "this is nowhere in the window", end_quote: "nor this" },
+      segments, normSegs, idxList,
+    });
+    expect(cut).toBeNull();
+  });
+
+  it("flags needs-review (ambiguous boundary) when only the end quote fails to map", () => {
+    const cut = mapGepaSpan({
+      span: {
+        type: "ad", subtype: null,
+        start_quote: "Our show today is brought to you by Acme VPN.",
+        end_quote: "a closing line that appears nowhere",
+      },
+      segments, normSegs, idxList,
+    });
+    expect(cut.startIndex).toBe(1);
+    expect(cut.endIndex).toBe(1); // fell back to the start segment
+    expect(cut.needsReview).toBe(true);
+    expect(cut.reasons).toContain("ambiguous-boundary");
+  });
+
+  it("GUARD: a fuzzy/prefix (non-exact) start map -> needs-review (fuzzy-map)", () => {
+    const cut = mapGepaSpan({
+      span: {
+        type: "ad", subtype: null,
+        // Shares the opening words of seg1 but is not an exact substring.
+        start_quote: "Our show today is brought to you by a different brand entirely here",
+        end_quote: "Visit acme dot com slash show for three months free.",
+      },
+      segments, normSegs, idxList,
+    });
+    expect(cut.needsReview).toBe(true);
+    expect(cut.reasons).toContain("fuzzy-map");
+  });
+
+  it("GUARD: a non-unique quote (matched in >1 segment) -> needs-review (non-unique-quote)", () => {
+    const segs = [
+      { speaker: "S", start: 0, end: 5, text: "Subscribe now at example dot com." },
+      { speaker: "S", start: 5, end: 10, text: "Subscribe now at example dot com." },
+    ];
+    const ns = segs.map((s) => norm(s.text));
+    const cut = mapGepaSpan({
+      span: {
+        type: "ad", subtype: null,
+        start_quote: "Subscribe now at example dot com.",
+        end_quote: "Subscribe now at example dot com.",
+      },
+      segments: segs, normSegs: ns, idxList: [0, 1],
+    });
+    expect(cut.needsReview).toBe(true);
+    expect(cut.reasons).toContain("non-unique-quote");
+  });
+
+  it("GUARD: span duration over the 45s HARD cap -> needs-review (hard-cap)", () => {
+    // A single 80s segment; the quoted span runs most of it -> > 45s.
+    const segs = [
+      { speaker: "S", start: 0, end: 80, text: "Our sponsor today is Acme and here is a very long read about everything Acme does and a code." },
+    ];
+    const ns = segs.map((s) => norm(s.text));
+    const cut = mapGepaSpan({
+      span: {
+        type: "ad", subtype: null,
+        start_quote: "Our sponsor today is Acme",
+        end_quote: "and a code",
+      },
+      segments: segs, normSegs: ns, idxList: [0],
+    });
+    expect(cut.endSec - cut.startSec).toBeGreaterThan(HARD_AUTOCUT_MAX_SEC);
+    expect(cut.needsReview).toBe(true);
+    expect(cut.reasons).toContain("hard-cap");
+  });
+
+  it("GUARD: start+end in the SAME long (>=45s) turn covering most of it -> needs-review (long-turn-most)", () => {
+    const segs = [
+      { speaker: "S", start: 0, end: 60, text: "Acme sponsor read start blah blah blah lots of filler words here in one long diarized turn end code." },
+    ];
+    const ns = segs.map((s) => norm(s.text));
+    const cut = mapGepaSpan({
+      span: {
+        type: "ad", subtype: null,
+        start_quote: "Acme sponsor read start",
+        end_quote: "end code",
+      },
+      segments: segs, normSegs: ns, idxList: [0],
+    });
+    expect(cut.startIndex).toBe(0);
+    expect(cut.endIndex).toBe(0);
+    expect(cut.needsReview).toBe(true);
+    expect(cut.reasons).toContain("long-turn-most");
+  });
+
+  it("GUARD: degenerate interpolation (end<=start) falls back to whole span AND flags", () => {
+    // Force end offset < start offset within the same segment by quoting a LATER
+    // phrase as start and an EARLIER phrase as end.
+    const segs = [
+      { speaker: "S", start: 0, end: 10, text: "alpha beta gamma delta epsilon." },
+    ];
+    const ns = segs.map((s) => norm(s.text));
+    const cut = mapGepaSpan({
+      span: { type: "ad", subtype: null, start_quote: "epsilon", end_quote: "alpha" },
+      segments: segs, normSegs: ns, idxList: [0],
+    });
+    expect(cut.needsReview).toBe(true);
+    expect(cut.reasons).toContain("interp-degenerate");
+    // The fallback is the whole-segment span.
+    expect(cut.startSec).toBe(0);
+    expect(cut.endSec).toBe(10);
+  });
+
+  it("TYPE POLICY: intro/outro/housekeeping are forced needs-review even when short + clean", () => {
+    for (const type of ["intro", "outro", "housekeeping"]) {
+      const cut = mapGepaSpan({
+        span: {
+          type, subtype: null,
+          start_quote: "Our show today is brought to you by Acme VPN.",
+          end_quote: "Our show today is brought to you by Acme VPN.",
+        },
+        segments, normSegs, idxList,
+      });
+      expect(cut.type).toBe(type);
+      expect(cut.needsReview).toBe(true);
+      expect(cut.reasons).toContain(`type-${type}`);
+    }
+  });
+
+  it("TYPE POLICY: type 'ad' stays auto-cut-eligible (carries type/subtype, not flagged by type)", () => {
+    const cut = mapGepaSpan({
+      span: {
+        type: "ad", subtype: "pre-roll",
+        start_quote: "Our show today is brought to you by Acme VPN.",
+        end_quote: "Visit acme dot com slash show for three months free.",
+      },
+      segments, normSegs, idxList,
+    });
+    expect(cut.type).toBe("ad");
+    expect(cut.subtype).toBe("pre-roll");
+    expect(cut.needsReview).toBe(false);
+    expect(cut.reasons.some((r) => r.startsWith("type-"))).toBe(false);
+  });
+
+  it("GUARD: sensitivity can never RAISE the 45s hard cap", () => {
+    const segs = [
+      { speaker: "S", start: 0, end: 80, text: "Our sponsor today is Acme and here is a very long read about everything Acme does and a code." },
+    ];
+    const ns = segs.map((s) => norm(s.text));
+    // A hugely permissive needsReviewMaxSec must NOT let a >45s span auto-apply.
+    const cut = mapGepaSpan({
+      span: { type: "ad", subtype: null, start_quote: "Our sponsor today is Acme", end_quote: "and a code" },
+      segments: segs, normSegs: ns, idxList: [0], needsReviewMaxSec: 100000,
+    });
+    expect(cut.needsReview).toBe(true);
+    expect(cut.reasons).toContain("hard-cap");
+  });
+});
+
+describe("detectAds() gepa mode - end to end", () => {
+  const saved = process.env.OSW_DETECTOR_MODE;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.OSW_DETECTOR_MODE;
+    else process.env.OSW_DETECTOR_MODE = saved;
+  });
+
+  const GEPA_AD = {
+    segments: [
+      { speaker: "SPEAKER_00", start: 0, end: 4, text: "And honestly that ending wrecked me." },
+      { speaker: "SPEAKER_00", start: 100, end: 110, text: "Our show today is brought to you by Acme VPN." },
+      { speaker: "SPEAKER_00", start: 110, end: 118, text: "Visit acme dot com slash show for three months free." },
+      { speaker: "SPEAKER_01", start: 200, end: 205, text: "So anyway, where were we." },
+    ],
+  };
+  const cleanSpan = [{
+    type: "ad", subtype: "mid-roll",
+    start_quote: "Our show today is brought to you by Acme VPN.",
+    end_quote: "Visit acme dot com slash show for three months free.",
+  }];
+
+  it("posts the GEPA prompt + SPANS schema + '#idx [mm:ss] speaker:' lines when mode='gepa'", async () => {
+    const fetch = fetchSpans([]);
+    await detectAds({ transcript: GEPA_AD, fetch, mode: "gepa" });
+    const [, opts] = fetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.messages[0].content).toBe(GEPA_INSTRUCTION);
+    expect(body.response_format).toEqual(SPANS_SCHEMA);
+    expect(body.response_format.json_schema.strict).toBe(true);
+    // GEPA line format, not the legacy "<idx>. <text>".
+    expect(body.messages[1].content).toContain("#1 [01:40] SPEAKER_00: Our show today is brought to you by Acme VPN.");
+  });
+
+  it("maps a clean ad by char interpolation and auto-applies it", async () => {
+    const { ads, stats } = await detectAds({ transcript: GEPA_AD, fetch: fetchSpans(cleanSpan), mode: "gepa" });
+    expect(ads).toHaveLength(1);
+    expect(ads[0].startIndex).toBe(1);
+    expect(ads[0].endIndex).toBe(2);
+    // start_quote is the WHOLE of seg1 (charOff 0) -> seg1.start exactly.
+    expect(ads[0].startSec).toBeCloseTo(100, 3);
+    // end_quote is the WHOLE of seg2 (end offset == norm length) -> seg2.end exactly.
+    expect(ads[0].endSec).toBeCloseTo(118, 3);
+    expect(ads[0].needsReview).toBe(false);
+    expect(ads[0].type).toBe("ad");
+    expect(stats.adsReturned).toBe(1);
+    expect(stats.quoteMapFailures).toBe(0);
+  });
+
+  it("honours OSW_DETECTOR_MODE=gepa when mode is unset", async () => {
+    process.env.OSW_DETECTOR_MODE = "gepa";
+    const fetch = fetchSpans([]);
+    await detectAds({ transcript: GEPA_AD, fetch });
+    const body = JSON.parse(fetch.mock.calls[0][1].body);
+    expect(body.messages[0].content).toBe(GEPA_INSTRUCTION);
+    expect(body.response_format).toEqual(SPANS_SCHEMA);
+  });
+
+  it("CARDINAL: skips an ad whose opening quote maps to no segment (quote-map fail)", async () => {
+    const span = [{ type: "ad", subtype: null, start_quote: "nowhere in this episode at all", end_quote: "nor here" }];
+    const { ads, stats } = await detectAds({ transcript: GEPA_AD, fetch: fetchSpans(span), mode: "gepa" });
+    expect(ads).toEqual([]);
+    expect(stats.quoteMapFailures).toBe(1);
+  });
+
+  it("uses the reasoning_content fallback in gepa mode too", async () => {
+    const { ads } = await detectAds({ transcript: GEPA_AD, fetch: fetchSpans(cleanSpan, { inReasoning: true }), mode: "gepa" });
+    expect(ads).toHaveLength(1);
+    expect(ads[0].startIndex).toBe(1);
+  });
+
+  it("forces intro/outro/housekeeping spans to needs-review end to end", async () => {
+    const span = [{
+      type: "housekeeping", subtype: null,
+      start_quote: "Our show today is brought to you by Acme VPN.",
+      end_quote: "Our show today is brought to you by Acme VPN.",
+    }];
+    const { ads } = await detectAds({ transcript: GEPA_AD, fetch: fetchSpans(span), mode: "gepa" });
+    expect(ads).toHaveLength(1);
+    expect(ads[0].needsReview).toBe(true);
+    expect(ads[0].reasons).toContain("type-housekeeping");
+  });
+
+  it("de-dupes the same span across overlapping windows, keeping the safer flagging", async () => {
+    // Place the ad deep enough to fall in two overlapping windows.
+    const segments = [
+      { speaker: "S", start: 0, end: 5, text: "early chatter" },
+      { speaker: "S", start: 1650, end: 1660, text: "Our show today is brought to you by Acme VPN." },
+      { speaker: "S", start: 1660, end: 1668, text: "Visit acme dot com slash show for three months free." },
+      { speaker: "S", start: 1700, end: 1705, text: "back to the topic" },
+    ];
+    const wins = buildWindows(toSegments({ segments }));
+    expect(wins.length).toBeGreaterThanOrEqual(2);
+    const { ads } = await detectAds({ transcript: { segments }, fetch: fetchSpans(cleanSpan), mode: "gepa" });
+    expect(ads).toHaveLength(1);
+    expect(ads[0].startIndex).toBe(1);
+    expect(ads[0].endIndex).toBe(2);
+  });
+
+  it("degrades to no cuts when the gepa model output is unparseable", async () => {
+    const fetch = vi.fn(async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: "not json" } }] }) }));
+    const { ads } = await detectAds({ transcript: GEPA_AD, fetch, mode: "gepa" });
+    expect(ads).toEqual([]);
+  });
+
+  it("CARDINAL: a flagged sighting in one window is NEVER cleared by an unflagged sighting of the same span in another", async () => {
+    // The same index range appears in two overlapping windows. Window 0 sees it as a
+    // clean `ad` (would auto-apply); window 1 sees the SAME span as `housekeeping`
+    // (always needsReview by type policy). The merged cut MUST stay needsReview - a
+    // second unflagged sighting can never un-hold a held span (and vice-versa).
+    const segments = [
+      { speaker: "S", start: 0, end: 5, text: "early chatter" },
+      { speaker: "S", start: 1650, end: 1660, text: "Our show today is brought to you by Acme VPN." },
+      { speaker: "S", start: 1660, end: 1668, text: "Visit acme dot com slash show for three months free." },
+      { speaker: "S", start: 1700, end: 1705, text: "back to the topic" },
+    ];
+    const wins = buildWindows(toSegments({ segments }));
+    expect(wins.length).toBeGreaterThanOrEqual(2);
+    const cleanAd = {
+      type: "ad", subtype: "mid-roll",
+      start_quote: "Our show today is brought to you by Acme VPN.",
+      end_quote: "Visit acme dot com slash show for three months free.",
+    };
+    const flaggedSameSpan = { ...cleanAd, type: "housekeeping", subtype: null };
+    // Window 0 -> clean ad; window 1 -> same geometry, flagged housekeeping.
+    let call = 0;
+    const fetch = vi.fn(async () => {
+      call += 1;
+      const spans = call === 1 ? [cleanAd] : [flaggedSameSpan];
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ spans }) } }] }) };
+    });
+    const { ads } = await detectAds({ transcript: { segments }, fetch, mode: "gepa" });
+    expect(fetch.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(ads).toHaveLength(1);
+    expect(ads[0].startIndex).toBe(1);
+    expect(ads[0].endIndex).toBe(2);
+    // The flag set by the housekeeping sighting survives the clean-ad sighting.
+    expect(ads[0].needsReview).toBe(true);
+    expect(ads[0].reasons).toContain("type-housekeeping");
+  });
+
+  it("the merge order does not matter: flagged-first then clean stays flagged too", async () => {
+    // Same as above but the FLAGGED sighting arrives FIRST and the clean one second,
+    // proving the OR is symmetric (a later clean sighting cannot clear an early flag).
+    const segments = [
+      { speaker: "S", start: 0, end: 5, text: "early chatter" },
+      { speaker: "S", start: 1650, end: 1660, text: "Our show today is brought to you by Acme VPN." },
+      { speaker: "S", start: 1660, end: 1668, text: "Visit acme dot com slash show for three months free." },
+      { speaker: "S", start: 1700, end: 1705, text: "back to the topic" },
+    ];
+    const cleanAd = {
+      type: "ad", subtype: "mid-roll",
+      start_quote: "Our show today is brought to you by Acme VPN.",
+      end_quote: "Visit acme dot com slash show for three months free.",
+    };
+    const flaggedSameSpan = { ...cleanAd, type: "outro", subtype: null };
+    let call = 0;
+    const fetch = vi.fn(async () => {
+      call += 1;
+      const spans = call === 1 ? [flaggedSameSpan] : [cleanAd];
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ spans }) } }] }) };
+    });
+    const { ads } = await detectAds({ transcript: { segments }, fetch, mode: "gepa" });
+    expect(ads).toHaveLength(1);
+    expect(ads[0].needsReview).toBe(true);
+    expect(ads[0].reasons).toContain("type-outro");
+  });
+});
+
+describe("ZERO REGRESSION: legacy mode is byte-for-byte unchanged by the gepa work", () => {
+  const LEGACY_AD = {
+    segments: [
+      { speaker: "SPEAKER_00", start: 0, end: 4, text: "And honestly that ending wrecked me, best film of the year." },
+      { speaker: "SPEAKER_00", start: 4, end: 9, text: "Our show today is brought to you by Acme VPN." },
+      { speaker: "SPEAKER_00", start: 9, end: 14, text: "Acme encrypts everything. Visit Acme dot com slash show for three months free." },
+      { speaker: "SPEAKER_01", start: 14, end: 18, text: "We're back. So anyway, where were we on the Scorsese thing?" },
+    ],
+  };
+  const legacyQuotes = [{
+    first_line: "Our show today is brought to you by Acme VPN.",
+    last_line: "Visit Acme dot com slash show for three months free.",
+  }];
+
+  it("the DEFAULT (no mode, no env) posts VERIFY_INSTRUCTION + ADS_SCHEMA + '<idx>. <text>' lines", async () => {
+    const saved = process.env.OSW_DETECTOR_MODE;
+    delete process.env.OSW_DETECTOR_MODE;
+    try {
+      const fetch = fetchReturning([]);
+      await detectAds({ transcript: LEGACY_AD, fetch });
+      const body = JSON.parse(fetch.mock.calls[0][1].body);
+      expect(body.messages[0].content).toBe(VERIFY_INSTRUCTION);
+      expect(body.response_format).toEqual(ADS_SCHEMA);
+      // Legacy line format, not the gepa "#idx [mm:ss]" one.
+      expect(body.messages[1].content).toContain("1. Our show today is brought to you by Acme VPN.");
+      expect(body.messages[1].content).not.toContain("#1 [");
+    } finally {
+      if (saved === undefined) delete process.env.OSW_DETECTOR_MODE;
+      else process.env.OSW_DETECTOR_MODE = saved;
+    }
+  });
+
+  it("the DEFAULT maps a clean ad to whole-segment indices + start/end and auto-applies (unchanged shape)", async () => {
+    const { ads, stats } = await detectAds({ transcript: LEGACY_AD, fetch: fetchReturning(legacyQuotes) });
+    expect(ads).toHaveLength(1);
+    expect(ads[0]).toEqual({
+      startIndex: 1,
+      endIndex: 2,
+      startSec: 4, // whole-segment start (NOT char-interpolated)
+      endSec: 14, // whole-segment end
+      needsReview: false,
+      reasons: [],
+    });
+    // Legacy ad objects carry NO type/subtype keys (that is a gepa-only addition).
+    expect("type" in ads[0]).toBe(false);
+    expect("subtype" in ads[0]).toBe(false);
+    expect(stats.adsReturned).toBe(1);
+    expect(stats.quoteMapFailures).toBe(0);
+  });
+
+  it("explicit mode:'legacy' behaves identically to the default", async () => {
+    const a = await detectAds({ transcript: LEGACY_AD, fetch: fetchReturning(legacyQuotes) });
+    const b = await detectAds({ transcript: LEGACY_AD, fetch: fetchReturning(legacyQuotes), mode: "legacy" });
+    expect(b.ads).toEqual(a.ads);
   });
 });

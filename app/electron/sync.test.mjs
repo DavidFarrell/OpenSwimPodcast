@@ -857,20 +857,54 @@ describe("adToCut positional intro/outro handling", () => {
   it("preserves the needsReview flag from the detector", () => {
     const cut = adToCut({ ad: { startSec: 900, endSec: 1000, needsReview: true, reasons: ["over-threshold"] }, segments });
     expect(cut.needsReview).toBe(true);
-    expect(cut.reasons).toEqual(["over-threshold"]);
+    // The detector's reason is preserved; the post-snap guard also fires here (the
+    // 100s span > 45s hard cap) and appends its own reason - union, never dropped.
+    expect(cut.reasons).toContain("over-threshold");
+    expect(cut.reasons).toContain("post-snap-hard-cap");
+  });
+
+  // The post-edge-snap hard cap (GPT-5 guard spec) holds ANY final cut > 45s for
+  // review, independent of detector mode and sensitivity, even a clean mid-roll the
+  // detector did not flag. A short cut that the edge-snap GROWS by > 15s is held too.
+  it("holds a clean >45s mid-roll for review via the post-snap hard cap", () => {
+    const cut = adToCut({ ad: { startSec: 900, endSec: 1000, needsReview: false, reasons: [] }, segments });
+    expect(cut.needsReview).toBe(true);
+    expect(cut.reasons).toContain("post-snap-hard-cap");
+    // The boundaries themselves are untouched - we only flag, never re-cut here.
+    expect(cut.startSec).toBe(900);
+    expect(cut.endSec).toBe(1000);
+  });
+
+  it("leaves a clean <=45s mid-roll auto-applyable (within both caps -> not newly flagged)", () => {
+    const cut = adToCut({ ad: { startSec: 900, endSec: 930, needsReview: false, reasons: [] }, segments });
+    expect(cut.needsReview).toBe(false);
+    expect(cut.reasons).toEqual([]);
+    expect(cut.label).toBe("ad");
+  });
+
+  it("holds a short cut that the edge-snap grows by > 15s (snap-growth guard)", () => {
+    // A 5s block ending 40s before the episode end (1800), but within EDGE_SNAP_SEC
+    // (45s) of it: the trailing edge-snap extends it to 1800, growing it from 5s to
+    // 40s (35s growth, > 15s) -> held for review.
+    const cut = adToCut({ ad: { startSec: 1760, endSec: 1765, needsReview: false, reasons: [] }, segments });
+    expect(cut.endSec).toBe(1800); // snapped to the episode end
+    expect(cut.needsReview).toBe(true);
+    expect(cut.reasons).toContain("edge-snap-growth");
   });
 });
 
 describe("generateCuts", () => {
   it("returns ready with cuts when the detector finds clean ads", async () => {
+    // A clean mid-roll within the 45s hard cap (and far from the episode edges, so
+    // no edge-snap) auto-applies -> status ready.
     const transcribeFn = vi.fn(async () => ({ segments: [
       { start: 0, end: 10, text: "intro" },
-      { start: 600, end: 700, text: "ad" },
+      { start: 600, end: 630, text: "ad" },
       { start: 700, end: 1300, text: "content" },
     ] }));
     const detectAdsFn = vi.fn(async ({ transcript }) => {
       expect(transcript).toBeTruthy();
-      return { ads: [{ startIndex: 1, endIndex: 1, startSec: 600, endSec: 700, needsReview: false, reasons: [] }], stats: {} };
+      return { ads: [{ startIndex: 1, endIndex: 1, startSec: 600, endSec: 630, needsReview: false, reasons: [] }], stats: {} };
     });
     const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn });
     expect(out.status).toBe("ready");
@@ -923,6 +957,28 @@ describe("generateCuts", () => {
       return { ads: [], stats: {} };
     });
     await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn });
+    expect(detectAdsFn).toHaveBeenCalledOnce();
+  });
+
+  // Detector mode threading: the shipped pipeline must ALWAYS pass an explicit
+  // mode, so a stray OSW_DETECTOR_MODE env can never flip production to gepa.
+  it("calls the detector with an explicit mode 'legacy' by default", async () => {
+    const transcribeFn = vi.fn(async () => ({ segments: [{ start: 0, end: 10, text: "hi" }] }));
+    const detectAdsFn = vi.fn(async ({ mode }) => {
+      expect(mode).toBe("legacy");
+      return { ads: [], stats: {} };
+    });
+    await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn });
+    expect(detectAdsFn).toHaveBeenCalledOnce();
+  });
+
+  it("threads an explicit detectorMode:'gepa' through to the detector (Phase 2 head-to-head)", async () => {
+    const transcribeFn = vi.fn(async () => ({ segments: [{ start: 0, end: 10, text: "hi" }] }));
+    const detectAdsFn = vi.fn(async ({ mode }) => {
+      expect(mode).toBe("gepa");
+      return { ads: [], stats: {} };
+    });
+    await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, detectorMode: "gepa" });
     expect(detectAdsFn).toHaveBeenCalledOnce();
   });
 
@@ -1081,17 +1137,18 @@ describe("runSync trim stage", () => {
       expect(src).toBe(path.join(cacheDir, "a.mp3"));
       return { segments: [
         { start: 0, end: 10, text: "hello" },
-        { start: 600, end: 700, text: "this ad" },
+        { start: 600, end: 640, text: "this ad" },
         { start: 700, end: 1300, text: "back to it" },
       ] };
     });
+    // A clean 40s mid-roll (within the 45s hard cap, away from edges) auto-applies.
     const detectAdsFn = vi.fn(async () => ({
-      ads: [{ startIndex: 1, endIndex: 1, startSec: 600, endSec: 700, needsReview: false, reasons: [] }],
+      ads: [{ startIndex: 1, endIndex: 1, startSec: 600, endSec: 640, needsReview: false, reasons: [] }],
       stats: {},
     }));
     const convertFn = vi.fn(async ({ src, dest, cuts }) => {
       expect(src).toBe(path.join(cacheDir, "a.mp3"));
-      expect(cuts).toEqual([[600, 700]]);
+      expect(cuts).toEqual([[600, 640]]);
       fs.writeFileSync(dest, Buffer.from("trimmed mp3"));
       return { bytes: 11, durationSec: 60, fromCache: false };
     });
@@ -1119,21 +1176,22 @@ describe("runSync trim stage", () => {
 
     const transcribeFn = vi.fn(async () => ({ segments: [
       { start: 0, end: 10, text: "x" },
-      { start: 600, end: 700, text: "clean ad" },
+      { start: 600, end: 640, text: "clean ad" },
       { start: 700, end: 1300, text: "y" },
       { start: 1300, end: 1700, text: "long sketchy ad" },
     ] }));
-    // One clean cut, one needs-review cut. Only the clean one may reach convert.
+    // One clean cut (40s, within the hard cap), one needs-review cut. Only the clean
+    // one may reach convert; the flagged 400s mid-roll is held back.
     const detectAdsFn = vi.fn(async () => ({
       ads: [
-        { startSec: 600, endSec: 700, needsReview: false, reasons: [] },
+        { startSec: 600, endSec: 640, needsReview: false, reasons: [] },
         { startSec: 1300, endSec: 1700, needsReview: true, reasons: ["over-threshold"] },
       ],
       stats: {},
     }));
     const convertFn = vi.fn(async ({ dest, cuts }) => {
       // The needs-review [1300,1700] cut must NOT be present.
-      expect(cuts).toEqual([[600, 700]]);
+      expect(cuts).toEqual([[600, 640]]);
       fs.writeFileSync(dest, Buffer.from("partially trimmed"));
       return { bytes: 17, durationSec: 60, fromCache: false };
     });
@@ -1206,11 +1264,12 @@ describe("runSync trim stage", () => {
 
     const transcribeFn = vi.fn(async () => ({ segments: [
       { start: 0, end: 10, text: "x" },
-      { start: 600, end: 700, text: "ad" },
+      { start: 600, end: 640, text: "ad" },
       { start: 700, end: 1300, text: "y" },
     ] }));
+    // A clean 40s mid-roll (within the hard cap) auto-applies.
     const detectAdsFn = vi.fn(async () => ({
-      ads: [{ startSec: 600, endSec: 700, needsReview: false, reasons: [] }],
+      ads: [{ startSec: 600, endSec: 640, needsReview: false, reasons: [] }],
       stats: {},
     }));
     // First call (with cuts) throws; retry without cuts is a plain speed-1.0 mp3
@@ -1271,11 +1330,12 @@ describe("runSync trim stage", () => {
 
     const transcribeFn = vi.fn(async () => ({ segments: [
       { start: 0, end: 10, text: "x" },
-      { start: 600, end: 700, text: "ad" },
+      { start: 600, end: 640, text: "ad" },
       { start: 700, end: 1300, text: "y" },
     ] }));
+    // A clean 40s mid-roll (within the hard cap) auto-applies.
     const detectAdsFn = vi.fn(async () => ({
-      ads: [{ startSec: 600, endSec: 700, needsReview: false, reasons: [] }],
+      ads: [{ startSec: 600, endSec: 640, needsReview: false, reasons: [] }],
       stats: {},
     }));
     const convertFn = vi.fn(async ({ cuts, dest, speed }) => {
@@ -1307,12 +1367,14 @@ describe("runSync trim stage", () => {
 
     const transcribeFn = vi.fn(async () => ({ segments: [
       { start: 0, end: 10, text: "hello" },
-      { start: 600, end: 700, text: "this ad" },
+      { start: 600, end: 640, text: "this ad" },
       { start: 700, end: 1300, text: "back to it" },
     ] }));
+    // A clean 40s mid-roll (within the 45s post-snap hard cap) auto-applies, so the
+    // converter still receives a cut and the model-threading assertion holds.
     const detectAdsFn = vi.fn(async ({ model }) => {
       expect(model).toBe("qwen/qwen3-14b");
-      return { ads: [{ startSec: 600, endSec: 700, needsReview: false, reasons: [] }], stats: {} };
+      return { ads: [{ startSec: 600, endSec: 640, needsReview: false, reasons: [] }], stats: {} };
     });
     const buildAnnouncementTextFn = vi.fn(async ({ llm }) => {
       expect(llm).toBeTruthy();
@@ -1324,7 +1386,7 @@ describe("runSync trim stage", () => {
       return outPath;
     });
     const convertFn = vi.fn(async ({ dest, cuts }) => {
-      expect(cuts).toEqual([[600, 700]]);
+      expect(cuts).toEqual([[600, 640]]);
       fs.writeFileSync(dest, Buffer.from("trimmed mp3"));
       return { bytes: 11, durationSec: 60, fromCache: false };
     });
@@ -1368,6 +1430,25 @@ describe("runSync trim stage", () => {
       onEvent: () => {},
     });
 
+    expect(res.ok).toBe(true);
+    expect(detectAdsFn).toHaveBeenCalledOnce();
+  });
+
+  // The shipped pipeline path (runSync, no detectorMode set - as ipc.cjs calls it)
+  // must hand the detector an explicit mode 'legacy', so a stray OSW_DETECTOR_MODE
+  // env can never flip production to gepa.
+  it("runSync calls the detector with mode 'legacy' by default (env can't flip production)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+    const transcribeFn = vi.fn(async () => ({ segments: [{ start: 0, end: 10, text: "hi" }] }));
+    const detectAdsFn = vi.fn(async ({ mode }) => {
+      expect(mode).toBe("legacy");
+      return { ads: [], stats: {} };
+    });
+    const convertFn = vi.fn(async ({ dest }) => { fs.writeFileSync(dest, Buffer.from("uncut")); return { bytes: 5, durationSec: 60, fromCache: false }; });
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn, detectAdsFn, convertFn, onEvent: () => {},
+    });
     expect(res.ok).toBe(true);
     expect(detectAdsFn).toHaveBeenCalledOnce();
   });
@@ -1477,13 +1558,19 @@ describe("runSync trim stage", () => {
 
   it("no gate when every cut is confident: awaitReview is never called", async () => {
     fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
-    const transcribeFn = flaggedTranscribe();
+    // A confident mid-roll within the 45s hard cap (and away from edges, so no
+    // edge-snap) -> nothing flagged -> the review gate is skipped entirely.
+    const transcribeFn = vi.fn(async () => ({ segments: [
+      { start: 0, end: 50, text: "open" },
+      { start: 200, end: 240, text: "clean mid-roll" },
+      { start: 380, end: 1200, text: "rest of the show" },
+    ] }));
     const detectAdsFn = vi.fn(async () => ({
-      ads: [{ startSec: 200, endSec: 380, needsReview: false, reasons: [] }],
+      ads: [{ startSec: 200, endSec: 240, needsReview: false, reasons: [] }],
       stats: {},
     }));
     const convertFn = vi.fn(async ({ dest, cuts }) => {
-      expect(cuts).toEqual([[200, 380]]);
+      expect(cuts).toEqual([[200, 240]]);
       fs.writeFileSync(dest, Buffer.from("auto-trimmed"));
       return { bytes: 12, durationSec: 60, fromCache: false };
     });

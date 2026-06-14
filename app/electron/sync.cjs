@@ -18,6 +18,18 @@ const { logEvent } = require("./logger.cjs");
 // last segment's end.
 const EDGE_SNAP_SEC = 45;
 
+// Post-edge-snap safety net (GPT-5 guard spec, cardinal-critical). The edge-snap
+// above can extend a cut all the way to 0 / the episode end; a short detected span
+// that snaps to a long edge cut must not auto-apply. So AFTER the snap, a cut is
+// forced needsReview (held back, never auto-applied) if the FINAL duration exceeds
+// HARD_FINAL_CUT_MAX_SEC, or if the snap GREW the cut by more than
+// EDGE_SNAP_GROWTH_MAX_SEC. This applies regardless of detector mode (it is a net,
+// not a mode feature) and is INDEPENDENT of sensitivity. A cut already within both
+// bounds keeps its original flagging, so nothing legacy used to auto-apply is newly
+// held unless it breaches one of these caps.
+const HARD_FINAL_CUT_MAX_SEC = 45;
+const EDGE_SNAP_GROWTH_MAX_SEC = 15;
+
 // Bumped whenever the intro CHANGES in a way that the variant cache key would not
 // otherwise capture - the intro WORDING (Fix 1: episode/season number + publish
 // date now spoken) or how the intro is PROCESSED (the sibling lane now speeds +
@@ -270,6 +282,11 @@ function adToCut({ ad, segments }) {
   let endSec = ad.endSec;
   const labels = [];
 
+  // The detected span BEFORE any edge-snap, so the post-snap guard can measure how
+  // much the snap grew the cut.
+  const preSnapStart = startSec;
+  const preSnapEnd = endSec;
+
   const firstSeg = segments[0];
   const lastSeg = segments[segments.length - 1];
   const episodeStart = firstSeg ? firstSeg.start : 0;
@@ -297,10 +314,29 @@ function adToCut({ ad, segments }) {
 
   if (labels.length === 0) labels.push("ad");
 
+  // Post-edge-snap guard (safety net, all modes). If the snap pushed the FINAL cut
+  // over the hard cap, or grew it by more than the allowed amount, hold it for
+  // review. We only ADD flagging here - a cut already flagged stays flagged, and a
+  // cut within both bounds is left exactly as it came in (legacy auto-applies stay
+  // auto-applied). Independent of sensitivity; the caps are absolute.
+  let needsReview = !!ad.needsReview;
+  const finalDur = (Number.isFinite(startSec) && Number.isFinite(endSec)) ? endSec - startSec : null;
+  const preSnapDur = (Number.isFinite(preSnapStart) && Number.isFinite(preSnapEnd))
+    ? preSnapEnd - preSnapStart : null;
+  const growth = (finalDur != null && preSnapDur != null) ? finalDur - preSnapDur : 0;
+  if (finalDur != null && finalDur > HARD_FINAL_CUT_MAX_SEC) {
+    needsReview = true;
+    if (!reasons.includes("post-snap-hard-cap")) reasons.push("post-snap-hard-cap");
+  }
+  if (growth > EDGE_SNAP_GROWTH_MAX_SEC) {
+    needsReview = true;
+    if (!reasons.includes("edge-snap-growth")) reasons.push("edge-snap-growth");
+  }
+
   return {
     startSec,
     endSec,
-    needsReview: !!ad.needsReview,
+    needsReview,
     reasons,
     label: labels.join("+"),
   };
@@ -326,6 +362,12 @@ function adToCut({ ad, segments }) {
 // (the cut list is flagged exactly as detected). Never throws into the pipeline.
 async function generateCuts({
   src, transcribeFn, detectAdsFn, llmFetch, model, needsReviewMaxSec, signal,
+  // The detector mode, passed EXPLICITLY into detectAds. Defaults to "legacy" so
+  // the shipped pipeline is always the locked detector, NEVER the env-driven
+  // fallback (a stray OSW_DETECTOR_MODE must never flip production to gepa). The
+  // production caller (ipc.cjs) does not set this, so it stays "legacy"; Phase 2's
+  // head-to-head calls with detectorMode:"gepa".
+  detectorMode = "legacy",
   readDecisionsFn = defaultReadDecisions,
   transcript: providedTranscript, hasTranscript = false,
 }) {
@@ -352,7 +394,10 @@ async function generateCuts({
       // model is the user-picked LM Studio model id (P4a). When undefined,
       // detectAds falls back to its own LMSTUDIO_MODEL default, so the locked
       // detector keeps working unchanged.
-      const detectArgs = { transcript, fetch: llmFetch, signal };
+      // mode is passed EXPLICITLY (default "legacy") so detectAds never falls back
+      // to OSW_DETECTOR_MODE on the production path - the shipped pipeline is always
+      // the locked detector unless a caller deliberately opts into "gepa".
+      const detectArgs = { transcript, fetch: llmFetch, signal, mode: detectorMode };
       if (model) detectArgs.model = model;
       // needsReviewMaxSec is the user-picked sensitivity threshold (P4b). When
       // undefined, detectAds falls back to its own NEEDS_REVIEW_MAX_SEC default,
@@ -418,6 +463,11 @@ async function runSync({
   // ACTUAL processed duration instead of the original feed length.
   probeDurationFn = async () => null,
   llm, llmFetch, model, needsReviewMaxSec,
+  // Detector mode for the whole run, threaded into generateCuts -> detectAds.
+  // Defaults to "legacy"; the production caller (ipc.cjs) leaves it unset so the
+  // shipped pipeline is always the locked detector. Phase 2's head-to-head passes
+  // detectorMode:"gepa" here.
+  detectorMode = "legacy",
   onEvent,
   signal,
 } = {}) {
@@ -530,7 +580,7 @@ async function runSync({
       let res;
       try {
         res = await generateCuts({
-          src, transcribeFn, detectAdsFn, readDecisionsFn, llmFetch, model, needsReviewMaxSec, signal,
+          src, transcribeFn, detectAdsFn, readDecisionsFn, llmFetch, model, needsReviewMaxSec, detectorMode, signal,
           transcript, hasTranscript: true,
         });
       } catch (e) {
@@ -848,4 +898,4 @@ async function runSync({
   return { ok: true, files: dests, transferred, totals };
 }
 
-module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, generateCuts, adToCut, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE, EDGE_SNAP_SEC, INTRO_PIPELINE_VERSION };
+module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, generateCuts, adToCut, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE, EDGE_SNAP_SEC, HARD_FINAL_CUT_MAX_SEC, EDGE_SNAP_GROWTH_MAX_SEC, INTRO_PIPELINE_VERSION };
