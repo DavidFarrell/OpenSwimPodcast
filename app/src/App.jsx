@@ -23,12 +23,16 @@ import { loadModel, saveModel, MODEL_OPTIONS } from "./modelPrefs.js";
 import {
   loadSensitivity, saveSensitivity, thresholdSecFor, SENSITIVITY_OPTIONS,
 } from "./sensitivityPrefs.js";
+import { loadBootRoute, saveRoute } from "./bootRoute.js";
 
 const pc = () => (typeof window !== "undefined" && window.openswim && window.openswim.pocketcasts) || null;
 
 export default function App() {
   const [connected, setConnected] = useState(false);
-  const [route, setRouteRaw] = useState(() => localStorage.getItem("os_route") || "up-next");
+  // Always boot to the queue (Fix 2). A saved os_route is deliberately NOT
+  // restored on boot, so a cold start can never land on the transient
+  // "syncing" Transfer screen. Within-session navigation still persists below.
+  const [route, setRouteRaw] = useState(() => loadBootRoute());
   const [playbackSpeed, setPlaybackSpeedRaw] = useState(() => {
     const v = parseFloat(localStorage.getItem("os_playbackSpeed"));
     return Number.isFinite(v) && v > 0 ? v : 1.0;
@@ -149,7 +153,10 @@ export default function App() {
   const [feedError, setFeedError] = useState(null);
   const { byUuid: downloadByUuid, ensure: ensureDownload, reconcile: reconcileDownloads } = useDownloads();
 
-  useEffect(() => { localStorage.setItem("os_route", route); }, [route]);
+  // Persist the current route within the session. This is NOT restored on boot
+  // (loadBootRoute always returns "up-next"); kept only so the value reflects the
+  // live route. Never causes a non-"up-next" boot.
+  useEffect(() => { saveRoute(route); }, [route]);
 
   // Push the effective per-episode Announce intent to the S5 IPC for every queued
   // episode. We record an explicit ON or OFF per uuid (never just ON) so the S5

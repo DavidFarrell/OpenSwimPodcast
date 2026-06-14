@@ -111,6 +111,13 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       url: it.url,
       show: it.show,
       title: it.title,
+      // Deterministic intro metadata (Fix 1) - threaded to announce.cjs via the
+      // IPC layer (which spreads ...it) and sync.cjs generateIntro. published is
+      // an ISO string; episode/season number are number|null (numbered shows
+      // only). Spoken only when present; the intro never depends on these.
+      published: it.published,
+      episodeNumber: it.episodeNumber,
+      seasonNumber: it.seasonNumber,
       slot: i + 1,
       filename: fnameFor(it.show, i + 1, "mp3"),
       ext: it.kind === "VIDEO" ? "mp4" : "mp3",
@@ -437,8 +444,8 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
               </div>
             ))}
           </div>
-          <div style={{ padding: "24px 28px", display: "flex", flexDirection: "column",
-            alignItems: "flex-start", justifyContent: "center", gap: 16 }}>
+          <div style={{ padding: "16px 28px", display: "flex", flexDirection: "column",
+            alignItems: "flex-start", justifyContent: "flex-start", gap: 16 }}>
             <div className="ct-label">awaiting start</div>
             <div className="ct-subhead" style={{ maxWidth: 440 }}>
               Lock the line-up, remove yesterday's files, transcribe and find cuts, write intros, encode, copy to the headphones, verify.

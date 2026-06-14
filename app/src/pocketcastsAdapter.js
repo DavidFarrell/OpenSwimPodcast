@@ -18,6 +18,16 @@ function kindFrom(fileType) {
   return fileType.toLowerCase().startsWith("video") ? "VIDEO" : "AUDIO";
 }
 
+// Normalise a feed episode/season number to a positive integer, or null. Pocket
+// Casts sends a number, a numeric string, or 0/null for "no number"; only a real
+// positive whole number is a usable episode/season number for the spoken intro.
+function normNumber(value) {
+  if (value == null) return null;
+  const n = typeof value === "number" ? value : parseInt(String(value).trim(), 10);
+  if (!Number.isFinite(n) || n <= 0 || Math.floor(n) !== n) return null;
+  return n;
+}
+
 export function adaptUpNext({ upNext, podcasts = [], history = [] }) {
   const podcastTitle = new Map();
   for (const p of podcasts) podcastTitle.set(p.uuid, (p.title || "").toUpperCase());
@@ -39,6 +49,11 @@ export function adaptUpNext({ upNext, podcasts = [], history = [] }) {
       show: podcastTitle.get(ep.podcast) || (h && h.podcastTitle?.toUpperCase()) || "PODCAST",
       url: ep.url,
       published: ep.published,
+      // Episode/season number are not on the up-next payload; podcast/full
+      // supplies them (enrichFromPodcastFull). Default null so the field always
+      // exists and a numbered show is filled in once enriched.
+      episodeNumber: null,
+      seasonNumber: null,
       dur: fmtDuration(durSec),
       durMin: Math.round(durSec / 60),
       size: fmtSize(bytes),
@@ -56,6 +71,12 @@ export function enrichFromPodcastFull(items, podcastFull) {
     if (!ex) return it;
     const durSec = ex.duration || 0;
     const bytes = ex.file_size || 0;
+    // Episode/season number for the deterministic spoken intro (announce.cjs).
+    // podcast/full is the source - numbered shows expose ex.episode / ex.season;
+    // narrative shows omit them, leaving these null. A null keeps the existing
+    // value so we never clobber a number captured elsewhere.
+    const episodeNumber = normNumber(ex.episode);
+    const seasonNumber = normNumber(ex.season);
     return {
       ...it,
       dur: durSec ? fmtDuration(durSec) : it.dur,
@@ -63,6 +84,8 @@ export function enrichFromPodcastFull(items, podcastFull) {
       size: bytes ? fmtSize(bytes) : it.size,
       sizeMB: bytes ? bytes / (1024 * 1024) : it.sizeMB,
       kind: kindFrom(ex.file_type) || it.kind,
+      episodeNumber: episodeNumber != null ? episodeNumber : it.episodeNumber,
+      seasonNumber: seasonNumber != null ? seasonNumber : it.seasonNumber,
       show: it.show === "PODCAST" && podcastFull.podcast.title ? podcastFull.podcast.title.toUpperCase() : it.show,
     };
   });

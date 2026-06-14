@@ -239,3 +239,115 @@ describe("buildAnnouncementText()", () => {
     expect(out).toBe("This is The Rest Is Classified. Goalkeeper Down. This episode is about a CIA plot against the 1970 World Cup squad.");
   });
 });
+
+describe("buildAnnouncementText() deterministic metadata (episode/season/date)", () => {
+  // Fix 1: episode number + publish date spoken from the feed, no LLM involved.
+
+  it("speaks an episode number between the show and the title", async () => {
+    const out = await buildAnnouncementText({
+      show: "Hard Fork", title: "Otters", episodeNumber: 47,
+    });
+    expect(out).toBe("This is Hard Fork. Episode 47. Otters.");
+  });
+
+  it("speaks a season AND episode number for a seasoned show", async () => {
+    const out = await buildAnnouncementText({
+      show: "Serial", title: "The Alibi", seasonNumber: 3, episodeNumber: 7,
+    });
+    expect(out).toBe("This is Serial. Season 3, episode 7. The Alibi.");
+    // Never the display form.
+    expect(out).not.toMatch(/S0?3E0?7/i);
+  });
+
+  it("omits the episode clause entirely when there is no episode number", async () => {
+    // A season with no episode number is not enough to identify the episode.
+    const noNum = await buildAnnouncementText({ show: "Radiolab", title: "Colors", seasonNumber: 2 });
+    expect(noNum).toBe("This is Radiolab. Colors.");
+    expect(noNum).not.toMatch(/episode/i);
+    expect(noNum).not.toMatch(/season/i);
+  });
+
+  it("formats an ISO publish date as 'the Nth of Month YYYY' (UTC), not ISO/numeric", async () => {
+    const out = await buildAnnouncementText({
+      show: "Hard Fork", title: "Otters", published: "2025-06-10T09:00:00Z",
+    });
+    expect(out).toBe("This is Hard Fork. Otters. Published on the 10th of June 2025.");
+    expect(out).not.toMatch(/2025-06-10/);
+    expect(out).not.toMatch(/\d+\/\d+\/\d+/);
+  });
+
+  it("uses UTC date components: a midnight-UTC timestamp does not drift to the previous day", async () => {
+    // 2025-06-10T00:00:00Z is the 10th in UTC; with local-time components it
+    // could render as the 9th in a negative-offset timezone. We assert the 10th.
+    const out = await buildAnnouncementText({
+      show: "Hard Fork", title: "Otters", published: "2025-06-10T00:00:00Z",
+    });
+    expect(out).toContain("Published on the 10th of June 2025.");
+    expect(out).not.toContain("9th of June");
+  });
+
+  it("speaks correct ordinals for tricky days (1st, 2nd, 3rd, 11th, 21st, 23rd)", async () => {
+    const cases = [
+      ["2025-01-01T00:00:00Z", "the 1st of January 2025"],
+      ["2025-02-02T00:00:00Z", "the 2nd of February 2025"],
+      ["2025-03-03T00:00:00Z", "the 3rd of March 2025"],
+      ["2025-04-11T00:00:00Z", "the 11th of April 2025"],
+      ["2025-05-21T00:00:00Z", "the 21st of May 2025"],
+      ["2025-07-23T00:00:00Z", "the 23rd of July 2025"],
+    ];
+    for (const [iso, expected] of cases) {
+      // eslint-disable-next-line no-await-in-loop
+      const out = await buildAnnouncementText({ show: "S", title: "T", published: iso });
+      expect(out).toContain(`Published on ${expected}.`);
+    }
+  });
+
+  it("omits the date clause when the publish date is missing or unparseable", async () => {
+    const missing = await buildAnnouncementText({ show: "S", title: "T" });
+    expect(missing).toBe("This is S. T.");
+    const bad = await buildAnnouncementText({ show: "S", title: "T", published: "not a date" });
+    expect(bad).toBe("This is S. T.");
+    expect(bad).not.toMatch(/published/i);
+  });
+
+  it("builds the full combined string: show, episode, title, date, summary", async () => {
+    const fetch = fakeFetch("sea otters and kelp forests");
+    const out = await buildAnnouncementText({
+      show: "Hard Fork",
+      title: "Otters",
+      episodeNumber: 47,
+      published: "2025-06-10T09:00:00Z",
+      transcript: TRANSCRIPT,
+      llm: { fetch },
+    });
+    expect(out).toBe("This is Hard Fork. Episode 47. Otters. Published on the 10th of June 2025. This episode is about sea otters and kelp forests.");
+  });
+
+  it("metadata is deterministic: full episode+date line even with NO transcript/LLM", async () => {
+    const out = await buildAnnouncementText({
+      show: "Hard Fork",
+      title: "Otters",
+      seasonNumber: 2,
+      episodeNumber: 5,
+      published: "2025-06-10T09:00:00Z",
+      // no transcript, no llm
+    });
+    expect(out).toBe("This is Hard Fork. Season 2, episode 5. Otters. Published on the 10th of June 2025.");
+  });
+
+  it("keeps the title-punctuation guard with the new clauses (no 'Who Won?.')", async () => {
+    const out = await buildAnnouncementText({
+      show: "Trivia", title: "Who Won?", episodeNumber: 12, published: "2025-06-10T00:00:00Z",
+    });
+    expect(out).toBe("This is Trivia. Episode 12. Who Won? Published on the 10th of June 2025.");
+    expect(out).not.toMatch(/\?\./);
+  });
+
+  it("coerces numeric-string / zero episode+season fields like the feed sends them", async () => {
+    // Numeric strings are real numbers; 0 / "" mean 'no number' and are omitted.
+    const str = await buildAnnouncementText({ show: "S", title: "T", episodeNumber: "47", seasonNumber: "3" });
+    expect(str).toBe("This is S. Season 3, episode 47. T.");
+    const zero = await buildAnnouncementText({ show: "S", title: "T", episodeNumber: 0 });
+    expect(zero).toBe("This is S. T.");
+  });
+});

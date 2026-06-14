@@ -105,4 +105,57 @@ describe("enrichFromPodcastFull", () => {
     const enriched = enrichFromPodcastFull(base, full);
     expect(enriched[0]).toEqual(base[0]);
   });
+
+  // Fix 1: episode/season number for the deterministic spoken intro come from
+  // podcast/full (ex.episode / ex.season). published must survive enrichment.
+  it("captures episodeNumber/seasonNumber from podcast/full and preserves published", () => {
+    const base = adaptUpNext({ upNext: upNextSample.episodes, podcasts, history });
+    // Defaults are null before enrichment.
+    expect(base[0].episodeNumber).toBeNull();
+    expect(base[0].seasonNumber).toBeNull();
+    const full = {
+      podcast: {
+        title: "Hard Fork",
+        episodes: [
+          { uuid: "ep-1", duration: 3600, file_size: 12345678, file_type: "audio/mpeg", episode: 47, season: 3 },
+        ],
+      },
+    };
+    const enriched = enrichFromPodcastFull(base, full);
+    expect(enriched[0].episodeNumber).toBe(47);
+    expect(enriched[0].seasonNumber).toBe(3);
+    // published (ISO) is carried straight through, unchanged.
+    expect(enriched[0].published).toBe("2026-04-17T09:00:00Z");
+  });
+
+  it("leaves episodeNumber/seasonNumber null when the feed episode omits them (narrative show)", () => {
+    const base = adaptUpNext({ upNext: upNextSample.episodes, podcasts, history });
+    const full = {
+      podcast: {
+        title: "Hard Fork",
+        episodes: [
+          { uuid: "ep-1", duration: 3600, file_size: 12345678, file_type: "audio/mpeg" },
+        ],
+      },
+    };
+    const enriched = enrichFromPodcastFull(base, full);
+    expect(enriched[0].episodeNumber).toBeNull();
+    expect(enriched[0].seasonNumber).toBeNull();
+  });
+
+  it("normalises numeric-string / zero episode+season to a positive int or null", () => {
+    const base = adaptUpNext({ upNext: upNextSample.episodes, podcasts, history });
+    const full = {
+      podcast: {
+        title: "Hard Fork",
+        episodes: [
+          // numeric string -> number; 0 -> null (no episode number)
+          { uuid: "ep-1", episode: "12", season: 0 },
+        ],
+      },
+    };
+    const enriched = enrichFromPodcastFull(base, full);
+    expect(enriched[0].episodeNumber).toBe(12);
+    expect(enriched[0].seasonNumber).toBeNull();
+  });
 });

@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 
 const require = createRequire(import.meta.url);
-const { runSync, isOurFilename, sha256File, buildPlan, itemNeedsEncode, readManifest, writeManifest, MANIFEST_FILE, generateCuts, adToCut, EDGE_SNAP_SEC } = require("./sync.cjs");
+const { runSync, isOurFilename, sha256File, buildPlan, itemNeedsEncode, readManifest, writeManifest, MANIFEST_FILE, generateCuts, adToCut, EDGE_SNAP_SEC, generateIntro, INTRO_PIPELINE_VERSION } = require("./sync.cjs");
 
 function mkTmp(label = "os-sync-") { return fs.mkdtempSync(path.join(os.tmpdir(), label)); }
 function rmTmp(d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
@@ -368,6 +368,109 @@ describe("runSync announce stage", () => {
   function announceItem(over = {}) {
     return { ...makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" }), announce: true, ...over };
   }
+
+  // Fix 1: the deterministic intro metadata (published + episode/season number)
+  // captured in the queue item must reach buildAnnouncementText through runSync.
+  it("threads published + episodeNumber + seasonNumber into buildAnnouncementText", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+
+    const transcribeFn = vi.fn(async () => ({ segments: [{ text: "hello world" }] }));
+    const buildAnnouncementTextFn = vi.fn(async ({ show, title, published, episodeNumber, seasonNumber }) => {
+      expect(show).toBe("HARD FORK");
+      expect(title).toBe("Otters");
+      expect(published).toBe("2025-06-10T09:00:00Z");
+      expect(episodeNumber).toBe(47);
+      expect(seasonNumber).toBe(3);
+      return "This is HARD FORK. Season 3, episode 47. Otters. Published on the 10th of June 2025.";
+    });
+    const renderIntroFn = vi.fn(async ({ outPath }) => { fs.writeFileSync(outPath, Buffer.from("intro wav")); return outPath; });
+    const convertFn = vi.fn(async ({ dest }) => { fs.writeFileSync(dest, Buffer.from("converted with intro")); return { bytes: 20, durationSec: 60, fromCache: false }; });
+
+    const res = await runSync({
+      devicePath, cacheDir,
+      queue: [announceItem({ title: "Otters", published: "2025-06-10T09:00:00Z", episodeNumber: 47, seasonNumber: 3 })],
+      transcribeFn, buildAnnouncementTextFn, renderIntroFn, convertFn,
+      onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    expect(buildAnnouncementTextFn).toHaveBeenCalledOnce();
+  });
+
+  // generateIntro returns { introPath, text } so the convert loop can key the
+  // cache on the spoken wording (Fix 1/3). Also threads the metadata through.
+  it("generateIntro returns the spoken text alongside the introPath and passes metadata through", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+    const it = announceItem({ title: "Otters", published: "2025-06-10T09:00:00Z", episodeNumber: 47 });
+    const buildAnnouncementTextFn = vi.fn(async ({ published, episodeNumber }) => {
+      expect(published).toBe("2025-06-10T09:00:00Z");
+      expect(episodeNumber).toBe(47);
+      return "This is HARD FORK. Episode 47. Otters.";
+    });
+    const renderIntroFn = vi.fn(async ({ outPath }) => { fs.writeFileSync(outPath, Buffer.from("wav")); return outPath; });
+    const out = await generateIntro({
+      it, src: path.join(cacheDir, "a.mp3"), outPath: path.join(cacheDir, "a.intro.wav"),
+      transcribeFn: vi.fn(async () => ({ segments: [{ text: "hi" }] })),
+      buildAnnouncementTextFn, renderIntroFn,
+      transcript: { segments: [{ text: "hi" }] }, hasTranscript: true,
+    });
+    expect(out.introPath).toBe(path.join(cacheDir, "a.intro.wav"));
+    expect(out.text).toBe("This is HARD FORK. Episode 47. Otters.");
+  });
+
+  // Fix 3 (cache invalidation): a PRE-FIX cached intro encode keyed "-intro"
+  // (boolean suffix, old slow/quiet/no-metadata pipeline) must NOT be reused. The
+  // new key carries INTRO_PIPELINE_VERSION + a text hash, so the converter runs
+  // and writes a fresh encode rather than shipping the stale cached mp3.
+  it("does NOT reuse a pre-fix '-intro' cached mp3 (intro pipeline version bumped)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+    // The stale pre-fix cache file at the OLD key (uuid + "-intro.mp3").
+    const stalePath = path.join(cacheDir, "a-intro.mp3");
+    fs.writeFileSync(stalePath, Buffer.from("OLD slow quiet no-metadata intro mix"));
+
+    const transcribeFn = vi.fn(async () => ({ segments: [{ text: "hi" }] }));
+    const buildAnnouncementTextFn = vi.fn(async () => "This is HARD FORK. Episode 47. Otters. Published on the 10th of June 2025.");
+    const renderIntroFn = vi.fn(async ({ outPath }) => { fs.writeFileSync(outPath, Buffer.from("fresh intro wav")); return outPath; });
+    const freshBytes = Buffer.from("FRESH fast loud metadata intro mix");
+    const convertFn = vi.fn(async ({ dest }) => { fs.writeFileSync(dest, freshBytes); return { bytes: freshBytes.length, durationSec: 60, fromCache: false }; });
+
+    const res = await runSync({
+      devicePath, cacheDir,
+      queue: [announceItem({ title: "Otters", published: "2025-06-10T09:00:00Z", episodeNumber: 47 })],
+      transcribeFn, buildAnnouncementTextFn, renderIntroFn, convertFn,
+      onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    // The converter ran (the stale cache was NOT reused) and a fresh encode shipped.
+    expect(convertFn).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(freshBytes)).toBe(true);
+    // The new variant cache file is the versioned+hashed key, NOT the old "-intro".
+    const written = fs.readdirSync(cacheDir).filter((f) => f.startsWith("a-intro") && f.endsWith(".mp3"));
+    expect(written).toContain(`a-intro${INTRO_PIPELINE_VERSION}-${require("node:crypto").createHash("sha1").update("This is HARD FORK. Episode 47. Otters. Published on the 10th of June 2025.").digest("hex").slice(0, 8)}.mp3`);
+    // The stale file is still on disk (we never reuse it, but we also don't delete it).
+    expect(fs.existsSync(stalePath)).toBe(true);
+  });
+
+  // The text hash means a CHANGED intro wording for the SAME episode invalidates:
+  // two different announcement texts map to two different cache files.
+  it("a different intro wording for the same episode keys a different cache file", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+    const renderIntroFn = vi.fn(async ({ outPath }) => { fs.writeFileSync(outPath, Buffer.from("wav")); return outPath; });
+    const convertFn = vi.fn(async ({ dest }) => { fs.writeFileSync(dest, Buffer.from("out")); return { bytes: 3, durationSec: 60, fromCache: false }; });
+    const run = (text) => runSync({
+      devicePath, cacheDir, queue: [announceItem()],
+      transcribeFn: vi.fn(async () => ({ segments: [{ text: "hi" }] })),
+      buildAnnouncementTextFn: vi.fn(async () => text),
+      renderIntroFn, convertFn, onEvent: () => {},
+    });
+
+    await run("This is HARD FORK. Episode 1. Ep.");
+    await run("This is HARD FORK. Episode 2. Ep.");
+    const variants = fs.readdirSync(cacheDir).filter((f) => f.startsWith("a-intro") && f.endsWith(".mp3"));
+    // Two distinct wordings -> two distinct hashed cache files.
+    expect(new Set(variants).size).toBe(2);
+  });
 
   it("announce-on happy path: builds an intro and converts with introPath", async () => {
     fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));

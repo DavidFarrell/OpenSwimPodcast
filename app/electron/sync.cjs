@@ -18,6 +18,15 @@ const { logEvent } = require("./logger.cjs");
 // last segment's end.
 const EDGE_SNAP_SEC = 45;
 
+// Bumped whenever the intro CHANGES in a way that the variant cache key would not
+// otherwise capture - the intro WORDING (Fix 1: episode/season number + publish
+// date now spoken) or how the intro is PROCESSED (the sibling lane now speeds +
+// loudness-matches the intro speech to the episode). Folded into the intro part
+// of the cache key so every pre-fix intro encode is invalidated and a stale
+// "slow/quiet/no-metadata intro" mp3 is never reused. Bump this on any future
+// intro pipeline change.
+const INTRO_PIPELINE_VERSION = 2;
+
 class AbortError extends Error {
   constructor() { super("aborted"); this.name = "AbortError"; }
 }
@@ -193,10 +202,13 @@ function buildPlan({ queue, existingDeviceFiles = [], existingManifest = [], nee
 }
 
 // Generate the intro WAV for a single episode: transcribe -> announce text ->
-// tts. Returns the introPath on success, or null on any failure. Degrades
-// safely - the metadata-only announcement text always works even without a
-// transcript, and renderIntro falls back to null if TTS/ffmpeg is unavailable.
-// Never throws into the pipeline.
+// tts. Returns { introPath, text } - introPath is the rendered WAV on success or
+// null on any failure; text is the announcement string that was spoken (or "").
+// The text is returned so the convert loop can fold a hash of it into the cache
+// variant key, invalidating a stale cached encode when the intro wording changes
+// (Fix 1/3). Degrades safely - the metadata-only announcement text always works
+// even without a transcript, and renderIntro falls back to null if TTS/ffmpeg is
+// unavailable. Never throws into the pipeline.
 //
 // Transcription is best-effort, NOT a gate: if the transcriber is unavailable,
 // unsupported, or throws, we degrade transcript to null and still build the
@@ -223,10 +235,13 @@ async function generateIntro({
     }
     const text = await buildAnnouncementTextFn({
       show: it.show, title: it.title, transcript, llm,
+      // Deterministic metadata (Fix 1): episode/season number + publish date are
+      // spoken when the feed has them. These never depend on the transcript/LLM.
+      published: it.published, episodeNumber: it.episodeNumber, seasonNumber: it.seasonNumber,
     });
     if (!text || !String(text).trim()) {
       logEvent("announce", `no announcement text for "${it.title}" - intro skipped`);
-      return null;
+      return { introPath: null, text: "" };
     }
     let intro = await renderIntroFn({ text, outPath, signal });
     // One retry: TTS (qwen-speak/MLX) can fail transiently under load. Only retry
@@ -236,10 +251,10 @@ async function generateIntro({
       intro = await renderIntroFn({ text, outPath, signal });
     }
     if (!intro) logEvent("announce", `TTS/render failed for "${it.title}" - intro skipped (check qwen-speak / ffmpeg)`);
-    return intro || null;
+    return { introPath: intro || null, text };
   } catch (e) {
     logEvent("announce", `intro generation threw for "${it.title}": ${e && e.message ? e.message : e}`);
-    return null;
+    return { introPath: null, text: "" };
   }
 }
 
@@ -448,6 +463,10 @@ async function runSync({
     .filter(({ it }) => it.trim);
   // Per-episode resolved outputs the convert loop reads unconditionally.
   const introPaths = new Array(queue.length).fill(null);
+  // The spoken announcement text per episode, kept alongside introPaths so the
+  // convert loop can hash it into the cache variant key (Fix 1/3): a changed
+  // intro wording for the same episode invalidates the cached encode.
+  const introTexts = new Array(queue.length).fill("");
   const trimResults = new Array(queue.length).fill(null).map(() => ({ status: "idle", cuts: [] }));
 
   // Stage: delete
@@ -536,17 +555,22 @@ async function runSync({
       // when unset so announce.cjs keeps its own default.
       const introLlm = model ? { ...(llm || {}), model } : llm;
       let intro = null;
+      let introText = "";
       try {
-        intro = await generateIntro({
+        const r = await generateIntro({
           it, src, outPath,
           transcribeFn, buildAnnouncementTextFn, renderIntroFn,
           llm: introLlm, signal,
           transcript, hasTranscript: true,
         });
+        intro = r && r.introPath ? r.introPath : null;
+        introText = (r && r.text) || "";
       } catch {
         intro = null;
+        introText = "";
       }
       introPaths[i] = intro;
+      introTexts[i] = introText;
       emit({ type: "announce", uuid: it.uuid, slot: it.slot, state: intro ? "ready" : "skipped" });
     }
   }
@@ -647,8 +671,17 @@ async function runSync({
       continue;
     }
     // The intro and the cut set are baked into the variant key so a cached encode
-    // is never reused across a different intro/cut combination.
-    const introSuffix = introPath ? "-intro" : "";
+    // is never reused across a different intro/cut combination. The intro part
+    // carries INTRO_PIPELINE_VERSION (invalidates every pre-fix "slow/quiet/no-
+    // metadata" encode wholesale) AND a short hash of the actual spoken text (so a
+    // future intro-wording change for the SAME episode also invalidates). We hash
+    // the TEXT, never the regenerated WAV's mtime - mtime would force a needless
+    // re-encode every run.
+    const introText = introTexts[i] || "";
+    const introHash = introText
+      ? crypto.createHash("sha1").update(introText).digest("hex").slice(0, 8)
+      : "";
+    const introSuffix = introPath ? `-intro${INTRO_PIPELINE_VERSION}${introHash ? `-${introHash}` : ""}` : "";
     const cutSuffix = autoCuts.length
       ? `-trim${crypto.createHash("sha1").update(JSON.stringify(autoCuts)).digest("hex").slice(0, 8)}`
       : "";
@@ -815,4 +848,4 @@ async function runSync({
   return { ok: true, files: dests, transferred, totals };
 }
 
-module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, generateCuts, adToCut, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE, EDGE_SNAP_SEC };
+module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, generateCuts, adToCut, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE, EDGE_SNAP_SEC, INTRO_PIPELINE_VERSION };
