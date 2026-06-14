@@ -35,6 +35,11 @@ class AbortError extends Error {
 
 const BOOST_FILTER = "acompressor=threshold=-22dB:ratio=3:attack=5:release=80:makeup=4dB,loudnorm=I=-14:LRA=9:TP=-1.0,volume=6dB,alimiter=limit=0.97:level=disabled";
 
+// Length of the leading chime in the intro WAV. Mirrors CHIME_SECONDS in
+// tts.cjs (the intro is [0.5s 880Hz chime, faded][then the speech]). Kept as a
+// local constant rather than importing tts.cjs to avoid a module dependency.
+const INTRO_CHIME_SEC = 0.5;
+
 // Sanitise the caller-supplied cut ranges into a clean, sorted, non-overlapping
 // list of [startSec, endSec] pairs on the ORIGINAL (pre-speed) episode timeline.
 // Invalid, empty, inverted, negative-start or non-finite ranges are dropped
@@ -109,33 +114,57 @@ async function convert({
   const tmp = `${dest}.tmp`;
   try { await fsp.unlink(tmp); } catch {}
 
-  // The cut ranges, speed-up and boost only ever apply to the EPISODE audio.
-  // The spoken intro must play at normal speed and uncut, so it is never run
-  // through these filters. Cuts are on the ORIGINAL timeline, so the aselect/
-  // asetpts drop MUST come first, before atempo changes the time base.
+  // Speed-up and boost apply to the EPISODE audio AND to the intro SPEECH, so
+  // the spoken intro matches the episode's pace and loudness (it used to play
+  // slow and quiet against a fast, loud episode - jarring in the pool). Cuts,
+  // however, only ever drop EPISODE audio - they are on the episode timeline and
+  // must never touch the intro. Cuts are on the ORIGINAL (pre-speed) timeline,
+  // so the aselect/asetpts drop MUST come first, before atempo changes the time
+  // base.
   const cutFilters = buildCutFilters(normaliseCuts(cuts));
-  const episodeFilters = [...cutFilters];
-  if (speed && speed !== 1.0) episodeFilters.push(`atempo=${speed}`);
-  if (boost) episodeFilters.push(BOOST_FILTER);
+  // speedBoostFilters = the speed+boost the episode gets, MINUS the cuts. The
+  // intro speech gets exactly these. At speed 1.0 + boost false this is empty,
+  // so the speech is unprocessed - which still matches the (also-unprocessed)
+  // episode.
+  const speedBoostFilters = [];
+  if (speed && speed !== 1.0) speedBoostFilters.push(`atempo=${speed}`);
+  if (boost) speedBoostFilters.push(BOOST_FILTER);
+  const episodeFilters = [...cutFilters, ...speedBoostFilters];
 
   let args;
   if (introPath) {
     // Front-concat: [intro] then [episode] as a single mp3. The intro WAV is
     // 24kHz mono and the episode is 44.1kHz, so a "-c copy" concat will not
     // work - we use the concat FILTER which re-encodes. The concat filter needs
-    // both inputs at the same sample rate and channel layout, so each stream is
-    // run through aresample + aformat to a common 44.1kHz target first. The
-    // episode stream is additionally filtered (atempo/boost) so it is sped up;
-    // the intro stream is NOT sped up so the spoken intro plays at normal speed.
+    // every input at the same sample rate and channel layout, so each stream is
+    // run through aresample + aformat to a common 44.1kHz target first.
+    //
+    // The intro WAV is structured as [0.5s chime, faded][then the speech]. We
+    // split it into the chime (atrim=0:0.5) and the speech (atrim=start=0.5,
+    // rebased to t=0 with asetpts). The SPEECH gets the SAME speed+boost as the
+    // episode (speedBoostFilters - everything the episode gets EXCEPT the cuts,
+    // which are on the episode timeline only) so the spoken intro matches the
+    // episode's pace and loudness. The CHIME is left untouched (only the
+    // resample/aformat normalise) so it stays a constant-length, constant-level
+    // marker - David has learned it as the "Swimcast" cue. Concat order is
+    // [chime][processed-speech][episode].
     const channels = mono ? 1 : 2;
     const layout = mono ? "mono" : "stereo";
     const normalise = `aresample=44100,aformat=sample_fmts=s16:channel_layouts=${layout}`;
-    const introChain = [normalise];
+    // Chime: just split off and normalise - never sped up or boosted.
+    const chimeChain = [`atrim=0:${INTRO_CHIME_SEC}`, normalise];
+    // Speech: split off (rebasing PTS to 0), apply the episode's speed+boost,
+    // then normalise. No cut filters here - cuts only ever drop episode audio.
+    const speechChain = [`atrim=start=${INTRO_CHIME_SEC}`, "asetpts=N/SR/TB", ...speedBoostFilters, normalise];
     const episodeChain = [...episodeFilters, normalise];
+    // The intro input [0:a] feeds two graph branches (chime + speech), so it
+    // must be asplit into two labelled copies first.
     const filterComplex = [
-      `[0:a]${introChain.join(",")}[intro]`,
+      `[0:a]asplit=2[intro_a][intro_b]`,
+      `[intro_a]${chimeChain.join(",")}[chime]`,
+      `[intro_b]${speechChain.join(",")}[speech]`,
       `[1:a]${episodeChain.join(",")}[ep]`,
-      `[intro][ep]concat=n=2:v=0:a=1[out]`,
+      `[chime][speech][ep]concat=n=3:v=0:a=1[out]`,
     ].join(";");
 
     args = [

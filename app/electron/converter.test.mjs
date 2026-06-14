@@ -247,7 +247,9 @@ describe("convert()", () => {
     expect(args.includes("-c")).toBe(false);
     expect(args.includes("copy")).toBe(false);
     const fc = args[args.indexOf("-filter_complex") + 1];
-    expect(fc).toContain("concat=n=2:v=0:a=1");
+    // Three concat inputs now: chime, speech, episode (the intro is split into
+    // its chime and its speech).
+    expect(fc).toContain("concat=n=3:v=0:a=1");
     // Resample so the 24kHz intro and 44.1kHz episode reconcile.
     expect(fc).toContain("aresample=44100");
     // Re-encodes to mp3 and maps the concat output.
@@ -256,7 +258,7 @@ describe("convert()", () => {
     expect(fs.existsSync(dest)).toBe(true);
   });
 
-  it("speeds up the episode but NOT the intro in the concat filter graph", async () => {
+  it("speeds up + boosts the episode AND the intro SPEECH, but leaves the chime untouched", async () => {
     const src = path.join(tmp, "ep.mp3");
     const dest = path.join(tmp, "ep-intro-fast.mp3");
     const intro = path.join(tmp, "intro.wav");
@@ -272,20 +274,73 @@ describe("convert()", () => {
     await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, introPath: intro, speed: 1.5, boost: true });
     const args = calls[0].args;
     const fc = args[args.indexOf("-filter_complex") + 1];
+    const stages = fc.split(";");
+
+    // The intro is split into a chime branch and a speech branch.
+    const splitStage = stages.find((s) => s.includes("asplit"));
+    expect(splitStage).toBeDefined();
+    expect(splitStage.startsWith("[0:a]")).toBe(true);
 
     // The atempo/boost live on the episode stream ([1:a] -> [ep]).
-    const epStage = fc.split(";").find((s) => s.endsWith("[ep]"));
+    const epStage = stages.find((s) => s.endsWith("[ep]"));
     expect(epStage).toBeDefined();
     expect(epStage.startsWith("[1:a]")).toBe(true);
     expect(epStage).toContain("atempo=1.5");
     expect(epStage).toContain("acompressor=");
 
-    // The intro stream ([0:a] -> [intro]) is resampled only, never sped up or boosted.
-    const introStage = fc.split(";").find((s) => s.endsWith("[intro]"));
-    expect(introStage).toBeDefined();
-    expect(introStage.startsWith("[0:a]")).toBe(true);
-    expect(introStage).not.toContain("atempo");
-    expect(introStage).not.toContain("acompressor=");
+    // The SPEECH stage trims off the chime (start=0.5) and gets the SAME
+    // speed+boost the episode gets, so it matches the episode's pace/loudness.
+    const speechStage = stages.find((s) => s.endsWith("[speech]"));
+    expect(speechStage).toBeDefined();
+    expect(speechStage).toContain("atrim=start=0.5");
+    expect(speechStage).toContain("asetpts=N/SR/TB");
+    expect(speechStage).toContain("atempo=1.5");
+    expect(speechStage).toContain("acompressor=");
+
+    // The CHIME stage keeps only the first 0.5s and is NEVER sped up or boosted -
+    // it stays a constant-length, constant-level "Swimcast" marker.
+    const chimeStage = stages.find((s) => s.endsWith("[chime]"));
+    expect(chimeStage).toBeDefined();
+    expect(chimeStage).toContain("atrim=0:0.5");
+    expect(chimeStage).not.toContain("atempo");
+    expect(chimeStage).not.toContain("acompressor=");
+
+    // Concat order is chime, then speech, then episode.
+    const concatStage = stages.find((s) => s.includes("concat="));
+    expect(concatStage).toBeDefined();
+    expect(concatStage).toContain("concat=n=3:v=0:a=1");
+    expect(concatStage.indexOf("[chime]")).toBeLessThan(concatStage.indexOf("[speech]"));
+    expect(concatStage.indexOf("[speech]")).toBeLessThan(concatStage.indexOf("[ep]"));
+  });
+
+  it("leaves the intro speech UNPROCESSED at speed 1.0 with no boost (matches the unprocessed episode)", async () => {
+    const src = path.join(tmp, "ep.mp3");
+    const dest = path.join(tmp, "ep-intro-plain.mp3");
+    const intro = path.join(tmp, "intro.wav");
+    fs.writeFileSync(src, "episode audio");
+    fs.writeFileSync(intro, "intro wav");
+
+    const { spawn, calls } = fakeSpawn((child) => {
+      child.stderr.write("Duration: 00:00:10.00, start: 0\n");
+      fs.writeFileSync(calls[0].args.at(-1), "mp3");
+      child.emit("exit", 0);
+    });
+
+    await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, introPath: intro, speed: 1.0, boost: false });
+    const fc = calls[0].args[calls[0].args.indexOf("-filter_complex") + 1];
+    const stages = fc.split(";");
+
+    // Speech still gets split off and PTS-rebased, but no atempo/boost is added.
+    const speechStage = stages.find((s) => s.endsWith("[speech]"));
+    expect(speechStage).toBeDefined();
+    expect(speechStage).toContain("atrim=start=0.5");
+    expect(speechStage).toContain("asetpts=N/SR/TB");
+    expect(speechStage).not.toContain("atempo");
+    expect(speechStage).not.toContain("acompressor=");
+    // Episode is likewise unprocessed (no atempo/boost) - they match.
+    const epStage = stages.find((s) => s.endsWith("[ep]"));
+    expect(epStage).not.toContain("atempo");
+    expect(epStage).not.toContain("acompressor=");
   });
 
   it("builds the plain single-input pipeline (no filter_complex) when introPath is not set", async () => {
@@ -355,8 +410,9 @@ describe("convert()", () => {
     await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, introPath: intro, speed: 1.5, boost: true, cuts: [[10, 20], [40, 50]] });
     const args = calls[0].args;
     const fc = args[args.indexOf("-filter_complex") + 1];
+    const stages = fc.split(";");
 
-    const epStage = fc.split(";").find((s) => s.endsWith("[ep]"));
+    const epStage = stages.find((s) => s.endsWith("[ep]"));
     expect(epStage).toBeDefined();
     expect(epStage.startsWith("[1:a]")).toBe(true);
     // Both cut ranges, summed, dropped before atempo/boost.
@@ -369,11 +425,15 @@ describe("convert()", () => {
     expect(atempoPos).toBeGreaterThan(ptsPos);
     expect(compPos).toBeGreaterThan(atempoPos);
 
-    // The intro stream is never cut.
-    const introStage = fc.split(";").find((s) => s.endsWith("[intro]"));
-    expect(introStage).toBeDefined();
-    expect(introStage).not.toContain("aselect");
-    expect(introStage).not.toContain("asetpts");
+    // Cuts are EPISODE-only: neither the chime nor the speech is ever cut. The
+    // speech does carry an asetpts (to rebase after the chime trim) but NEVER an
+    // aselect - that is the cut filter and it lives on the episode timeline only.
+    const chimeStage = stages.find((s) => s.endsWith("[chime]"));
+    expect(chimeStage).toBeDefined();
+    expect(chimeStage).not.toContain("aselect");
+    const speechStage = stages.find((s) => s.endsWith("[speech]"));
+    expect(speechStage).toBeDefined();
+    expect(speechStage).not.toContain("aselect");
   });
 
   it("cutting nothing yields byte-for-byte identical args to no cuts at all (zero-regression)", async () => {
@@ -404,6 +464,38 @@ describe("convert()", () => {
     const baseIntro = await argsFor({ introPath: intro, speed: 1.5, boost: true });
     expect(await argsFor({ introPath: intro, speed: 1.5, boost: true, cuts: [] })).toEqual(baseIntro);
     expect(await argsFor({ introPath: intro, speed: 1.5, boost: true, cuts: [[20, 10]] })).toEqual(baseIntro);
+  });
+
+  it("emits byte-identical args on the NO-introPath path (frozen contract, zero-regression)", async () => {
+    // The intro-speech change must NOT touch the no-intro code path. This pins
+    // the exact arg vector that path produced before the change.
+    const src = path.join(tmp, "ep.mp3");
+    const dest = path.join(tmp, "ep-nointro.mp3");
+    fs.writeFileSync(src, "audio");
+
+    const { spawn, calls } = fakeSpawn((child) => {
+      child.stderr.write("Duration: 00:00:30.00, start: 0\n");
+      fs.writeFileSync(calls[0].args.at(-1), "mp3");
+      child.emit("exit", 0);
+    });
+
+    await convert({ src, dest, ffmpegPath: "/fake/ffmpeg", spawn, speed: 1.5, boost: true, cuts: [[10, 20]] });
+    expect(calls[0].args).toEqual([
+      "-y",
+      "-hide_banner",
+      "-i", src,
+      "-vn",
+      "-acodec", "libmp3lame",
+      "-b:a", "128k",
+      "-f", "mp3",
+      "-filter:a", "aselect='not(between(t,10,20))',asetpts=N/SR/TB,atempo=1.5," +
+        "acompressor=threshold=-22dB:ratio=3:attack=5:release=80:makeup=4dB," +
+        "loudnorm=I=-14:LRA=9:TP=-1.0,volume=6dB,alimiter=limit=0.97:level=disabled",
+      "-ac", "1",
+      `${dest}.tmp`,
+    ]);
+    // No filter_complex / split / concat ever leaks into the single-input path.
+    expect(calls[0].args).not.toContain("-filter_complex");
   });
 
   it("can cut at speed 1.0 with no boost (cut-only, no atempo present)", async () => {
