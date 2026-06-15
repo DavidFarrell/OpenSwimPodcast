@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   splitSentences, toSegments, interpTime, sentenceLines,
   selectableCuts, lineInCuts, preselectFromCuts, toggleSentence,
-  selectedToRanges, panelSummary, selectedCount,
+  selectedToRanges, panelSummary, selectedCount, flaggedLines, heldCutCount,
 } from "./transcriptToggle.js";
 
 describe("splitSentences", () => {
@@ -224,6 +224,49 @@ describe("preselectFromCuts + lineInCuts", () => {
       { startSec: 600, endSec: 700, needsReview: true, label: "ad" },      // flagged -> grey
     ] });
     expect([...sel].sort((a, b) => a - b)).toEqual([0]);
+  });
+});
+
+describe("flaggedLines + heldCutCount (held cuts stay VISIBLE but opt-in)", () => {
+  const transcript = { segments: [
+    { start: 0, end: 30, text: "Welcome to the show." },        // line 0, mid 15
+    { start: 600, end: 660, text: "Sponsored by Acme today." },  // line 1, mid 630
+    { start: 660, end: 700, text: "Acme makes great widgets." }, // line 2, mid 680
+    { start: 720, end: 760, text: "Back to the topic." },        // line 3, mid 740
+  ] };
+
+  it("flags lines from BOTH confident and held cuts (so a held cut is findable)", () => {
+    const lines = sentenceLines(transcript);
+    const flagged = flaggedLines(lines, { cuts: [
+      { startSec: 0, endSec: 30, needsReview: false, label: "intro" }, // confident -> line 0
+      { startSec: 600, endSec: 700, needsReview: true, label: "ad" },  // HELD -> lines 1,2
+    ] });
+    expect([...flagged].sort((a, b) => a - b)).toEqual([0, 1, 2]);
+  });
+
+  it("CARDINAL: a HELD cut is FLAGGED (visible) but NOT pre-selected (opt-in)", () => {
+    const lines = sentenceLines(transcript);
+    const trimEntry = { cuts: [{ startSec: 600, endSec: 700, needsReview: true, label: "ad" }] };
+    // Flagged so the user can SEE + click it...
+    expect([...flaggedLines(lines, trimEntry)].sort((a, b) => a - b)).toEqual([1, 2]);
+    // ...but NOT auto-selected (it stays grey until the user opts in - cardinal rule).
+    expect(preselectFromCuts(lines, trimEntry).size).toBe(0);
+  });
+
+  it("returns an empty set when there are no cuts", () => {
+    const lines = sentenceLines(transcript);
+    expect(flaggedLines(lines, { cuts: [] }).size).toBe(0);
+    expect(flaggedLines(lines, undefined).size).toBe(0);
+  });
+
+  it("heldCutCount counts only needsReview === true cuts", () => {
+    expect(heldCutCount({ cuts: [
+      { startSec: 0, endSec: 30, needsReview: false },
+      { startSec: 600, endSec: 700, needsReview: true },
+      { startSec: 720, endSec: 760, needsReview: true },
+    ] })).toBe(2);
+    expect(heldCutCount({ cuts: [{ startSec: 0, endSec: 30, needsReview: false }] })).toBe(0);
+    expect(heldCutCount(undefined)).toBe(0);
   });
 });
 

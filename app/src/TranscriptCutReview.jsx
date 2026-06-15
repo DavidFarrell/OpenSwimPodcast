@@ -1,6 +1,6 @@
 import {
   sentenceLines, selectableCuts, selectedToRanges,
-  panelSummary, selectedCount,
+  panelSummary, selectedCount, flaggedLines, heldCutCount,
 } from "./transcriptToggle.js";
 import { previewJoinWindows } from "./cutlistReview.js";
 
@@ -52,12 +52,33 @@ export function TranscriptCutReview({
 
   const sel = selected instanceof Set ? selected : new Set();
 
+  // The detector's FULL proposed cuts mapped to line indices (confident AND held).
+  // A line that is flagged but NOT selected (a held / needs-review cut) is rendered
+  // in a distinct "detector flagged, unsure - click to cut" state, so a held cut is
+  // findable instead of invisible among the grey kept lines (the "1 mid-roll found
+  // but 0 lines selected, nothing highlighted" case). Marking never selects: the
+  // cardinal rule (cut only the yellow set at Continue) is unchanged.
+  const flagged = flaggedLines(lines, trimEntry);
+  const heldCount = heldCutCount(trimEntry);
+  const hasFlaggedUnselected = [...flagged].some((i) => !sel.has(i));
+
   // Plain refs (no hooks) so the component is renderable by a direct function call
   // in tests as well as by React. A callback ref captures the shared <audio>; the
   // ▶ handlers close over it. Mirrors CutlistReview's no-hooks audio approach.
   const audioRef = { current: null };
   const pendingJoin = { current: null };
+  const bodyRef = { current: null };
   const previewsOn = !!audioUrl;
+
+  // Scroll the first flagged-but-unselected line into view - so the user can FIND a
+  // held cut in a long transcript instead of hunting for it. DOM query on click (no
+  // hook needed); a no-op if the body is not mounted or nothing is flagged.
+  const jumpToFlagged = () => {
+    const root = bodyRef.current;
+    if (!root) return;
+    const el = root.querySelector('[data-flagged="true"]');
+    if (el && typeof el.scrollIntoView === "function") el.scrollIntoView({ block: "center" });
+  };
 
   // The first sentence index of each contiguous selected run, so we can show a
   // single ▶ at the head of a run (preview the join across that run) rather than one
@@ -127,12 +148,16 @@ export function TranscriptCutReview({
 
   // Per-sentence row styling. Yellow = in the cut (amber on a faint amber wash);
   // grey = kept. The whole row is a button so reading + clicking is one gesture.
-  const rowStyle = (isSel) => ({
+  const rowStyle = (isSel, isFlagged) => ({
     display: "flex", gap: 8, alignItems: "baseline", width: "100%",
-    padding: "3px 6px", border: "none", textAlign: "left", cursor: "pointer",
+    padding: "3px 6px", textAlign: "left", cursor: "pointer",
     background: isSel ? "var(--ct-amber-dim)" : "transparent",
-    color: isSel ? "var(--ct-amber)" : "var(--fg-muted)",
-    font: "inherit", borderRadius: 2,
+    color: (isSel || isFlagged) ? "var(--ct-amber)" : "var(--fg-muted)",
+    font: "inherit", borderRadius: 2, border: "none",
+    // Flagged-but-not-selected (a HELD cut): amber text + a dashed amber LEFT rule,
+    // no wash - visually between a selected (solid amber wash) line and plain grey
+    // content, so the user can SEE a held cut and click it in.
+    borderLeft: isFlagged && !isSel ? "2px dashed var(--ct-amber)" : "2px solid transparent",
   });
   const timeStyle = {
     fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--fg-dim)",
@@ -147,7 +172,7 @@ export function TranscriptCutReview({
   });
 
   return (
-    <details className="transcript-cut-review" data-uuid={uuid || ""} {...(defaultOpen ? { open: true } : {})}
+    <details className="transcript-cut-review" data-uuid={uuid || ""} {...((defaultOpen || hasFlaggedUnselected) ? { open: true } : {})}
       style={{ borderTop: "1px solid var(--rule)", padding: "6px 20px 10px",
         background: "var(--ct-coffee-deep)" }}>
       <summary className="transcript-cut-review__summary"
@@ -156,35 +181,57 @@ export function TranscriptCutReview({
         {panelSummary(trimEntry)}
         <span style={{ marginLeft: 8, color: "var(--fg-muted)", fontSize: 10, letterSpacing: 0 }}>
           {cutCount} cut{cutCount !== 1 ? "s" : ""} · {yellowCount} line{yellowCount !== 1 ? "s" : ""} selected
+          {heldCount > 0 && (
+            <span style={{ color: "var(--ct-amber)" }}> · {heldCount} flagged for review</span>
+          )}
         </span>
       </summary>
 
       <div className="transcript-cut-review__hint"
         style={{ fontSize: 10, color: "var(--fg-dim)", margin: "6px 0 8px" }}>
-        Yellow lines will be cut; grey lines are kept. Click any line to add or remove
-        it from the cut. Use the ▶ to hear how a cut joins.
+        Yellow lines will be cut; grey lines are kept. Amber dashed lines are ones the
+        detector flagged but was not sure about - click to cut them. Click any line to
+        add or remove it from the cut. Use the ▶ to hear how a cut joins.
       </div>
+
+      {hasFlaggedUnselected && (
+        <button type="button" className="transcript-cut-review__jump-flagged"
+          onClick={jumpToFlagged}
+          title="jump to the first cut the detector flagged for your review"
+          style={{ fontFamily: "var(--font-mono)", fontSize: 10, letterSpacing: ".5px",
+            color: "var(--ct-amber)", background: "transparent", cursor: "pointer",
+            border: "1px solid var(--ct-amber)", borderRadius: 2, padding: "2px 8px",
+            margin: "0 0 8px" }}>
+          ⚑ {heldCount} flagged for review - jump to {heldCount !== 1 ? "first" : "it"}
+        </button>
+      )}
 
       {audioUrl && (
         <audio ref={(el) => { audioRef.current = el; }} src={audioUrl} preload="none"
           className="transcript-cut-review__audio" data-testid="transcript-cut-audio" />
       )}
 
-      <div className="transcript-cut-review__body"
+      <div className="transcript-cut-review__body" ref={(el) => { bodyRef.current = el; }}
         style={{ maxHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 1 }}>
         {lines.map((line) => {
           const isSel = sel.has(line.index);
+          const isFlagged = flagged.has(line.index);
+          const isFlaggedUnsel = isFlagged && !isSel;
           const isHead = runHeads.has(line.index);
+          const lineTitle = isSel ? "click to keep this line (remove from the cut)"
+            : isFlaggedUnsel ? "the detector flagged this as a possible cut but was not sure - click to cut it"
+            : "click to cut this line";
           return (
             <div key={line.index} className="transcript-cut-review__line-wrap"
               style={{ display: "flex", alignItems: "baseline" }}>
               <button type="button"
-                className={`transcript-cut-review__line${isSel ? " is-selected" : ""}`}
+                className={`transcript-cut-review__line${isSel ? " is-selected" : ""}${isFlaggedUnsel ? " is-flagged" : ""}`}
                 data-index={line.index} data-selected={isSel ? "true" : "false"}
+                data-flagged={isFlaggedUnsel ? "true" : undefined}
                 aria-pressed={isSel}
                 onClick={() => toggle(line.index)}
-                title={isSel ? "click to keep this line (remove from the cut)" : "click to cut this line"}
-                style={rowStyle(isSel)}>
+                title={lineTitle}
+                style={rowStyle(isSel, isFlagged)}>
                 <span style={timeStyle}>{line.time}</span>
                 <span style={{ flex: 1, minWidth: 0, fontSize: 12, lineHeight: 1.4 }}>{line.text}</span>
               </button>

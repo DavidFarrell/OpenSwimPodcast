@@ -253,6 +253,32 @@ export function preselectFromCuts(lines, trimEntry) {
   return sel;
 }
 
+// The lines the detector proposed cutting - CONFIDENT *and* HELD (needsReview) - as a
+// Set of sentence indices. Distinct from preselectFromCuts, which seeds only the
+// CONFIDENT cuts as yellow: a HELD cut's lines are "flagged but not selected", so the
+// review can MARK them (visible, opt-in) instead of leaving them indistinguishable
+// from plain kept content. Without this, a detector cut that was held for review
+// (e.g. an uncertain boundary) is invisible in a long transcript - the user is told
+// "1 mid-roll found" but cannot see WHERE to review. With it, the held cut's lines are
+// marked so the user can find and click them. The CARDINAL RULE is untouched: marking
+// a line does NOT select it; it is cut only if the user clicks it into the yellow set.
+export function flaggedLines(lines, trimEntry) {
+  const cuts = selectableCuts(trimEntry); // ALL cuts, including needsReview ones
+  const out = new Set();
+  if (!Array.isArray(lines) || cuts.length === 0) return out;
+  for (const line of lines) {
+    if (lineInCuts(line, cuts)) out.add(line.index);
+  }
+  return out;
+}
+
+// Count of detector cuts that are HELD (needsReview === true) - surfaced for the user
+// but NOT pre-selected. Drives the "N flagged for review" hint so the user knows to
+// look even when nothing is pre-selected yellow. Pure.
+export function heldCutCount(trimEntry) {
+  return selectableCuts(trimEntry).filter((c) => c && c.needsReview === true).length;
+}
+
 // Toggle one sentence (by index) in or out of a selected Set, returning a NEW Set
 // (immutability, so React state updates cleanly). Pure.
 export function toggleSentence(selected, index) {
