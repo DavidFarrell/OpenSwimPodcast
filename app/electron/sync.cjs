@@ -591,25 +591,13 @@ async function runSync({
   const introTexts = new Array(queue.length).fill("");
   const trimResults = new Array(queue.length).fill(null).map(() => ({ status: "idle", cuts: [] }));
 
-  // Stage: delete
-  // Run the device IO first, before the GPU-heavy analysis, so a removal error
-  // surfaces fast and nothing wastes a transcription.
-  emit({ type: "stage", stage: "delete", state: "active" });
-  const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
-  for (const r of removals) {
-    throwIfAborted();
-    const verb = r.replaced ? "replace" : "rm";
-    emit({ type: "log", stage: "delete", state: "active", text: `${verb} ${r.filename}` });
-    if (!r.replaced) {
-      try { await fsp.unlink(path.join(devicePath, r.filename)); }
-      catch (e) {
-        emit({ type: "log", stage: "delete", state: "error", text: `rm ${r.filename}: ${e.message}` });
-        throw e;
-      }
-    }
-    emit({ type: "log", stage: "delete", state: "done", text: `${verb} ${r.filename}` });
-  }
-  emit({ type: "stage", stage: "delete", state: "done" });
+  // NOTE: "Stage: delete" (remove superseded device files) USED to run here, before
+  // the analysis + the review gate. That was a data-loss footgun: cancelling at the
+  // review gate left the device's old files already deleted with NOTHING written in
+  // their place. The delete block has been MOVED to AFTER the gate resolves (into the
+  // Transferring phase, just before convert) so a cancel-at-gate leaves the device
+  // untouched. See the relocated block below, just before "Stage: convert". What gets
+  // deleted is unchanged (same computeRemovals); only WHEN it runs has moved.
 
   // Stage: analyse (transcribe -> detect cuts -> build intro)
   // SEQUENTIAL, one episode at a time, one GPU-heavy step at a time. Running
@@ -769,6 +757,35 @@ async function runSync({
     }
     emit({ type: "stage", stage: "review", state: "done" });
   }
+
+  // Stage: delete (RELOCATED - cardinal-rule-critical).
+  // Remove superseded device files. This MUST run AFTER the review gate resolves, not
+  // before the analysis as it used to: if it ran first, cancelling at the gate would
+  // leave the device's old files already deleted with nothing written in their place
+  // (data loss). By deleting here - past the gate, in the Transferring phase, just
+  // before convert/transfer - a CANCEL at the gate aborts the run (cancelSync resolves
+  // the parked gate then aborts; the throwIfAborted() below raises AbortError) BEFORE
+  // a single file is unlinked, so the device is left exactly as it was. What gets
+  // deleted is identical to before (same computeRemovals on the same inputs); only the
+  // timing moved. The "delete" stage now shows under Transferring. Verify still runs
+  // last.
+  throwIfAborted();
+  emit({ type: "stage", stage: "delete", state: "active" });
+  const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
+  for (const r of removals) {
+    throwIfAborted();
+    const verb = r.replaced ? "replace" : "rm";
+    emit({ type: "log", stage: "delete", state: "active", text: `${verb} ${r.filename}` });
+    if (!r.replaced) {
+      try { await fsp.unlink(path.join(devicePath, r.filename)); }
+      catch (e) {
+        emit({ type: "log", stage: "delete", state: "error", text: `rm ${r.filename}: ${e.message}` });
+        throw e;
+      }
+    }
+    emit({ type: "log", stage: "delete", state: "done", text: `${verb} ${r.filename}` });
+  }
+  emit({ type: "stage", stage: "delete", state: "done" });
 
   // Stage: convert
   emit({ type: "stage", stage: "convert", state: "active" });

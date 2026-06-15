@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Btn, CoverArt, Kbd } from "./Atoms.jsx";
+import { Btn, CoverArt } from "./Atoms.jsx";
 import { Toolbar } from "./Shell.jsx";
 
 const PULL_THRESHOLD = 80;
@@ -72,6 +72,15 @@ function RefreshIcon({ spinning }) {
 export function UpNextScreen({ items, selected, setSelected, goToday, onDeviceIds, order, onRefresh, refreshing }) {
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState("all");
+  const searchRef = useRef(null);
+
+  // Clear the search TEXT only - the all/audio/video filter is deliberately left
+  // untouched (clearing both on one action is surprising). Refocus the input so the
+  // user can keep typing.
+  const clearSearch = () => {
+    setQ("");
+    if (searchRef.current) searchRef.current.focus();
+  };
 
   const filtered = useMemo(() => items.filter((it) => {
     if (filter === "audio" && it.kind !== "AUDIO") return false;
@@ -132,8 +141,22 @@ export function UpNextScreen({ items, selected, setSelected, goToday, onDeviceId
             strokeWidth="1.4" style={{ color: "var(--fg-muted)" }}>
             <circle cx="7" cy="7" r="4.5"/><path d="M 10.5 10.5 L 14 14"/>
           </svg>
-          <input placeholder="search queue" value={q} onChange={(e) => setQ(e.target.value)} />
-          <Kbd>⌘K</Kbd>
+          <input ref={searchRef} placeholder="search queue" value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Escape") clearSearch(); }} />
+          {q && (
+            <button type="button" onClick={clearSearch} title="clear search" aria-label="clear search"
+              className="ct-btn ct-btn--xs"
+              style={{
+                background: "transparent", color: "var(--fg-muted)", border: "none",
+                padding: 2, display: "inline-flex", alignItems: "center", cursor: "pointer",
+              }}>
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                strokeWidth="1.5" strokeLinecap="round">
+                <path d="M 4 4 L 12 12" /><path d="M 12 4 L 4 12" />
+              </svg>
+            </button>
+          )}
         </div>
         <div style={{ display: "flex", gap: 4 }}>
           {["all", "audio", "video"].map((f) => (

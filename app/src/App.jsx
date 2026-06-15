@@ -18,8 +18,6 @@ import {
   loadTrimOff, saveTrimOff,
   effectiveTrim,
 } from "./trimPrefs.js";
-import { buildTrimAudioUrls } from "./trimAudio.js";
-import { sentenceLines, preselectFromCuts, toggleSentence } from "./transcriptToggle.js";
 import { loadModel, saveModel, MODEL_OPTIONS } from "./modelPrefs.js";
 import {
   loadSensitivity, saveSensitivity, thresholdSecFor, SENSITIVITY_OPTIONS,
@@ -106,40 +104,12 @@ export default function App() {
     });
   };
   const [trimStatus, setTrimStatus] = useState({});
-  // Proposed cut lists per uuid (P3a) - the trim sync:event carries the full cut
-  // list alongside the state. Kept separate from the string status above so the
-  // badge can stay a simple string while the review surface reads the cuts.
-  const [trimCuts, setTrimCuts] = useState({});
-  // Transcript segments per episode, fed by the same trim event. The Advanced
-  // transcript-as-evidence view (P3d) reads these to highlight the detected ad
-  // ranges in context. Optional - the view renders nothing without segments.
-  const [trimSegments, setTrimSegments] = useState({});
-  // TRANSCRIPT-TOGGLE REDESIGN. The SELECTED (yellow) sentence indices per episode,
-  // keyed by uuid -> Set<number>. This is the authoritative review state: the
-  // detector's cuts seed it (preselectFromCuts), the user toggles sentences, and at
-  // "Continue" the contiguous selected runs become the final cut ranges. Seeded from
-  // the trim event below; a per-uuid seed-signature guards against clobbering the
-  // user's toggles when the same cut list re-arrives, while still re-seeding when a
-  // genuinely new cut list comes in.
-  const [trimSelected, setTrimSelected] = useState({});
-  const trimSeedSigRef = useRef({});
-  const seedTrimSelection = (uuid, segments, cuts) => {
-    if (!uuid) return;
-    const sig = JSON.stringify((cuts || []).map((c) => [c.startSec, c.endSec]));
-    if (trimSeedSigRef.current[uuid] === sig) return; // same cuts already seeded - keep edits
-    trimSeedSigRef.current[uuid] = sig;
-    const lines = sentenceLines({ segments: segments || [] });
-    const sel = preselectFromCuts(lines, { cuts: cuts || [] });
-    setTrimSelected((prev) => ({ ...prev, [uuid]: sel }));
-  };
-  // Toggle one sentence in/out of an episode's selected set (the editing gesture).
-  // CARDINAL RULE: this only changes WHAT will be cut at Continue; it cuts nothing
-  // itself. The commit (SyncScreen) reads trimSelected -> selectedToRanges -> the
-  // explicit cut-set IPC.
-  const onToggleSentence = (uuid, index) => {
-    if (!uuid || !Number.isFinite(index)) return;
-    setTrimSelected((prev) => ({ ...prev, [uuid]: toggleSentence(prev[uuid] || new Set(), index) }));
-  };
+  // NOTE: the per-episode cut list / transcript segments / selected-set + the
+  // sentence-toggle handler that USED to live here fed only the inline review on the
+  // Line-up screen, which was dead surface (it never rendered pre-run) and has been
+  // removed. The Transfer review gate (SyncScreen) builds its OWN review state from
+  // the `review` event, so no shared App state is needed for it. Only the passive
+  // trimStatus badge feed (above) survives.
   const [selected, setSelected] = useState([]);
   const [order, setOrder] = useState([]);
   const [syncArmed, setSyncArmed] = useState(false);
@@ -204,20 +174,11 @@ export default function App() {
     if (!api || !api.onEvent) return;
     const off = api.onEvent((evt) => {
       if (evt && evt.type === "trim" && evt.uuid) {
+        // Only the passive badge status is tracked here now. The cut list + segments
+        // the trim event also carries used to seed the (now-removed) inline Line-up
+        // review; the Transfer review gate reads them straight off its own `review`
+        // event instead, so we no longer mirror them into App state.
         setTrimStatus((prev) => ({ ...prev, [evt.uuid]: evt.state }));
-        if (Array.isArray(evt.cuts)) {
-          setTrimCuts((prev) => ({ ...prev, [evt.uuid]: evt.cuts }));
-        }
-        if (Array.isArray(evt.segments)) {
-          setTrimSegments((prev) => ({ ...prev, [evt.uuid]: evt.segments }));
-        }
-        // Seed the transcript-toggle selection from the detector's cuts the moment a
-        // cut list + its segments are known, so the redesigned review surface opens
-        // with the detector's cuts already yellow (default == today). Re-seeds only
-        // when a genuinely new cut list arrives (signature guard inside).
-        if (Array.isArray(evt.cuts) && Array.isArray(evt.segments)) {
-          seedTrimSelection(evt.uuid, evt.segments, evt.cuts);
-        }
       }
     });
     return typeof off === "function" ? off : undefined;
@@ -415,11 +376,6 @@ export default function App() {
                 trimOff={trimOff}
                 setTrimEpisode={setTrimEpisode}
                 trimStatus={trimStatus}
-                trimCuts={trimCuts}
-                trimSegments={trimSegments}
-                trimSelected={trimSelected}
-                onToggleSentence={onToggleSentence}
-                trimAudioUrls={buildTrimAudioUrls(downloadByUuid)}
                 devicePath={device.mounted ? device.path : null}
                 setShowMountDialog={setShowMountDialog} />
             )}

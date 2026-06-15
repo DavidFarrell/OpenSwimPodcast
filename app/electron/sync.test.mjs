@@ -1762,6 +1762,63 @@ describe("runSync trim stage", () => {
     expect(convertFn).not.toHaveBeenCalled();
   });
 
+  // CARDINAL (remove-old relocation): the delete step was MOVED to AFTER the review
+  // gate. A cancel at the gate must therefore leave the device's superseded old files
+  // INTACT - under the old ordering they were already deleted before the gate, which
+  // was the data-loss footgun this reorder fixes.
+  it("a cancel at the review gate leaves the device's old files UNTOUCHED (delete runs after the gate)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("new episode audio"));
+    // An old superseded file on the device that the run WOULD delete (different show,
+    // so computeRemovals marks it for removal, not replacement).
+    const oldFile = path.join(devicePath, "07_oldshow.mp3");
+    fs.writeFileSync(oldFile, Buffer.from("yesterday's episode - must survive a cancel"));
+
+    const convertFn = vi.fn();
+    const ac = new AbortController();
+    // The IPC cancel path: gate resolves with no decisions AND the run aborts.
+    const awaitReview = vi.fn(async () => { ac.abort(); return {}; });
+
+    const events = [];
+    await expect(runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: flaggedTranscribe(), detectAdsFn: flaggedDetect(), convertFn,
+      awaitReview, signal: ac.signal, onEvent: (e) => events.push(e),
+    })).rejects.toThrow();
+
+    // The old file is still there - nothing was deleted, because the abort raised
+    // before the (now post-gate) delete block ran.
+    expect(fs.existsSync(oldFile)).toBe(true);
+    expect(fs.readFileSync(oldFile).toString()).toBe("yesterday's episode - must survive a cancel");
+    // The delete stage never even started (it is past the gate).
+    expect(events.some((e) => e.type === "stage" && e.stage === "delete")).toBe(false);
+    expect(convertFn).not.toHaveBeenCalled();
+  });
+
+  // The delete now runs AFTER the review gate resolves (Transferring phase): on an
+  // approved run the stage:done ORDER is finalise -> ... -> review -> delete -> convert
+  // -> transfer -> verify, never delete-before-review.
+  it("on an approved run, delete runs AFTER review (review done precedes delete done)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+    // A superseded device file so a delete stage actually fires.
+    fs.writeFileSync(path.join(devicePath, "07_oldshow.mp3"), Buffer.from("stale"));
+    const convertFn = vi.fn(async ({ dest }) => { fs.writeFileSync(dest, Buffer.from("trimmed")); return { bytes: 7, durationSec: 60, fromCache: false }; });
+    const awaitReview = vi.fn(async () => ({ a: { __cutSet: [[200, 380]] } }));
+
+    const events = [];
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: flaggedTranscribe(), detectAdsFn: flaggedDetect(), convertFn,
+      awaitReview, onEvent: (e) => events.push(e),
+    });
+
+    expect(res.ok).toBe(true);
+    const doneOrder = events.filter((e) => e.type === "stage" && e.state === "done").map((e) => e.stage);
+    // review precedes delete, delete precedes convert (the relocation invariant).
+    expect(doneOrder.indexOf("review")).toBeLessThan(doneOrder.indexOf("delete"));
+    expect(doneOrder.indexOf("delete")).toBeLessThan(doneOrder.indexOf("convert"));
+    expect(doneOrder).toEqual(["finalise", "transcribe", "trim", "review", "delete", "convert", "transfer", "verify"]);
+  });
+
   // --- Transcript-toggle redesign: the gate may resolve to an EXPLICIT cut-set ---
 
   it("an explicit __cutSet from the gate REPLACES the cuts and applies exactly those ranges", async () => {

@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
-  loadSensitivity, saveSensitivity, thresholdSecFor, loadThresholdSec,
+  loadSensitivity, saveSensitivity, thresholdSecFor, loadThresholdSec, labelFor,
   KEY, DEFAULT_SENSITIVITY, DEFAULT_THRESHOLD_SEC,
-  SENSITIVITY_THRESHOLDS, SENSITIVITY_OPTIONS,
+  SENSITIVITY_THRESHOLDS, SENSITIVITY_OPTIONS, SENSITIVITY_LABELS,
 } from "./sensitivityPrefs.js";
 
 function fakeStorage(initial = {}) {
@@ -54,6 +54,47 @@ describe("sensitivityPrefs - cardinal ordering", () => {
       expect(Number.isFinite(sec)).toBe(true);
       expect(sec).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("sensitivityPrefs - display labels (Auto-cut rename)", () => {
+  // The control is relabelled "Auto-cut" in the UI; the picker shows these phrases,
+  // but the stored KEYS and their thresholds are unchanged (asserted elsewhere).
+  it("maps each key to its display phrase", () => {
+    expect(labelFor("conservative")).toBe("only obvious cuts");
+    expect(labelFor("balanced")).toBe("suggested cuts");
+    expect(labelFor("aggressive")).toBe("more suggested cuts");
+    expect(SENSITIVITY_LABELS).toEqual({
+      conservative: "only obvious cuts",
+      balanced: "suggested cuts",
+      aggressive: "more suggested cuts",
+    });
+  });
+
+  it("covers every option (no option renders a raw key)", () => {
+    for (const level of SENSITIVITY_OPTIONS) {
+      expect(typeof SENSITIVITY_LABELS[level]).toBe("string");
+      expect(SENSITIVITY_LABELS[level].length).toBeGreaterThan(0);
+      expect(SENSITIVITY_LABELS[level]).not.toBe(level);
+    }
+  });
+
+  it("degrades an unknown / blank key to the default level's label", () => {
+    expect(labelFor("yolo")).toBe(SENSITIVITY_LABELS[DEFAULT_SENSITIVITY]);
+    expect(labelFor("")).toBe(SENSITIVITY_LABELS[DEFAULT_SENSITIVITY]);
+    expect(labelFor(null)).toBe(SENSITIVITY_LABELS[DEFAULT_SENSITIVITY]);
+    expect(labelFor(undefined)).toBe(SENSITIVITY_LABELS[DEFAULT_SENSITIVITY]);
+  });
+
+  it("normalises case / whitespace before resolving the label", () => {
+    expect(labelFor("  Aggressive  ")).toBe("more suggested cuts");
+  });
+
+  // The rename is DISPLAY ONLY: the keys and their thresholds remain 120/300/360.
+  it("does not change the underlying thresholds (display-only rename)", () => {
+    expect(thresholdSecFor("conservative")).toBe(120);
+    expect(thresholdSecFor("balanced")).toBe(300);
+    expect(thresholdSecFor("aggressive")).toBe(360);
   });
 });
 

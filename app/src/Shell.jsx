@@ -22,7 +22,7 @@ function Wordmark() {
 export function Sidebar({ route, setRoute, todayCount, mountState, mountFree, setShowMountDialog, onLogout }) {
   const items = [
     { id: "up-next", label: "Queue", meta: "POCKET CASTS" },
-    { id: "today", label: "Ready", meta: todayCount ? `${todayCount} LINED UP` : "LINE UP" },
+    { id: "today", label: "Line-up", meta: todayCount ? `${todayCount} LINED UP` : "LINE UP" },
     { id: "syncing", label: "Transfer", meta: "TO HEADPHONES" },
   ];
   return (

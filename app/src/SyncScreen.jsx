@@ -7,6 +7,31 @@ import { TranscriptCutReview } from "./TranscriptCutReview.jsx";
 import { buildTrimAudioUrls } from "./trimAudio.js";
 import { sentenceLines, preselectFromCuts, toggleSentence, selectedToRanges, selectedCount } from "./transcriptToggle.js";
 
+// Two visible phases (presentational only - one runSync arc, not two IPC sessions).
+// PREPARING covers the analysis + the review gate; TRANSFERRING covers the device
+// IO. Every stage id is mapped to one of these so the stage list can render under a
+// phase header. The execution order after the remove-old reorder is
+//   finalise -> transcribe -> find cuts -> write intros -> [review gate]
+//     -> remove old -> encode -> copy -> verify
+// but the DISPLAY groups the analysis stages first (Preparing) and the device IO
+// after (Transferring); "Finalise order" is shown under Transferring for legibility
+// even though it executes first (it is a no-op label step, not device IO).
+const PHASE_PREPARING = "preparing";
+const PHASE_TRANSFERRING = "transferring";
+const PHASE_OF = {
+  transcribe: PHASE_PREPARING,
+  trim: PHASE_PREPARING,
+  announce: PHASE_PREPARING,
+  review: PHASE_PREPARING,
+  finalise: PHASE_TRANSFERRING,
+  delete: PHASE_TRANSFERRING,
+  convert: PHASE_TRANSFERRING,
+  transfer: PHASE_TRANSFERRING,
+  verify: PHASE_TRANSFERRING,
+};
+const PHASE_LABEL = { [PHASE_PREPARING]: "Preparing", [PHASE_TRANSFERRING]: "Transferring" };
+const PHASE_ORDER = [PHASE_PREPARING, PHASE_TRANSFERRING];
+
 function buildStages({ hasVideo, playbackSpeed, boost }) {
   const reEncode = playbackSpeed !== 1.0 || boost;
   let encodeDetail;
@@ -38,24 +63,31 @@ function logKey(evt) {
   return evt.uuid ? `${evt.stage}:${evt.uuid}` : `${evt.stage}:${evt.text}`;
 }
 
-// The optional analysis stages (only present when Trim / Announce are on). They
-// run between Remove-old and Encode. We surface each one the moment its first
-// event arrives so the user can see the slow GPU work (transcribe -> detect ->
-// speak) happening instead of staring at a frozen "Encode".
+// The optional analysis stages (only present when Trim / Announce are on), plus the
+// review gate. These are the PREPARING phase. We surface each one the moment its
+// first event arrives so the user can see the slow GPU work (transcribe -> detect ->
+// speak -> review) happening. They are displayed FIRST (before the Transferring
+// stages) to match the execution order: analysis + gate all complete before any
+// device IO (encode/copy/verify, and - after the remove-old reorder - the delete).
 const ANALYSIS_STAGE_DEFS = {
   transcribe: { id: "transcribe", label: "Transcribe", detail: "speech to text" },
   trim: { id: "trim", label: "Find cuts", detail: "detect ads + intros" },
   announce: { id: "announce", label: "Write intros", detail: "summarise + speak" },
+  review: { id: "review", label: "Review cuts", detail: "approve before sending" },
 };
-const ANALYSIS_ORDER = ["transcribe", "trim", "announce"];
+// Order within the Preparing phase. review sits last - it is the gate at the end of
+// Preparing, just before the Transferring stages begin.
+const ANALYSIS_ORDER = ["transcribe", "trim", "announce", "review"];
 
+// PREPEND the present Preparing stages (analysis + gate) before the base Transferring
+// stages, so the displayed list reads Preparing-then-Transferring. A stage is
+// "present" once any event has set its state (active/done). Returns the base list
+// unchanged when no Preparing stage has started (plain transfer, no trim/announce).
 function insertAnalysisStages(base, stageState) {
   const present = ANALYSIS_ORDER.filter((id) => stageState[id]);
   if (!present.length) return base;
   const extra = present.map((id) => ANALYSIS_STAGE_DEFS[id]);
-  const ci = base.findIndex((s) => s.id === "convert");
-  if (ci < 0) return [...base, ...extra];
-  return [...base.slice(0, ci), ...extra, ...base.slice(ci)];
+  return [...extra, ...base];
 }
 
 // Turn the accumulated per-episode analysis events into human log lines.
@@ -88,6 +120,20 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   const fullQueue = order.map((id) => items.find((x) => x.id === id)).filter(Boolean);
   const readyQueue = fullQueue.filter((it) => downloadByUuid[it.uuid]?.state === "ready");
   const skipped = fullQueue.filter((it) => !readyQueue.includes(it));
+  // DOWNLOADS GATE. An episode is "in-flight" while its download is queued or still
+  // downloading - i.e. NOT in a terminal state (ready / error / cancelled). A missing
+  // state counts as in-flight too (App ensures the download, so "no state yet" means
+  // it is about to start). We must never SEND while anything is still downloading
+  // (sending the half-written file, or starting before its bytes land); but we must
+  // also never block FOREVER on a failed download - error/cancelled are terminal, so
+  // once every episode is terminal Send is allowed (the failed ones just get skipped
+  // by readyQueue). downloadsPending drives the explicit "Preparing - waiting for N
+  // download(s)" block on both this screen and Line-up's Send button.
+  const DOWNLOAD_TERMINAL = new Set(["ready", "error", "cancelled"]);
+  const inFlightDownloads = fullQueue.filter(
+    (it) => !DOWNLOAD_TERMINAL.has(downloadByUuid[it.uuid]?.state)
+  );
+  const downloadsPending = inFlightDownloads.length;
   const videoCount = readyQueue.filter((x) => x.kind === "VIDEO").length;
   const totalMB = readyQueue.reduce((s, x) => s + x.sizeMB, 0);
   const queue = readyQueue;
@@ -339,6 +385,10 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     return stages.find((st) => stageState[st.id] !== "done")?.id || "verify";
   })();
   const currentStageIdx = stages.findIndex((s) => s.id === currentStage);
+  // Which of the two phases is live, from the current stage. Drives the header label
+  // ("Preparing" while transcribing/finding cuts/at the gate; "Transferring" once the
+  // device IO begins). The review gate is the last Preparing step.
+  const currentPhase = PHASE_OF[currentStage] || PHASE_TRANSFERRING;
 
   // Per-episode analysis lines for the right-hand log, ordered by slot then step.
   const analysisLines = ANALYSIS_ORDER.flatMap((type) =>
@@ -381,7 +431,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
           title="Something went wrong."
           subtitle={error || "unknown error"}
           actions={<>
-            <Btn variant="ghost" onClick={onBack}>back to today</Btn>
+            <Btn variant="ghost" onClick={onBack}>back to line-up</Btn>
             <Btn variant="cta" onClick={() => { setError(null); setLogByKey({}); setStageState({}); setSteps({}); setServerPlan([]); setPhase("running"); }}>
               RETRY
             </Btn>
@@ -400,23 +450,27 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
         <Toolbar
           label={`Transfer · ${queue.length} ready${skipped.length ? ` · ${skipped.length} skipped` : ""}`}
-          title={devicePath ? "Ready when you are." : "No headphones connected."}
-          subtitle={devicePath
-            ? [
+          title={!devicePath ? "No headphones connected."
+            : downloadsPending ? "Preparing…"
+            : "Ready when you are."}
+          subtitle={!devicePath
+            ? "Plug in your OpenSwim Pro before transferring."
+            : downloadsPending
+            ? `Preparing - waiting for ${downloadsPending} download${downloadsPending !== 1 ? "s" : ""} to finish before sending.`
+            : [
                 `${totalMB.toFixed(1)}MB across ${queue.length} file${queue.length !== 1 ? "s" : ""}`,
                 removedPreview > 0 ? `~${removedPreview} to remove` : null,
                 videoCount > 0 ? `${videoCount} video→audio` : null,
                 playbackSpeed !== 1.0 ? `re-encoding at ${playbackSpeed}× speed` : null,
                 boost ? "volume boost on" : null,
                 skipped.length ? `${skipped.length} skipped (unreachable)` : null,
-              ].filter(Boolean).join(" · ")
-            : "Plug in your OpenSwim Pro before transferring."}
+              ].filter(Boolean).join(" · ")}
           actions={<>
             <Btn variant="ghost" onClick={onBack}>back to line-up</Btn>
-            <Btn variant="cta" onClick={() => { onArm && onArm(); setPhase("running"); }} disabled={!queue.length || !devicePath}>
+            <Btn variant="cta" onClick={() => { onArm && onArm(); setPhase("running"); }} disabled={downloadsPending > 0 || !queue.length || !devicePath}>
               {!devicePath ? "NO HEADPHONES"
+                : downloadsPending ? `WAITING FOR ${downloadsPending} DOWNLOAD${downloadsPending !== 1 ? "S" : ""}`
                 : queue.length ? `SEND · ${queue.length} EP`
-                : fullQueue.length ? "WAITING FOR DOWNLOADS"
                 : "NOTHING LINED UP"}
             </Btn>
           </>}
@@ -438,7 +492,10 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
             alignItems: "flex-start", justifyContent: "flex-start", gap: 16 }}>
             <div className="ct-label">awaiting start</div>
             <div className="ct-subhead" style={{ maxWidth: 440 }}>
-              Lock the line-up, remove yesterday's files, transcribe and find cuts, write intros, encode, copy to the headphones, verify.
+              Two phases. First we prepare - transcribe, find cuts, write intros, then
+              you review every cut. Then we transfer - remove yesterday's files, encode,
+              copy to the headphones, verify. Nothing on the device is touched until you
+              approve the cuts.
             </div>
             <div className="ct-meta" style={{ color: "var(--fg-dim)", maxWidth: 440, lineHeight: 1.8 }}>
               Nothing is written to your headphones until you press{" "}
@@ -453,8 +510,8 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
       <Toolbar
-        label={`Transfer · stage ${Math.max(1, currentStageIdx + 1)}/${stages.length} · ${stages[Math.max(0, currentStageIdx)].id}`}
-        title="Sending to your headphones."
+        label={`${(PHASE_LABEL[currentPhase] || "Transferring").toUpperCase()} · stage ${Math.max(1, currentStageIdx + 1)}/${stages.length} · ${stages[Math.max(0, currentStageIdx)].id}`}
+        title={currentPhase === PHASE_PREPARING ? "Preparing your episodes." : "Sending to your headphones."}
         subtitle={`${doneCount}/${planWithLog.length} · ${(overall * 100).toFixed(0)}%`}
         actions={<Btn variant="ghost" onClick={cancel}>cancel</Btn>}
       />
@@ -513,27 +570,53 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       <div style={{ flex: 1, display: "grid", gridTemplateColumns: "300px 1fr",
         minHeight: 0, borderTop: "1px solid var(--rule)" }}>
         <div style={{ borderRight: "1px solid var(--rule)", overflow: "auto", padding: "10px 0" }}>
-          {stageProgress.map((st, si) => (
-            <div key={st.id} className="stage" data-state={st.state}>
-              <div className="stage__bullet">
-                {st.state === "done" ? "✓" : st.state === "active" ? "▸" : si + 1}
-              </div>
-              <div style={{ minWidth: 0 }}>
-                <div className="stage__label">{st.label}</div>
-                <div className="stage__label stage__detail" style={{ marginTop: 3 }}>
-                  {st.state === "done" ? "done" : st.detail}
+          {PHASE_ORDER.map((ph) => {
+            // The stages that belong to this phase, in their display order. A phase
+            // with no stages yet (e.g. Preparing on a plain transfer with no
+            // trim/announce) renders nothing - no empty header.
+            const phaseStages = stageProgress.filter((st) => PHASE_OF[st.id] === ph);
+            if (!phaseStages.length) return null;
+            const isActivePhase = currentPhase === ph;
+            const allDone = phaseStages.every((st) => st.state === "done");
+            return (
+              <div key={ph} className="stage-phase" data-phase={ph} data-active={isActivePhase ? "true" : undefined}>
+                <div className="stage-phase__head" style={{ display: "flex", alignItems: "center", gap: 8,
+                  padding: "4px 18px 6px", fontFamily: "var(--font-mono)", fontSize: 10, letterSpacing: "1.5px",
+                  textTransform: "uppercase",
+                  color: isActivePhase ? "var(--ct-amber)" : allDone ? "var(--ct-tea)" : "var(--fg-muted)" }}>
+                  <span>{PHASE_LABEL[ph]}</span>
+                  {isActivePhase && <span style={{ fontSize: 9 }}>● active</span>}
+                  {!isActivePhase && allDone && <span style={{ fontSize: 9 }}>✓ done</span>}
                 </div>
+                {phaseStages.map((st) => {
+                  // Bullet number is the stage's position in the FULL list so the
+                  // numbering stays stable across the two phase groups.
+                  const si = stages.findIndex((s) => s.id === st.id);
+                  return (
+                    <div key={st.id} className="stage" data-state={st.state}>
+                      <div className="stage__bullet">
+                        {st.state === "done" ? "✓" : st.state === "active" ? "▸" : si + 1}
+                      </div>
+                      <div style={{ minWidth: 0 }}>
+                        <div className="stage__label">{st.label}</div>
+                        <div className="stage__label stage__detail" style={{ marginTop: 3 }}>
+                          {st.state === "done" ? "done" : st.detail}
+                        </div>
+                      </div>
+                      <div className="stage__right">
+                        {st.state !== "pending" && (
+                          <div style={{ width: 40, height: 2, background: "var(--rule)", position: "relative" }}>
+                            <div style={{ position: "absolute", inset: 0, width: `${st.pct * 100}%`,
+                              background: st.state === "done" ? "var(--ct-tea)" : "var(--ct-amber)" }} />
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
-              <div className="stage__right">
-                {st.state !== "pending" && (
-                  <div style={{ width: 40, height: 2, background: "var(--rule)", position: "relative" }}>
-                    <div style={{ position: "absolute", inset: 0, width: `${st.pct * 100}%`,
-                      background: st.state === "done" ? "var(--ct-tea)" : "var(--ct-amber)" }} />
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
 
         <div style={{ padding: "16px 20px", overflow: "auto", background: "var(--ct-coffee-deep)" }}>

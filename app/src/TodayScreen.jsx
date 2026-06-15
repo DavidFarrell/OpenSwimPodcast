@@ -3,7 +3,7 @@ import { Btn, CoverArt, DragHandle } from "./Atoms.jsx";
 import { Toolbar } from "./Shell.jsx";
 import { effectiveAnnounce } from "./announcePrefs.js";
 import { effectiveTrim } from "./trimPrefs.js";
-import { TranscriptCutReview } from "./TranscriptCutReview.jsx";
+import { labelFor as sensitivityLabelFor } from "./sensitivityPrefs.js";
 
 import { fnameFor } from "./slugShow.js";
 export { fnameFor };
@@ -202,30 +202,38 @@ function ModelPicker({ value, onChange, options = [] }) {
   );
 }
 
-// Sensitivity picker (P4b). A pulldown that tunes the trim detector's needs-review
-// duration threshold ONLY: conservative flags more cuts for review, aggressive
-// flags fewer. It does NOT change the locked detector method and CANNOT weaken the
-// cardinal rule - quote-map failures are still skipped and ambiguous boundaries
-// still flagged regardless of this setting. Persisted in localStorage by App.jsx.
+// Auto-cut picker (P4b - relabelled "Auto-cut" in the UI; the stored keys
+// conservative/balanced/aggressive and their thresholds are UNCHANGED). A pulldown
+// that tunes how much the detector PRE-SELECTS to cut on its own before the review
+// gate: "only obvious cuts" pre-selects the fewest, "more suggested cuts" the most.
+// It does NOT change the locked detector method and CANNOT weaken the cardinal rule -
+// quote-map failures are still skipped and ambiguous boundaries still flagged
+// regardless of this setting, and nothing is cut without passing the review gate.
+// The option text is the display label; the underlying value stays the raw key.
 function SensitivityPicker({ value, onChange, options = [] }) {
   if (!onChange) return null;
   const opts = options.includes(value) || !value ? options : [value, ...options];
   return (
-    <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-      <span className="ct-meta" style={{ color: "var(--fg-muted)", letterSpacing: "1.2px", textTransform: "uppercase" }}>Sensitivity</span>
-      <select
-        value={value || ""}
-        onChange={(e) => onChange(e.target.value)}
-        title="How readily the trim detector flags a cut for review. Conservative flags more cuts; aggressive flags fewer. This only tunes the review threshold - it never lets the detector trim an ambiguous or unmappable cut."
-        style={{
-          fontFamily: "var(--font-mono)", fontSize: 11, padding: "3px 8px",
-          border: "1px solid var(--rule)", background: "transparent",
-          color: "var(--fg)",
-        }}>
-        {opts.map((m) => (
-          <option key={m} value={m}>{m}</option>
-        ))}
-      </select>
+    <div style={{ display: "inline-flex", flexDirection: "column", gap: 3 }}>
+      <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <span className="ct-meta" style={{ color: "var(--fg-muted)", letterSpacing: "1.2px", textTransform: "uppercase" }}>Auto-cut</span>
+        <select
+          value={value || ""}
+          onChange={(e) => onChange(e.target.value)}
+          title="How much it trims on its own before asking you. 'Only obvious cuts' pre-selects the fewest; 'more suggested cuts' the most. It never auto-cuts anything risky - every cut is shown for review before anything is written."
+          style={{
+            fontFamily: "var(--font-mono)", fontSize: 11, padding: "3px 8px",
+            border: "1px solid var(--rule)", background: "transparent",
+            color: "var(--fg)",
+          }}>
+          {opts.map((m) => (
+            <option key={m} value={m}>{sensitivityLabelFor(m)}</option>
+          ))}
+        </select>
+      </div>
+      <span className="ct-meta" style={{ color: "var(--fg-muted)", fontSize: 9, letterSpacing: 0, textTransform: "none" }}>
+        How much it trims on its own before asking. It never auto-cuts anything risky.
+      </span>
     </div>
   );
 }
@@ -272,8 +280,6 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   sensitivity, setSensitivity, sensitivityOptions = [],
   announceOn = false, setAnnounceOn, announceOff, setAnnounceEpisode, announceStatus = {},
   trimOn = false, setTrimOn, trimOff, setTrimEpisode, trimStatus = {},
-  trimCuts = {}, trimAudioUrls = {},
-  trimSegments = {}, trimSelected = {}, onToggleSentence,
   devicePath, setShowMountDialog }) {
 
   const offSet = announceOff || new Set();
@@ -286,6 +292,14 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   const used = onDevice.reduce((s, x) => s + x.sizeMB, 0);
   const free = deviceCapacityMB - used;
   const overCap = totalMB > free;
+  // DOWNLOADS GATE (mirrors SyncScreen). An episode is in-flight while its download
+  // is not yet terminal (ready / error / cancelled). We surface the same waiting
+  // state here so SEND on Line-up is visibly blocked until every download finishes -
+  // and never blocks forever on a failed one (error/cancelled count as terminal).
+  const DOWNLOAD_TERMINAL = new Set(["ready", "error", "cancelled"]);
+  const downloadsPending = queue.filter(
+    (it) => !DOWNLOAD_TERMINAL.has(downloadByUuid[it.uuid]?.state)
+  ).length;
 
   const [dragId, setDragId] = useState(null);
   const [dropTarget, setDropTarget] = useState(null);
@@ -360,13 +374,15 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
       <Toolbar
-        label={`Ready · ${queue.length} episodes lined up`}
+        label={`Line-up · ${queue.length} episodes lined up`}
         title="Ready for your swim."
         subtitle={`${totalHM} · ${totalMB.toFixed(1)}MB · will write ${queue.length} file${queue.length > 1 ? "s" : ""}, remove ${removed.length}${playbackSpeed !== 1.0 ? ` · will re-encode at ${playbackSpeed}× playback speed` : ""}${boost ? " · boost on" : ""}${announceOn ? ` · announce ${queue.filter((q) => effectiveAnnounce(q.uuid, announceOn, offSet)).length}` : ""}${trimOn ? ` · trim ${queue.filter((q) => effectiveTrim(q.uuid, trimOn, trimOffSet)).length}` : ""}`}
         actions={<>
           <Btn variant="secondary" onClick={goUpNext}>+ add more</Btn>
-          <Btn variant="cta" onClick={goSync} disabled={overCap}>
-            {overCap ? "OVER CAPACITY" : `SEND TO HEADPHONES · ${queue.length} EP`}
+          <Btn variant="cta" onClick={goSync} disabled={overCap || downloadsPending > 0}>
+            {overCap ? "OVER CAPACITY"
+              : downloadsPending > 0 ? `WAITING FOR ${downloadsPending} DOWNLOAD${downloadsPending !== 1 ? "S" : ""}`
+              : `SEND TO HEADPHONES · ${queue.length} EP`}
           </Btn>
         </>}
       />
@@ -463,14 +479,6 @@ export function TodayScreen({ items, onDevice, setSelected, order, setOrder,
                   style={{ color: "var(--destructive)" }} title="remove">✕</button>
               </div>
             </div>
-            {trimOn && it.uuid && !trimOffSet.has(it.uuid) && (
-              <TranscriptCutReview uuid={it.uuid}
-                transcript={trimSegments[it.uuid]}
-                trimEntry={{ cuts: trimCuts[it.uuid] || [] }}
-                selected={trimSelected[it.uuid]}
-                onToggleSentence={onToggleSentence}
-                audioUrl={trimAudioUrls[it.uuid]} />
-            )}
             </div>
           );
         })}

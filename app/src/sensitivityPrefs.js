@@ -49,6 +49,26 @@ const SENSITIVITY_THRESHOLDS = {
 // The pulldown options, conservative first so the safest choice reads first.
 const SENSITIVITY_OPTIONS = ["conservative", "balanced", "aggressive"];
 
+// DISPLAY labels only (the control is relabelled "Auto-cut" in the UI). The
+// INTERNAL keys + thresholds above are unchanged - these map a stored key to the
+// human phrase shown in the picker. Framed as "how much it pre-selects to cut on
+// its own": conservative pre-selects the fewest (only obvious cuts), aggressive
+// pre-selects the most. No threshold numbers leak into the UI.
+const SENSITIVITY_LABELS = {
+  conservative: "only obvious cuts",
+  balanced: "suggested cuts",
+  aggressive: "more suggested cuts",
+};
+
+// Resolve a key to its display label, degrading an unknown / blank key to the
+// default level's label so the picker never renders a raw key or blank.
+function labelFor(level) {
+  const key = (typeof level === "string") ? level.trim().toLowerCase() : "";
+  return Object.prototype.hasOwnProperty.call(SENSITIVITY_LABELS, key)
+    ? SENSITIVITY_LABELS[key]
+    : SENSITIVITY_LABELS[DEFAULT_SENSITIVITY];
+}
+
 // Load the chosen sensitivity level. Returns DEFAULT_SENSITIVITY when nothing is
 // stored, the stored value is blank / unknown, or storage is unavailable.
 function loadSensitivity(storage) {
@@ -103,9 +123,11 @@ export {
   saveSensitivity,
   thresholdSecFor,
   loadThresholdSec,
+  labelFor,
   KEY,
   DEFAULT_SENSITIVITY,
   DEFAULT_THRESHOLD_SEC,
   SENSITIVITY_THRESHOLDS,
   SENSITIVITY_OPTIONS,
+  SENSITIVITY_LABELS,
 };
