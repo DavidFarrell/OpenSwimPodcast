@@ -22,8 +22,8 @@ describe("sensitivityPrefs - default", () => {
   });
 
   it("balanced maps to the LOCKED default threshold", () => {
-    expect(DEFAULT_THRESHOLD_SEC).toBe(150);
-    expect(thresholdSecFor("balanced")).toBe(150);
+    expect(DEFAULT_THRESHOLD_SEC).toBe(300);
+    expect(thresholdSecFor("balanced")).toBe(300);
     expect(SENSITIVITY_THRESHOLDS.balanced).toBe(DEFAULT_THRESHOLD_SEC);
   });
 
@@ -78,8 +78,8 @@ describe("sensitivityPrefs - persistence", () => {
   });
 
   it("loadThresholdSec resolves storage to the threshold in seconds", () => {
-    expect(loadThresholdSec(fakeStorage({ [KEY]: "conservative" }))).toBe(90);
-    expect(loadThresholdSec(fakeStorage({ [KEY]: "aggressive" }))).toBe(240);
+    expect(loadThresholdSec(fakeStorage({ [KEY]: "conservative" }))).toBe(120);
+    expect(loadThresholdSec(fakeStorage({ [KEY]: "aggressive" }))).toBe(360);
     expect(loadThresholdSec(fakeStorage())).toBe(DEFAULT_THRESHOLD_SEC);
   });
 });

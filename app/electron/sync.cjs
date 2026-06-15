@@ -20,14 +20,19 @@ const EDGE_SNAP_SEC = 45;
 
 // Post-edge-snap safety net (GPT-5 guard spec, cardinal-critical). The edge-snap
 // above can extend a cut all the way to 0 / the episode end; a short detected span
-// that snaps to a long edge cut must not auto-apply. So AFTER the snap, a cut is
-// forced needsReview (held back, never auto-applied) if the FINAL duration exceeds
+// that snaps to a long edge cut must not pre-select. So AFTER the snap, a cut is
+// forced needsReview (left grey, not pre-selected) if the FINAL duration exceeds
 // HARD_FINAL_CUT_MAX_SEC, or if the snap GREW the cut by more than
-// EDGE_SNAP_GROWTH_MAX_SEC. This applies regardless of detector mode (it is a net,
-// not a mode feature) and is INDEPENDENT of sensitivity. A cut already within both
-// bounds keeps its original flagging, so nothing legacy used to auto-apply is newly
-// held unless it breaches one of these caps.
-const HARD_FINAL_CUT_MAX_SEC = 45;
+// EDGE_SNAP_GROWTH_MAX_SEC. HARD_FINAL_CUT_MAX_SEC is now a PRE-SELECT sanity ceiling
+// (not blind-cut protection): the review gate surfaces every cut for approval before
+// any write, so the ceiling just stops a runaway-long final span from pre-selecting.
+// Set to 360 to match detectAds.cjs HARD_AUTOCUT_MAX_SEC - safely above the measured
+// max real-ad length (292s). The EDGE_SNAP_GROWTH_MAX_SEC guard (15s) is UNCHANGED:
+// a short span the snap balloons is still held, because that growth is the boundary
+// being fabricated by the snap, not a confidently-mapped long read. This applies
+// regardless of detector mode and is INDEPENDENT of sensitivity. A cut already within
+// both bounds keeps its original flagging.
+const HARD_FINAL_CUT_MAX_SEC = 360;
 const EDGE_SNAP_GROWTH_MAX_SEC = 15;
 
 // Bumped whenever the intro CHANGES in a way that the variant cache key would not

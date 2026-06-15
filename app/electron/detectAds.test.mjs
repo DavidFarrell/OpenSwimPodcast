@@ -156,7 +156,7 @@ describe("classifyRange()", () => {
     const r = classifyRange({ startIndex: 0, endIndex: 2, segments, endQuoteMapped: true });
     expect(r.needsReview).toBe(true);
     expect(r.reasons).toContain("over-threshold");
-    expect(NEEDS_REVIEW_MAX_SEC).toBe(150);
+    expect(NEEDS_REVIEW_MAX_SEC).toBe(300);
   });
 });
 
@@ -187,15 +187,15 @@ describe("classifyRange() - P4b sensitivity threshold tuning", () => {
   it("aggressive (higher threshold) keeps auto-applying a cut the default would flag", () => {
     const longSegs = [
       { start: 0, end: 4, text: "a" },
-      { start: 4, end: 200, text: "b" }, // 200s span
+      { start: 4, end: 330, text: "b" }, // 330s span
     ];
     const dflt = classifyRange({ startIndex: 0, endIndex: 1, segments: longSegs, endQuoteMapped: true });
-    expect(dflt.needsReview).toBe(true); // 200s > 150s default -> flagged
+    expect(dflt.needsReview).toBe(true); // 330s > 300s default -> flagged
 
     const aggressive = classifyRange({
-      startIndex: 0, endIndex: 1, segments: longSegs, endQuoteMapped: true, needsReviewMaxSec: 240,
+      startIndex: 0, endIndex: 1, segments: longSegs, endQuoteMapped: true, needsReviewMaxSec: 360,
     });
-    expect(aggressive.needsReview).toBe(false); // 200s < 240s -> auto-apply
+    expect(aggressive.needsReview).toBe(false); // 330s < 360s -> auto-apply
   });
 
   it("an invalid / non-positive threshold falls back to the locked default", () => {
@@ -255,17 +255,17 @@ describe("detectAds() - P4b sensitivity threading and fail-safes", () => {
     const longAd = {
       segments: [
         { speaker: "S", start: 0, end: 5, text: "Our show today is brought to you by Acme VPN." },
-        { speaker: "S", start: 5, end: 200, text: "Visit Acme dot com slash show for three months free." },
-        { speaker: "S", start: 200, end: 400, text: "We're back, so anyway where were we." },
+        { speaker: "S", start: 5, end: 330, text: "Visit Acme dot com slash show for three months free." },
+        { speaker: "S", start: 330, end: 500, text: "We're back, so anyway where were we." },
       ],
     };
     const dflt = await detectAds({ transcript: longAd, fetch: fetchReturning(adQuotes) });
-    expect(dflt.ads[0].needsReview).toBe(true); // 200s > 150s default
+    expect(dflt.ads[0].needsReview).toBe(true); // 330s > 300s default
 
     const aggressive = await detectAds({
-      transcript: longAd, fetch: fetchReturning(adQuotes), needsReviewMaxSec: 240,
+      transcript: longAd, fetch: fetchReturning(adQuotes), needsReviewMaxSec: 360,
     });
-    expect(aggressive.ads[0].needsReview).toBe(false); // 200s < 240s
+    expect(aggressive.ads[0].needsReview).toBe(false); // 330s < 360s
   });
 
   it("CARDINAL: aggressive NEVER auto-applies a quote-map-failed ad - it is skipped entirely", async () => {
@@ -666,10 +666,10 @@ describe("mapGepaSpan() - char interpolation + guards + type policy", () => {
     expect(cut.reasons).toContain("non-unique-quote");
   });
 
-  it("GUARD: span duration over the 45s HARD cap -> needs-review (hard-cap)", () => {
-    // A single 80s segment; the quoted span runs most of it -> > 45s.
+  it("GUARD: span duration over the 360s HARD cap -> needs-review (hard-cap)", () => {
+    // A single 400s segment; the quoted span runs most of it -> > 360s.
     const segs = [
-      { speaker: "S", start: 0, end: 80, text: "Our sponsor today is Acme and here is a very long read about everything Acme does and a code." },
+      { speaker: "S", start: 0, end: 400, text: "Our sponsor today is Acme and here is a very long read about everything Acme does and a code." },
     ];
     const ns = segs.map((s) => norm(s.text));
     const cut = mapGepaSpan({
@@ -753,12 +753,12 @@ describe("mapGepaSpan() - char interpolation + guards + type policy", () => {
     expect(cut.reasons.some((r) => r.startsWith("type-"))).toBe(false);
   });
 
-  it("GUARD: sensitivity can never RAISE the 45s hard cap", () => {
+  it("GUARD: sensitivity can never RAISE the 360s hard cap", () => {
     const segs = [
-      { speaker: "S", start: 0, end: 80, text: "Our sponsor today is Acme and here is a very long read about everything Acme does and a code." },
+      { speaker: "S", start: 0, end: 400, text: "Our sponsor today is Acme and here is a very long read about everything Acme does and a code." },
     ];
     const ns = segs.map((s) => norm(s.text));
-    // A hugely permissive needsReviewMaxSec must NOT let a >45s span auto-apply.
+    // A hugely permissive needsReviewMaxSec must NOT let a >360s span auto-apply.
     const cut = mapGepaSpan({
       span: { type: "ad", subtype: null, start_quote: "Our sponsor today is Acme", end_quote: "and a code" },
       segments: segs, normSegs: ns, idxList: [0], needsReviewMaxSec: 100000,

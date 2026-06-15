@@ -855,28 +855,28 @@ describe("adToCut positional intro/outro handling", () => {
   });
 
   it("preserves the needsReview flag from the detector", () => {
-    const cut = adToCut({ ad: { startSec: 900, endSec: 1000, needsReview: true, reasons: ["over-threshold"] }, segments });
+    const cut = adToCut({ ad: { startSec: 900, endSec: 1300, needsReview: true, reasons: ["over-threshold"] }, segments });
     expect(cut.needsReview).toBe(true);
     // The detector's reason is preserved; the post-snap guard also fires here (the
-    // 100s span > 45s hard cap) and appends its own reason - union, never dropped.
+    // 400s span > 360s hard cap) and appends its own reason - union, never dropped.
     expect(cut.reasons).toContain("over-threshold");
     expect(cut.reasons).toContain("post-snap-hard-cap");
   });
 
-  // The post-edge-snap hard cap (GPT-5 guard spec) holds ANY final cut > 45s for
+  // The post-edge-snap hard cap (GPT-5 guard spec) holds ANY final cut > 360s for
   // review, independent of detector mode and sensitivity, even a clean mid-roll the
   // detector did not flag. A short cut that the edge-snap GROWS by > 15s is held too.
-  it("holds a clean >45s mid-roll for review via the post-snap hard cap", () => {
-    const cut = adToCut({ ad: { startSec: 900, endSec: 1000, needsReview: false, reasons: [] }, segments });
+  it("holds a clean >360s mid-roll for review via the post-snap hard cap", () => {
+    const cut = adToCut({ ad: { startSec: 900, endSec: 1300, needsReview: false, reasons: [] }, segments });
     expect(cut.needsReview).toBe(true);
     expect(cut.reasons).toContain("post-snap-hard-cap");
     // The boundaries themselves are untouched - we only flag, never re-cut here.
     expect(cut.startSec).toBe(900);
-    expect(cut.endSec).toBe(1000);
+    expect(cut.endSec).toBe(1300);
   });
 
-  it("leaves a clean <=45s mid-roll auto-applyable (within both caps -> not newly flagged)", () => {
-    const cut = adToCut({ ad: { startSec: 900, endSec: 930, needsReview: false, reasons: [] }, segments });
+  it("leaves a clean <=360s mid-roll auto-applyable (within both caps -> not newly flagged)", () => {
+    const cut = adToCut({ ad: { startSec: 900, endSec: 1000, needsReview: false, reasons: [] }, segments });
     expect(cut.needsReview).toBe(false);
     expect(cut.reasons).toEqual([]);
     expect(cut.label).toBe("ad");
@@ -1469,7 +1469,7 @@ describe("runSync trim stage", () => {
       { start: 600, end: 640, text: "this ad" },
       { start: 700, end: 1300, text: "back to it" },
     ] }));
-    // A clean 40s mid-roll (within the 45s post-snap hard cap) auto-applies, so the
+    // A clean 40s mid-roll (within the 360s post-snap hard cap) auto-applies, so the
     // converter still receives a cut and the model-threading assertion holds.
     const detectAdsFn = vi.fn(async ({ model }) => {
       expect(model).toBe("qwen/qwen3-14b");
@@ -1657,7 +1657,7 @@ describe("runSync trim stage", () => {
 
   it("CARDINAL (Fix 1): a confident-only episode is STILL surfaced for review (no silent auto-cut)", async () => {
     fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
-    // A confident mid-roll within the 45s hard cap (away from edges). Under the
+    // A confident mid-roll within the 360s hard cap (away from edges). Under the
     // redesign this is NOT cut silently - it is surfaced for review (pre-yellow), and
     // only applied once the user's resolution includes it.
     const transcribeFn = vi.fn(async () => ({ segments: [

@@ -8,7 +8,7 @@
 //
 // Semantics (the ONLY thing this changes):
 //   - conservative -> LOWER threshold -> more cuts cross it -> MORE flagging.
-//   - balanced     -> the LOCKED default threshold (~2.5 min). This is the default.
+//   - balanced     -> the LOCKED default threshold (5 min). This is the default.
 //   - aggressive   -> HIGHER threshold -> fewer cuts cross it -> LESS flagging.
 //
 // It does NOT change the locked detector method (windowing + quote-boundary
@@ -25,19 +25,25 @@
 const KEY = "os_sensitivity";
 
 // The LOCKED default threshold (seconds). Must match detectAds.cjs
-// NEEDS_REVIEW_MAX_SEC. "balanced" maps to exactly this so the default behaviour
-// is unchanged from before this setting existed.
-const DEFAULT_THRESHOLD_SEC = 150; // ~2.5 minutes
+// NEEDS_REVIEW_MAX_SEC. "balanced" maps to exactly this. Raised from 150 to 300:
+// the review gate now surfaces every cut for approval before any write, so this
+// threshold only decides which clean spans START pre-selected, not what gets cut
+// blind. 300 sits just above the measured max real-ad length (292s) so genuine
+// long host-reads pre-select instead of opening the review with nothing selected.
+const DEFAULT_THRESHOLD_SEC = 300; // 5 minutes
 
 // The default sensitivity level.
 const DEFAULT_SENSITIVITY = "balanced";
 
-// Level -> needs-review threshold in seconds. Lower = flags more. The order here
-// is the cardinal invariant of this feature: conservative < balanced < aggressive.
+// Level -> needs-review threshold in seconds. Lower = flags more (fewer clean spans
+// start pre-selected). The order here is the cardinal invariant of this feature:
+// conservative < balanced < aggressive. Raised in step with DEFAULT_THRESHOLD_SEC
+// (300) now that the review gate surfaces every cut before any write - these tune
+// which clean spans START pre-selected, never what is cut blind.
 const SENSITIVITY_THRESHOLDS = {
-  conservative: 90, // 1.5 min - flags more
-  balanced: DEFAULT_THRESHOLD_SEC, // 2.5 min - locked default
-  aggressive: 240, // 4 min - flags less
+  conservative: 120, // 2 min - flags more
+  balanced: DEFAULT_THRESHOLD_SEC, // 5 min - locked default
+  aggressive: 360, // 6 min - flags less
 };
 
 // The pulldown options, conservative first so the safest choice reads first.

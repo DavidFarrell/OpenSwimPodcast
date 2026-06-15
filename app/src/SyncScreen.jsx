@@ -311,6 +311,13 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     ? review.items.reduce((n, it) => n + selectedCount(reviewSelected[it.uuid]), 0)
     : 0;
 
+  // Total cuts the DETECTOR found across all reviewed episodes. Surfaced alongside
+  // the selected-line count so "0 selected" never reads as "found nothing" - the
+  // detector may have found several cuts that are all grey (held) pending a click.
+  const reviewCutsFound = review
+    ? review.items.reduce((n, it) => n + ((it.cuts && it.cuts.length) || 0), 0)
+    : 0;
+
   const stageCounts = stages.map((st) => ({
     ...st,
     count: serverPlan.filter((p) => p.stage === st.id).length,
@@ -463,7 +470,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
               <div>
                 <div className="ct-label" style={{ color: "var(--ct-amber)" }}>Review before sending</div>
                 <div className="ct-subhead" style={{ marginTop: 4 }}>
-                  {reviewSelectedLines} line{reviewSelectedLines !== 1 ? "s" : ""} selected to cut across {review.items.length} episode{review.items.length !== 1 ? "s" : ""}
+                  {reviewCutsFound} cut{reviewCutsFound !== 1 ? "s" : ""} found · {reviewSelectedLines} line{reviewSelectedLines !== 1 ? "s" : ""} selected to cut across {review.items.length} episode{review.items.length !== 1 ? "s" : ""}
                 </div>
               </div>
               <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--ct-amber)" }}></div>

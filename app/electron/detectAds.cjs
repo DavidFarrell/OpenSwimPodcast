@@ -33,9 +33,14 @@ const LMSTUDIO_TIMEOUT_MS = 10 * 60 * 1000;
 const WIN = 1800.0; // 30-minute window
 const STRIDE = 1620.0; // 27-minute step => 3-minute overlap
 
-// Needs-review threshold: a cut longer than this (in seconds) is flagged for
-// review instead of auto-applied. Starting heuristic from BUILD_PLAN.md, tunable.
-const NEEDS_REVIEW_MAX_SEC = 150; // ~2.5 minutes
+// Needs-review threshold: a clean, well-mapped cut longer than this (in seconds)
+// is left grey (not pre-selected) instead of pre-selected yellow. The review gate
+// now surfaces EVERY cut for approval before any write, so this is no longer a
+// blind-cut guard - it only decides which clean spans START pre-selected. Raised
+// from 150 to 300 because measured real host-read ad blocks run 119-292s and were
+// all being left grey at 150, so the review opened with nothing pre-selected.
+// Tunable via the sensitivity slider.
+const NEEDS_REVIEW_MAX_SEC = 300; // 5 minutes
 
 // The prompt is identical in spirit to the reference VERIFY_INSTRUCTION. Kept
 // verbatim so the detector behaves exactly as the locked evaluation proved.
@@ -132,13 +137,16 @@ function resolveMode(mode) {
   return m === "gepa" ? "gepa" : DEFAULT_MODE;
 }
 
-// HARD auto-cut cap (seconds). A mapped span (and, in sync.cjs, the post-edge-snap
-// final cut) longer than this is ALWAYS flagged needs-review, never auto-applied.
-// This is INDEPENDENT of the caller's needsReviewMaxSec / sensitivity: sensitivity
-// may only make flagging MORE aggressive (a lower threshold), it can NEVER raise
-// this cap. fast-diarise caps turns at ~60s, so an ad that fills most of one long
-// turn lands just under here - the long-turn guard below catches that case too.
-const HARD_AUTOCUT_MAX_SEC = 45;
+// HARD pre-select sanity ceiling (seconds). A mapped span (and, in sync.cjs, the
+// post-edge-snap final cut) longer than this is ALWAYS left grey (needs-review),
+// never pre-selected. This is now a SANITY CEILING, not blind-cut protection: the
+// review gate surfaces every cut for approval before any write, so the ceiling just
+// stops an absurdly long span (a runaway mis-map) from pre-selecting. Set to 360 -
+// safely above the measured max real-ad length (292s) so genuine long host-reads
+// pre-select, while anything beyond ~6 minutes is held for a closer look. It is
+// INDEPENDENT of the caller's needsReviewMaxSec / sensitivity: sensitivity may only
+// make flagging MORE aggressive (a lower threshold), it can NEVER raise this ceiling.
+const HARD_AUTOCUT_MAX_SEC = 360;
 
 // When start_quote and end_quote map to the SAME segment and that segment is at
 // least this long, a mapped span covering most of it (>= LONG_TURN_COVER_FRAC) is
