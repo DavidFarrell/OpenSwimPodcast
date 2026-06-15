@@ -18,7 +18,8 @@ import {
   loadTrimOff, saveTrimOff,
   effectiveTrim,
 } from "./trimPrefs.js";
-import { buildTrimAudioUrls, applyCutEdit } from "./trimAudio.js";
+import { buildTrimAudioUrls } from "./trimAudio.js";
+import { sentenceLines, preselectFromCuts, toggleSentence } from "./transcriptToggle.js";
 import { loadModel, saveModel, MODEL_OPTIONS } from "./modelPrefs.js";
 import {
   loadSensitivity, saveSensitivity, thresholdSecFor, SENSITIVITY_OPTIONS,
@@ -113,33 +114,31 @@ export default function App() {
   // transcript-as-evidence view (P3d) reads these to highlight the detected ad
   // ranges in context. Optional - the view renders nothing without segments.
   const [trimSegments, setTrimSegments] = useState({});
-  // Recorded keep/remove decisions for FLAGGED cuts, keyed by uuid then cut key
-  // ({ uuid: { "start-end": "keep" | "remove" } }). Default is keep everywhere
-  // (cardinal rule); only an explicit remove lets a flagged cut be applied.
-  const [trimDecisions, setTrimDecisions] = useState({});
-  const onTrimDecide = (uuid, cut, decision) => {
-    if (!uuid || !cut) return;
-    const key = `${Math.round(Number(cut.startSec) * 1000)}-${Math.round(Number(cut.endSec) * 1000)}`;
-    const value = decision === "remove" ? "remove" : "keep";
-    setTrimDecisions((prev) => ({ ...prev, [uuid]: { ...(prev[uuid] || {}), [key]: value } }));
-    const api = typeof window !== "undefined" && window.openswim && window.openswim.trim;
-    if (api && api.decide) api.decide(uuid, cut, value);
+  // TRANSCRIPT-TOGGLE REDESIGN. The SELECTED (yellow) sentence indices per episode,
+  // keyed by uuid -> Set<number>. This is the authoritative review state: the
+  // detector's cuts seed it (preselectFromCuts), the user toggles sentences, and at
+  // "Continue" the contiguous selected runs become the final cut ranges. Seeded from
+  // the trim event below; a per-uuid seed-signature guards against clobbering the
+  // user's toggles when the same cut list re-arrives, while still re-seeding when a
+  // genuinely new cut list comes in.
+  const [trimSelected, setTrimSelected] = useState({});
+  const trimSeedSigRef = useRef({});
+  const seedTrimSelection = (uuid, segments, cuts) => {
+    if (!uuid) return;
+    const sig = JSON.stringify((cuts || []).map((c) => [c.startSec, c.endSec]));
+    if (trimSeedSigRef.current[uuid] === sig) return; // same cuts already seeded - keep edits
+    trimSeedSigRef.current[uuid] = sig;
+    const lines = sentenceLines({ segments: segments || [] });
+    const sel = preselectFromCuts(lines, { cuts: cuts || [] });
+    setTrimSelected((prev) => ({ ...prev, [uuid]: sel }));
   };
-  // Boundary edit for a FLAGGED cut (P3b nudge / typed timestamp). The new cut
-  // already passed cutlistReview's invert guard, so here we just (1) swap the
-  // boundaries in the in-memory cut list for an immediate redraw and (2) persist
-  // the edit through IPC so it survives a re-process. CARDINAL RULE: this only
-  // changes WHAT a later REMOVE would cut - it never applies a cut.
-  const onTrimEdit = (uuid, originalCut, newCut) => {
-    if (!uuid || !originalCut || !newCut) return;
-    setTrimCuts((prev) => {
-      const cur = prev[uuid];
-      const next = applyCutEdit(cur, originalCut, newCut);
-      if (next === cur) return prev;
-      return { ...prev, [uuid]: next };
-    });
-    const api = typeof window !== "undefined" && window.openswim && window.openswim.trim;
-    if (api && api.edit) api.edit(uuid, originalCut, newCut);
+  // Toggle one sentence in/out of an episode's selected set (the editing gesture).
+  // CARDINAL RULE: this only changes WHAT will be cut at Continue; it cuts nothing
+  // itself. The commit (SyncScreen) reads trimSelected -> selectedToRanges -> the
+  // explicit cut-set IPC.
+  const onToggleSentence = (uuid, index) => {
+    if (!uuid || !Number.isFinite(index)) return;
+    setTrimSelected((prev) => ({ ...prev, [uuid]: toggleSentence(prev[uuid] || new Set(), index) }));
   };
   const [selected, setSelected] = useState([]);
   const [order, setOrder] = useState([]);
@@ -211,6 +210,13 @@ export default function App() {
         }
         if (Array.isArray(evt.segments)) {
           setTrimSegments((prev) => ({ ...prev, [evt.uuid]: evt.segments }));
+        }
+        // Seed the transcript-toggle selection from the detector's cuts the moment a
+        // cut list + its segments are known, so the redesigned review surface opens
+        // with the detector's cuts already yellow (default == today). Re-seeds only
+        // when a genuinely new cut list arrives (signature guard inside).
+        if (Array.isArray(evt.cuts) && Array.isArray(evt.segments)) {
+          seedTrimSelection(evt.uuid, evt.segments, evt.cuts);
         }
       }
     });
@@ -411,9 +417,8 @@ export default function App() {
                 trimStatus={trimStatus}
                 trimCuts={trimCuts}
                 trimSegments={trimSegments}
-                trimDecisions={trimDecisions}
-                onTrimDecide={onTrimDecide}
-                onTrimEdit={onTrimEdit}
+                trimSelected={trimSelected}
+                onToggleSentence={onToggleSentence}
                 trimAudioUrls={buildTrimAudioUrls(downloadByUuid)}
                 devicePath={device.mounted ? device.path : null}
                 setShowMountDialog={setShowMountDialog} />

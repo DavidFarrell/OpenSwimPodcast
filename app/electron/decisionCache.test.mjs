@@ -7,6 +7,7 @@ import os from "node:os";
 const require = createRequire(import.meta.url);
 const {
   cutKey, decisionSidecarPath, readDecisions, writeDecisions, applyDecisions,
+  cutSetSidecarPath, writeCutSet, readCutSet, sanitizeCutSet,
 } = require("./decisionCache.cjs");
 const { fingerprint } = require("./transcribe.cjs");
 
@@ -192,5 +193,72 @@ describe("adjusted-remove sidecar round-trip", () => {
       "5-6": "remove",                                       // a real plain remove survives
     } });
     expect(await readDecisions({ src })).toEqual({ "5-6": "remove" });
+  });
+});
+
+describe("read/writeCutSet round-trip (transcript-toggle redesign, first-class cut-set)", () => {
+  let dir, src;
+  beforeEach(() => {
+    dir = mkTmp();
+    src = path.join(dir, "ep.mp3");
+    fs.writeFileSync(src, Buffer.from("episode audio bytes"));
+  });
+  afterEach(() => rmTmp(dir));
+
+  it("persists an explicit cut-set and reads it back VERBATIM, fingerprint-keyed", async () => {
+    expect(await writeCutSet({ src, ranges: [[1390, 1445], [600, 660]] })).toBe(true);
+    // Sorted by start on the way in.
+    expect(await readCutSet({ src })).toEqual([[600, 660], [1390, 1445]]);
+    // Written to the cutset sidecar (not the decisions one).
+    const fp = await fingerprint(src);
+    expect(fs.existsSync(cutSetSidecarPath(src, fp))).toBe(true);
+  });
+
+  it("CARDINAL (Fix 3): an EMPTY cut-set persists and replays as [] (reviewed = cut nothing), NOT null", async () => {
+    expect(await writeCutSet({ src, ranges: [] })).toBe(true);
+    const back = await readCutSet({ src });
+    expect(back).toEqual([]);          // reviewed: cut nothing
+    expect(back).not.toBe(null);       // distinct from "never reviewed"
+  });
+
+  it("readCutSet returns null when NO cut-set was persisted (never reviewed -> fall back)", async () => {
+    expect(await readCutSet({ src })).toBe(null);
+  });
+
+  it("replays a user-ADDED range the detector never proposed (round-trips verbatim)", async () => {
+    // A range with no relation to any detected cut - the legacy decision map could
+    // not carry this; the first-class cut-set does.
+    await writeCutSet({ src, ranges: [[12.5, 47.25]] });
+    expect(await readCutSet({ src })).toEqual([[12.5, 47.25]]);
+  });
+
+  it("CARDINAL: malformed ranges are dropped on write (never widened)", async () => {
+    await writeCutSet({ src, ranges: [
+      [600, 660],      // ok
+      [700, 700],      // zero-length -> dropped
+      [900, 800],      // inverted -> dropped
+      [-5, 10],        // negative -> dropped
+      [Number.NaN, 5], // non-finite -> dropped
+      { startSec: 1000, endSec: 1030 }, // object form ok
+    ] });
+    expect(await readCutSet({ src })).toEqual([[600, 660], [1000, 1030]]);
+  });
+
+  it("a re-downloaded (different-fingerprint) file misses the old cut-set", async () => {
+    await writeCutSet({ src, ranges: [[600, 660]] });
+    fs.writeFileSync(src, Buffer.from("completely different audio now"));
+    expect(await readCutSet({ src })).toBe(null);
+  });
+
+  it("a corrupt cut-set sidecar reads as null (never throws)", async () => {
+    const fp = await fingerprint(src);
+    fs.writeFileSync(cutSetSidecarPath(src, fp), "{ not json");
+    expect(await readCutSet({ src })).toBe(null);
+  });
+
+  it("sanitizeCutSet accepts tuples and {startSec,endSec}, drops malformed, sorts", () => {
+    expect(sanitizeCutSet([[3, 4], { startSec: 1, endSec: 2 }, [9, 9]]))
+      .toEqual([[1, 2], [3, 4]]);
+    expect(sanitizeCutSet("nope")).toEqual([]);
   });
 });

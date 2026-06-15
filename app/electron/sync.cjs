@@ -7,7 +7,7 @@ const { transcribe: defaultTranscribe } = require("./transcribe.cjs");
 const { buildAnnouncementText: defaultBuildAnnouncementText } = require("./announce.cjs");
 const { renderIntro: defaultRenderIntro } = require("./tts.cjs");
 const { detectAds: defaultDetectAds, toSegments } = require("./detectAds.cjs");
-const { readDecisions: defaultReadDecisions, applyDecisions } = require("./decisionCache.cjs");
+const { readDecisions: defaultReadDecisions, applyDecisions, readCutSet: defaultReadCutSet } = require("./decisionCache.cjs");
 const { logEvent } = require("./logger.cjs");
 
 // A detected ad block is treated as a positional intro/outro (and snapped to the
@@ -369,6 +369,7 @@ async function generateCuts({
   // head-to-head calls with detectorMode:"gepa".
   detectorMode = "legacy",
   readDecisionsFn = defaultReadDecisions,
+  readCutSetFn = defaultReadCutSet,
   transcript: providedTranscript, hasTranscript = false,
 }) {
   try {
@@ -416,15 +417,40 @@ async function generateCuts({
     const detected = result.ads.map((ad) => adToCut({ ad, segments }))
       .filter((c) => Number.isFinite(c.startSec) && Number.isFinite(c.endSec) && c.endSec > c.startSec);
 
-    // Reuse any previously-reviewed decisions for this exact episode. A cache
-    // miss / corrupt cache yields {} so the cut list is flagged as detected.
-    let decisions = {};
+    // PRECEDENCE: a previously-reviewed EXPLICIT cut-set for this exact episode wins
+    // over the detector AND the legacy decision map. The transcript-toggle redesign
+    // persists the user's final selection as a first-class cut-set (decisionCache
+    // readCutSet); when one exists for this audio fingerprint, REPLACE the detector's
+    // cuts with exactly those ranges so the reviewed choice sticks across re-process -
+    // including an EMPTY set (the user reviewed and chose to cut nothing -> no cuts),
+    // a de-selected confident cut, and a user-ADDED range the detector never proposed.
+    // readCutSet returns null when NO cut-set was persisted (never reviewed), in which
+    // case we fall back to the detector + legacy decision path below. A cut-set is
+    // emitted as confident (needsReview:false) so that, when re-surfaced for review
+    // (Fix 1), it starts pre-yellow == the user's prior selection.
+    let savedCutSet = null;
     try {
-      decisions = await readDecisionsFn({ src });
+      savedCutSet = await readCutSetFn({ src });
     } catch {
-      decisions = {};
+      savedCutSet = null;
     }
-    const cuts = applyDecisions(detected, decisions);
+    let cuts;
+    if (Array.isArray(savedCutSet)) {
+      cuts = savedCutSet
+        .map((r) => ({ startSec: Number(r[0]), endSec: Number(r[1]), needsReview: false, reasons: [], label: "ad", decided: "remove" }))
+        .filter((c) => Number.isFinite(c.startSec) && Number.isFinite(c.endSec) && c.endSec > c.startSec);
+      logEvent("trim", `reusing reviewed cut-set: ${cuts.length} range(s) replace ${detected.length} detected cut(s)`);
+    } else {
+      // No reviewed cut-set. Reuse any legacy per-cut decisions for this episode (a
+      // cache miss / corrupt cache yields {} so the cut list is flagged as detected).
+      let decisions = {};
+      try {
+        decisions = await readDecisionsFn({ src });
+      } catch {
+        decisions = {};
+      }
+      cuts = applyDecisions(detected, decisions);
+    }
 
     if (cuts.length === 0) return { status: "ready", cuts: [], segments: [] };
     const status = cuts.some((c) => c.needsReview) ? "needs-review" : "ready";
@@ -436,14 +462,54 @@ async function generateCuts({
   }
 }
 
+// Resolve one reviewed episode's FINAL cut list from the gate's decision for it.
+// The gate resolves per uuid to ONE OF two shapes:
+//
+//   (a) LEGACY decision map { cutKey: "keep" | "remove" | {action,startSec,endSec} }
+//       - the per-detected-cut keep/remove (+ boundary edit) model. Folded via
+//         applyDecisions exactly as before: a "remove" un-flags the detected cut so
+//         it auto-applies, "keep" drops it, an undecided flagged cut stays held.
+//
+//   (b) EXPLICIT cut-set { __cutSet: [[startSec,endSec], ...] } - the transcript-
+//       toggle redesign's output. The user reviewed the WHOLE transcript and the
+//       returned ranges ARE the authoritative final cut set for the episode: REPLACE
+//       the episode's cuts with exactly these ranges as auto-apply (needsReview:false)
+//       cuts. Nothing the user did not select is cut; the detector's original flagged
+//       cuts are discarded in favour of the user's explicit set. An empty / missing
+//       __cutSet means the user selected nothing -> NO cuts (cardinal-rule safe: the
+//       episode ships untouched).
+//
+// CARDINAL RULE: in BOTH shapes, only what the user affirmatively chose is cut. The
+// explicit set is fail-closed by construction - a malformed range (non-finite or
+// non-forward) is dropped, never widened, so an ambiguous range is never cut.
+function resolveEpisodeCuts(detectedCuts, decision) {
+  const cuts = Array.isArray(detectedCuts) ? detectedCuts : [];
+  if (decision && typeof decision === "object" && Array.isArray(decision.__cutSet)) {
+    const out = [];
+    for (const r of decision.__cutSet) {
+      const s = Array.isArray(r) ? Number(r[0]) : Number(r && r.startSec);
+      const e = Array.isArray(r) ? Number(r[1]) : Number(r && r.endSec);
+      if (!Number.isFinite(s) || !Number.isFinite(e) || !(e > s) || s < 0) continue;
+      out.push({ startSec: s, endSec: e, needsReview: false, reasons: [], label: "ad", decided: "remove" });
+    }
+    out.sort((a, b) => a.startSec - b.startSec);
+    return out;
+  }
+  // Legacy per-cut decision map.
+  return applyDecisions(cuts, decision || {});
+}
+
 // The review gate. When an episode has cuts still flagged needs-review after
 // detection, the pipeline HOLDS here and hands the flagged items to this
-// callback, which resolves to a per-uuid decision map ({ uuid: { cutKey: "keep"
-// | "remove" | {action,startSec,endSec} } }) once the user has decided. The
-// default resolves to {} immediately - no decisions, so every flagged cut stays
-// held back (never auto-applied; cardinal rule) and the run continues exactly as
-// it did before the gate existed. The IPC layer injects the real interactive
-// implementation; unit tests inject their own, so this default never blocks them.
+// callback, which resolves to a per-uuid decision ({ uuid: <decision> }) once the
+// user has decided. <decision> is EITHER a legacy per-cut map ({ cutKey: "keep" |
+// "remove" | {action,startSec,endSec} }) OR an explicit final cut-set
+// ({ __cutSet: [[startSec,endSec], ...] } - the transcript-toggle redesign). See
+// resolveEpisodeCuts. The default resolves to {} immediately - no decisions, so
+// every flagged cut stays held back (never auto-applied; cardinal rule) and the run
+// continues exactly as it did before the gate existed. The IPC layer injects the
+// real interactive implementation; unit tests inject their own, so this default
+// never blocks them.
 async function defaultAwaitReview() { return {}; }
 
 async function runSync({
@@ -456,6 +522,7 @@ async function runSync({
   renderIntroFn = defaultRenderIntro,
   detectAdsFn = defaultDetectAds,
   readDecisionsFn = defaultReadDecisions,
+  readCutSetFn = defaultReadCutSet,
   awaitReview = defaultAwaitReview,
   // Best-effort probe of an output file's real duration (seconds). Defaults to a
   // null no-op so unit tests stay hermetic (no ffmpeg spawn); the IPC layer
@@ -580,7 +647,7 @@ async function runSync({
       let res;
       try {
         res = await generateCuts({
-          src, transcribeFn, detectAdsFn, readDecisionsFn, llmFetch, model, needsReviewMaxSec, detectorMode, signal,
+          src, transcribeFn, detectAdsFn, readDecisionsFn, readCutSetFn, llmFetch, model, needsReviewMaxSec, detectorMode, signal,
           transcript, hasTranscript: true,
         });
       } catch (e) {
@@ -630,17 +697,21 @@ async function runSync({
   if (announceItems.length) emit({ type: "stage", stage: "announce", state: "done" });
 
   // Stage: review gate.
-  // If any trim episode still has cuts flagged needs-review (uncertain: over the
-  // safe length, or an ambiguous boundary the detector couldn't pin), HOLD the
-  // pipeline here and let the user approve / reject / adjust them before anything
-  // is encoded or written to the device. CONFIDENT cuts are untouched - they
-  // already auto-apply - so a run with no uncertain cuts skips this gate entirely
-  // and continues exactly as before. CARDINAL RULE: a flagged cut left undecided
-  // stays held back (never auto-applied); only an explicit "remove" cuts it.
+  // HOLD the pipeline here whenever a trim episode has ANY cut at all - confident OR
+  // flagged - and let the user see + approve them in the transcript surface before
+  // anything is encoded or written to the device. This is the transcript-toggle
+  // redesign's whole point: the user sees and controls everything, so NOTHING auto-
+  // applies to the converter without having been surfaced for review first. Confident
+  // cuts start pre-selected (yellow) in the surface, so the DEFAULT outcome matches
+  // the old behaviour (they get cut unless the user greys them) - but they are no
+  // longer cut silently. An episode with NO cuts at all skips this gate entirely.
+  // CARDINAL RULE: a surfaced cut that the gate does not resolve is NOT auto-applied
+  // (the fold below fails closed on a missing resolution); only what the user's
+  // resolution explicitly includes is cut.
   const reviewItems = trimItems
     .map(({ it, i }) => {
       const cuts = (trimResults[i] && trimResults[i].cuts) || [];
-      if (!cuts.some((c) => c && c.needsReview)) return null;
+      if (!cuts.length) return null; // nothing detected -> nothing to surface
       return {
         i, uuid: it.uuid, slot: it.slot, title: it.title, ext: it.ext || "mp3",
         cuts,
@@ -652,7 +723,7 @@ async function runSync({
   if (reviewItems.length) {
     throwIfAborted();
     const payload = reviewItems.map(({ i, ...rest }) => rest);
-    logEvent("review", `holding for review: ${reviewItems.length} episode(s) with flagged cuts`);
+    logEvent("review", `holding for review: ${reviewItems.length} episode(s) with cuts to approve`);
     emit({ type: "stage", stage: "review", state: "active" });
     emit({ type: "review", items: payload });
     let decisionsByUuid = {};
@@ -665,12 +736,22 @@ async function runSync({
       decisionsByUuid = {};
     }
     throwIfAborted();
-    // Fold the user's decisions into each reviewed episode's cut list. A decided
-    // "remove" un-flags the cut so the converter applies it; "keep" drops it; an
-    // undecided flagged cut stays flagged and is therefore held back below.
+    // Fold the user's decision into each reviewed episode's cut list. The decision
+    // is EITHER a legacy per-cut keep/remove map OR an explicit final cut-set (the
+    // transcript-toggle redesign) - resolveEpisodeCuts handles both. A decided
+    // "remove" / a selected range becomes an auto-apply cut; "keep" / an un-selected
+    // range is dropped; an undecided flagged cut stays flagged and is held back below.
+    //
+    // FAIL-CLOSED (cardinal rule): an episode was SURFACED for review, so NOTHING of
+    // it may auto-apply unless the gate resolved it. If the gate returned NO entry for
+    // this episode (a failed/empty gate, or a default no-op gate), treat it as an
+    // EMPTY explicit cut-set => cut nothing. Only an episode the gate explicitly
+    // resolved (an __cutSet, or a legacy keep/remove map) applies anything. This is
+    // what stops a confident cut that was surfaced-but-unresolved from being cut.
     for (const item of reviewItems) {
-      const d = (decisionsByUuid && decisionsByUuid[item.uuid]) || {};
-      const updated = applyDecisions(trimResults[item.i].cuts, d);
+      const hasEntry = !!(decisionsByUuid && Object.prototype.hasOwnProperty.call(decisionsByUuid, item.uuid));
+      const d = hasEntry ? decisionsByUuid[item.uuid] : { __cutSet: [] };
+      const updated = resolveEpisodeCuts(trimResults[item.i].cuts, d);
       trimResults[item.i] = { ...trimResults[item.i], cuts: updated };
       const auto = updated.filter((c) => !c.needsReview).length;
       const held = updated.filter((c) => c && c.needsReview).length;
@@ -898,4 +979,4 @@ async function runSync({
   return { ok: true, files: dests, transferred, totals };
 }
 
-module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, generateCuts, adToCut, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE, EDGE_SNAP_SEC, HARD_FINAL_CUT_MAX_SEC, EDGE_SNAP_GROWTH_MAX_SEC, INTRO_PIPELINE_VERSION };
+module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, generateCuts, adToCut, resolveEpisodeCuts, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE, EDGE_SNAP_SEC, HARD_FINAL_CUT_MAX_SEC, EDGE_SNAP_GROWTH_MAX_SEC, INTRO_PIPELINE_VERSION };

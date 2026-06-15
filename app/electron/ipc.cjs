@@ -5,7 +5,7 @@ const { DownloadManager } = require("./downloader.cjs");
 const { createDeviceWatcher } = require("./device.cjs");
 const { runSync, readManifest } = require("./sync.cjs");
 const { probeDurationSec } = require("./converter.cjs");
-const { writeDecisions } = require("./decisionCache.cjs");
+const { writeDecisions, writeCutSet } = require("./decisionCache.cjs");
 
 function serializeError(e) {
   return { message: e.message || String(e), code: e.code, status: e.status };
@@ -233,6 +233,68 @@ function getTrimEdits(uuid) {
   return Object.fromEntries(m.entries());
 }
 
+// Explicit FINAL cut-set per episode (transcript-toggle redesign), keyed by uuid.
+// The redesigned review surface lets the user toggle sentences in/out of the cut
+// across the whole transcript and commits the result as an authoritative list of
+// [startSec,endSec] ranges (the contiguous "yellow" runs). When present for a uuid,
+// this set is what the episode gets cut to - it OVERRIDES the per-cut keep/remove
+// map below (which stays for any non-redesigned caller). Stored as a sanitised array
+// of { startSec, endSec }; a malformed/empty input clears the override.
+//
+// CARDINAL RULE: only ranges the user explicitly selected are recorded. Each range
+// is validated forward (finite, start>=0, start<end) on the way in - an invalid
+// range is dropped, never widened, so an ambiguous range can never become a cut.
+const trimCutSets = new Map();
+
+function sanitizeRanges(ranges) {
+  const out = [];
+  if (!Array.isArray(ranges)) return out;
+  for (const r of ranges) {
+    const s = Array.isArray(r) ? Number(r[0]) : Number(r && r.startSec);
+    const e = Array.isArray(r) ? Number(r[1]) : Number(r && r.endSec);
+    if (!Number.isFinite(s) || !Number.isFinite(e) || s < 0 || !(e > s)) continue;
+    out.push({ startSec: s, endSec: e });
+  }
+  out.sort((a, b) => a.startSec - b.startSec);
+  return out;
+}
+
+// Record (or clear) the explicit final cut-set for an episode. Returns the sanitised
+// ranges that were stored (possibly []). An empty result is a valid "cut nothing"
+// state and is stored as such (the episode ships untouched), distinct from "no
+// redesigned decision recorded" (no entry) - resolveReview only treats a uuid as
+// using the explicit path when it HAS an entry here.
+function setTrimCutSet(uuid, ranges) {
+  if (!uuid) return null;
+  const clean = sanitizeRanges(ranges);
+  trimCutSets.set(uuid, clean);
+  return clean;
+}
+
+function getTrimCutSet(uuid) {
+  if (!uuid) return null;
+  return trimCutSets.has(uuid) ? trimCutSets.get(uuid) : null;
+}
+
+// Best-effort persistence of the explicit cut-set to the fingerprint sidecar so a
+// re-process of the same untouched episode re-applies the user's reviewed selection
+// instead of re-asking. We persist it as a FIRST-CLASS cut-set (decisionCache
+// writeCutSet -> {version, cutSet:[[s,e],...]}), NOT a back-mapped legacy decision
+// map: the legacy map can only transform DETECTED needs-review cuts, so it could not
+// replay an EMPTY set, a de-selected confident cut, or a user-ADDED range. The
+// first-class cut-set replays VERBATIM (generateCuts readCutSet replaces the
+// detector's cuts with it). An empty set is persisted as such (= cut nothing sticks).
+// Fire-and-forget; never throws into the IPC reply.
+function persistTrimCutSet(uuid, ext) {
+  if (!uuid) return;
+  let cacheDir;
+  try { cacheDir = path.join(app.getPath("userData"), "cache", "episodes"); }
+  catch { return; }
+  const src = path.join(cacheDir, `${uuid}.${ext || "mp3"}`);
+  const ranges = (getTrimCutSet(uuid) || []).map((r) => [r.startSec, r.endSec]);
+  Promise.resolve().then(() => writeCutSet({ src, ranges })).catch(() => {});
+}
+
 let syncController = null;
 
 // The in-flight review gate. When runSync hands us flagged cuts, we park a
@@ -247,14 +309,41 @@ let pendingReview = null; // { resolve, uuids }
 
 // Resolve the parked review gate with the user's decisions, releasing runSync to
 // continue to encode + transfer. No-op (returns false) if nothing is awaiting
-// review. Building from mergeDecisionsWithEdits means an undecided flagged cut
-// simply has no entry, so it stays held back (cardinal rule).
+// review. Per reviewed episode we resolve to ONE of these, in precedence order:
+//
+//   1. EXPLICIT cut-set ({ __cutSet: [...] }) when the redesigned transcript-toggle
+//      surface recorded one for this uuid (setTrimCutSet). The authoritative final
+//      set - sync.cjs (resolveEpisodeCuts) REPLACES the cuts with exactly these
+//      ranges. The renderer's Continue calls setCuts for EVERY surfaced episode, so
+//      this is the production path.
+//   2. LEGACY per-cut map (mergeDecisionsWithEdits) ONLY when no explicit set was
+//      recorded BUT legacy keep/remove decisions exist - the original path, for any
+//      non-redesigned caller. Back-compat.
+//   3. FAIL-CLOSED default: an episode that was surfaced but for which NEITHER an
+//      explicit set NOR any legacy decision exists resolves to an EMPTY explicit
+//      cut-set => cut NOTHING. This is the cardinal-rule safe default: a confident
+//      cut that was surfaced but never affirmatively resolved is never cut. (Using an
+//      empty legacy {} here would instead let confident cuts pass through - the exact
+//      silent-auto-cut hole we are closing.)
+//
+// The renderer's Continue re-sends the authoritative state right before calling this,
+// so the store read here is current.
 function resolveReview() {
   if (!pendingReview) return false;
   const { resolve, uuids } = pendingReview;
   pendingReview = null;
   const decisionsByUuid = {};
-  for (const uuid of uuids || []) decisionsByUuid[uuid] = mergeDecisionsWithEdits(uuid);
+  for (const uuid of uuids || []) {
+    const explicit = getTrimCutSet(uuid);
+    if (explicit != null) {
+      decisionsByUuid[uuid] = { __cutSet: explicit.map((r) => [r.startSec, r.endSec]) };
+      continue;
+    }
+    const legacy = mergeDecisionsWithEdits(uuid);
+    // Legacy decisions present -> back-compat path. None present -> fail closed to an
+    // empty explicit cut-set (cut nothing), NOT an empty legacy map.
+    decisionsByUuid[uuid] = Object.keys(legacy).length > 0 ? legacy : { __cutSet: [] };
+  }
   resolve(decisionsByUuid);
   return true;
 }
@@ -265,9 +354,14 @@ async function startSync(spec) {
   const cacheDir = path.join(app.getPath("userData"), "cache", "episodes");
   const queue = resolveTrimQueue(resolveAnnounceQueue(spec.queue));
   // Reset trim status for the episodes about to be processed so a prior run's
-  // result does not linger in the renderer while this one analyses.
+  // result does not linger in the renderer while this one analyses. Also clear any
+  // explicit cut-set from a previous run so a stale selection can never resolve the
+  // new run's gate (the redesigned surface re-records it during this review).
   for (const it of queue) {
-    if (it.trim && it.uuid) trimStatus.set(it.uuid, { status: "idle", cuts: [] });
+    if (it.trim && it.uuid) {
+      trimStatus.set(it.uuid, { status: "idle", cuts: [] });
+      trimCutSets.delete(it.uuid);
+    }
   }
   try {
     const res = await runSync({
@@ -410,6 +504,16 @@ function buildHandlers() {
       return edited;
     },
     "trim:edits": (_, uuid) => getTrimEdits(uuid),
+    // Transcript-toggle redesign: record the episode's explicit FINAL cut-set (the
+    // contiguous yellow runs). Overrides the per-cut keep/remove map at the gate.
+    // Persist it so a re-process re-applies the user's reviewed selection.
+    "trim:setCuts": (_, payload) => {
+      const { uuid, ranges, ext } = payload || {};
+      const stored = setTrimCutSet(uuid, ranges);
+      if (stored != null) persistTrimCutSet(uuid, ext);
+      return stored;
+    },
+    "trim:cutSet": (_, uuid) => getTrimCutSet(uuid),
   };
 }
 
@@ -430,5 +534,6 @@ module.exports = {
   getTrim, setTrim, listTrim, resolveTrimQueue, getTrimStatus, recordTrimEvent,
   setTrimDecision, getTrimDecisions, cutKey,
   setTrimEdit, getTrimEdits, mergeDecisionsWithEdits,
+  setTrimCutSet, getTrimCutSet, sanitizeRanges,
   resolveReview, cancelSync,
 };

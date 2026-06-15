@@ -61,5 +61,9 @@ contextBridge.exposeInMainWorld("openswim", {
     decisions: (uuid) => invoke("trim:decisions", uuid),
     edit: (uuid, originalCut, newCut, ext) => invoke("trim:edit", { uuid, originalCut, newCut, ext }),
     edits: (uuid) => invoke("trim:edits", uuid),
+    // Transcript-toggle redesign: commit the episode's explicit final cut-set
+    // (the contiguous selected/yellow runs) as a list of [startSec,endSec] ranges.
+    setCuts: (uuid, ranges, ext) => invoke("trim:setCuts", { uuid, ranges, ext }),
+    cutSet: (uuid) => invoke("trim:cutSet", uuid),
   },
 });

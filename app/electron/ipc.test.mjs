@@ -11,6 +11,7 @@ const {
   getTrim, setTrim, listTrim, resolveTrimQueue, getTrimStatus, recordTrimEvent,
   setTrimDecision, getTrimDecisions, cutKey, buildHandlers,
   setTrimEdit, getTrimEdits, mergeDecisionsWithEdits,
+  setTrimCutSet, getTrimCutSet, sanitizeRanges,
   resolveReview, cancelSync,
 } = require("./ipc.cjs");
 
@@ -288,5 +289,51 @@ describe("review gate handshake (resolveReview / cancelSync guards)", () => {
   it("cancelSync returns false when no sync and no review are in flight", () => {
     // Nothing parked: cancel has nothing to release or abort.
     expect(cancelSync()).toBe(false);
+  });
+});
+
+describe("explicit cut-set store (setTrimCutSet / getTrimCutSet, transcript-toggle redesign)", () => {
+  it("defaults to null (no redesigned decision recorded) for an unknown uuid", () => {
+    expect(getTrimCutSet("no-set-yet")).toBe(null);
+  });
+
+  it("records and reads back a sanitised, sorted cut-set", () => {
+    const stored = setTrimCutSet("epCS1", [[1390, 1445], [600, 660]]);
+    expect(stored).toEqual([{ startSec: 600, endSec: 660 }, { startSec: 1390, endSec: 1445 }]);
+    expect(getTrimCutSet("epCS1")).toEqual([{ startSec: 600, endSec: 660 }, { startSec: 1390, endSec: 1445 }]);
+  });
+
+  it("CARDINAL: drops malformed ranges (inverted / zero / negative / non-finite), never widens", () => {
+    const stored = setTrimCutSet("epCS2", [
+      [600, 660],     // ok
+      [700, 700],     // zero-length - dropped
+      [900, 800],     // inverted - dropped
+      [-5, 10],       // negative start - dropped
+      [Number.NaN, 5],// non-finite - dropped
+      { startSec: 1000, endSec: 1030 }, // object form ok
+    ]);
+    expect(stored).toEqual([{ startSec: 600, endSec: 660 }, { startSec: 1000, endSec: 1030 }]);
+  });
+
+  it("an empty selection stores [] (a valid 'cut nothing' state, distinct from no entry)", () => {
+    expect(setTrimCutSet("epCS3", [])).toEqual([]);
+    expect(getTrimCutSet("epCS3")).toEqual([]); // has an entry -> explicit path, cuts nothing
+  });
+
+  it("setTrimCutSet on a falsy uuid is a no-op (null)", () => {
+    expect(setTrimCutSet(undefined, [[1, 2]])).toBe(null);
+  });
+
+  it("sanitizeRanges accepts both [s,e] tuples and {startSec,endSec} objects", () => {
+    expect(sanitizeRanges([[1, 2], { startSec: 3, endSec: 4 }]))
+      .toEqual([{ startSec: 1, endSec: 2 }, { startSec: 3, endSec: 4 }]);
+    expect(sanitizeRanges("nope")).toEqual([]);
+  });
+
+  it("the trim:setCuts IPC handler records the set and degrades on a null payload", () => {
+    const setCuts = buildHandlers()["trim:setCuts"];
+    expect(() => setCuts({}, null)).not.toThrow();
+    setCuts({}, { uuid: "epCS4", ranges: [[600, 660]], ext: "mp3" });
+    expect(getTrimCutSet("epCS4")).toEqual([{ startSec: 600, endSec: 660 }]);
   });
 });

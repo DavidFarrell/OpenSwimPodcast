@@ -68,4 +68,14 @@ describe("preload trim bridge", () => {
       ext: "m4a",
     });
   });
+
+  // Transcript-toggle redesign: the renderer commits the episode's final cut-set
+  // (the contiguous selected/yellow runs) via trim.setCuts, forwarding ext so the
+  // right fingerprint sidecar is written.
+  it("trim.setCuts forwards uuid, ranges AND ext", () => {
+    exposed.trim.setCuts("u1", [[600, 660], [1390, 1445]], "m4a");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].channel).toBe("trim:setCuts");
+    expect(calls[0].arg).toEqual({ uuid: "u1", ranges: [[600, 660], [1390, 1445]], ext: "m4a" });
+  });
 });

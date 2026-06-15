@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 
 const require = createRequire(import.meta.url);
-const { runSync, isOurFilename, sha256File, buildPlan, itemNeedsEncode, readManifest, writeManifest, MANIFEST_FILE, generateCuts, adToCut, EDGE_SNAP_SEC, generateIntro, INTRO_PIPELINE_VERSION } = require("./sync.cjs");
+const { runSync, isOurFilename, sha256File, buildPlan, itemNeedsEncode, readManifest, writeManifest, MANIFEST_FILE, generateCuts, adToCut, resolveEpisodeCuts, EDGE_SNAP_SEC, generateIntro, INTRO_PIPELINE_VERSION } = require("./sync.cjs");
 
 function mkTmp(label = "os-sync-") { return fs.mkdtempSync(path.join(os.tmpdir(), label)); }
 function rmTmp(d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
@@ -1117,6 +1117,87 @@ describe("generateCuts decision-cache reuse (P3c)", () => {
   });
 });
 
+describe("generateCuts explicit cut-set reuse (Fix 3 - reviewed selection sticks across re-process)", () => {
+  function setup() {
+    const transcribeFn = vi.fn(async () => ({ segments: [
+      { start: 0, end: 590, text: "opening content" },
+      { start: 600, end: 700, text: "ad" },
+      { start: 700, end: 3000, text: "more content" },
+    ] }));
+    // Detector proposes a flagged mid-roll; the saved cut-set should OVERRIDE it.
+    const detectAdsFn = vi.fn(async () => ({
+      ads: [{ startSec: 600, endSec: 700, needsReview: true, reasons: ["over-threshold"] }],
+      stats: {},
+    }));
+    return { transcribeFn, detectAdsFn };
+  }
+
+  it("a saved cut-set REPLACES the detector's cuts with exactly those ranges (auto-apply)", async () => {
+    const { transcribeFn, detectAdsFn } = setup();
+    // The user reviewed and chose [615,690] (narrower than the detected [600,700]).
+    const readCutSetFn = vi.fn(async () => [[615, 690]]);
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readCutSetFn });
+    expect(readCutSetFn).toHaveBeenCalledWith({ src: "/x.mp3" });
+    expect(out.status).toBe("ready");
+    expect(out.cuts).toHaveLength(1);
+    expect(out.cuts[0].startSec).toBe(615);
+    expect(out.cuts[0].endSec).toBe(690);
+    expect(out.cuts[0].needsReview).toBe(false);
+  });
+
+  it("CARDINAL: an EMPTY saved cut-set means cut NOTHING (the user de-selected everything)", async () => {
+    const { transcribeFn, detectAdsFn } = setup();
+    const readCutSetFn = vi.fn(async () => []); // reviewed: cut nothing
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readCutSetFn });
+    expect(out.status).toBe("ready");
+    expect(out.cuts).toEqual([]);
+  });
+
+  it("replays a user-ADDED range the detector never proposed", async () => {
+    const { transcribeFn, detectAdsFn } = setup();
+    // A range unrelated to the detected [600,700] - the user added it in the transcript.
+    const readCutSetFn = vi.fn(async () => [[10, 55]]);
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readCutSetFn });
+    expect(out.cuts).toHaveLength(1);
+    expect(out.cuts[0].startSec).toBe(10);
+    expect(out.cuts[0].endSec).toBe(55);
+  });
+
+  it("the cut-set takes PRECEDENCE over a legacy decision map", async () => {
+    const { transcribeFn, detectAdsFn } = setup();
+    const readCutSetFn = vi.fn(async () => [[615, 690]]);
+    const readDecisionsFn = vi.fn(async () => ({ "600000-700000": "remove" })); // legacy says full range
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readCutSetFn, readDecisionsFn });
+    // Cut-set wins: the narrowed range, not the detector's full 600-700.
+    expect(out.cuts).toEqual([
+      { startSec: 615, endSec: 690, needsReview: false, reasons: [], label: "ad", decided: "remove" },
+    ]);
+    // The legacy decision path is not even consulted when a cut-set exists.
+    expect(readDecisionsFn).not.toHaveBeenCalled();
+  });
+
+  it("no saved cut-set (readCutSet null) falls back to the detector + legacy decision path", async () => {
+    const { transcribeFn, detectAdsFn } = setup();
+    const readCutSetFn = vi.fn(async () => null); // never reviewed
+    const readDecisionsFn = vi.fn(async () => ({})); // empty legacy cache
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readCutSetFn, readDecisionsFn });
+    // Falls back -> the detector's flagged cut surfaces as before.
+    expect(out.status).toBe("needs-review");
+    expect(out.cuts).toHaveLength(1);
+    expect(out.cuts[0].needsReview).toBe(true);
+    expect(readDecisionsFn).toHaveBeenCalled();
+  });
+
+  it("tolerates a throwing readCutSet: falls back to the legacy path, never throws", async () => {
+    const { transcribeFn, detectAdsFn } = setup();
+    const readCutSetFn = vi.fn(async () => { throw new Error("corrupt cutset sidecar"); });
+    const readDecisionsFn = vi.fn(async () => ({}));
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readCutSetFn, readDecisionsFn });
+    expect(out.status).toBe("needs-review");
+    expect(out.cuts[0].needsReview).toBe(true);
+  });
+});
+
 describe("runSync trim stage", () => {
   let devicePath, cacheDir;
 
@@ -1130,7 +1211,7 @@ describe("runSync trim stage", () => {
     return { ...makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" }), trim: true, ...over };
   }
 
-  it("trim-on happy path: applies clean cuts and converts with cuts passed through", async () => {
+  it("trim-on happy path: a confident cut is SURFACED for review and applied once approved", async () => {
     fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
 
     const transcribeFn = vi.fn(async ({ src }) => {
@@ -1141,7 +1222,8 @@ describe("runSync trim stage", () => {
         { start: 700, end: 1300, text: "back to it" },
       ] };
     });
-    // A clean 40s mid-roll (within the 45s hard cap, away from edges) auto-applies.
+    // A clean 40s mid-roll. Under the redesign it is SURFACED (confident cuts start
+    // pre-yellow) and the user keeps it - resolved as the explicit cut-set [600,640].
     const detectAdsFn = vi.fn(async () => ({
       ads: [{ startIndex: 1, endIndex: 1, startSec: 600, endSec: 640, needsReview: false, reasons: [] }],
       stats: {},
@@ -1152,26 +1234,35 @@ describe("runSync trim stage", () => {
       fs.writeFileSync(dest, Buffer.from("trimmed mp3"));
       return { bytes: 11, durationSec: 60, fromCache: false };
     });
+    // The gate now fires for ANY episode with cuts (confident OR flagged). The user
+    // keeps the pre-yellow confident cut -> explicit cut-set.
+    let gateSawItems = null;
+    const awaitReview = vi.fn(async (items) => { gateSawItems = items; return { a: { __cutSet: [[600, 640]] } }; });
 
     const events = [];
     const res = await runSync({
       devicePath, cacheDir, queue: [trimItem()],
-      transcribeFn, detectAdsFn, convertFn,
+      transcribeFn, detectAdsFn, convertFn, awaitReview,
       onEvent: (e) => events.push(e),
     });
 
     expect(res.ok).toBe(true);
     expect(detectAdsFn).toHaveBeenCalledOnce();
+    // The confident episode was surfaced for review (the redesign's whole point).
+    expect(awaitReview).toHaveBeenCalledOnce();
+    expect(gateSawItems[0].uuid).toBe("a");
     expect(convertFn).toHaveBeenCalledOnce();
     expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).toString()).toBe("trimmed mp3");
 
     const trimStates = events.filter((e) => e.type === "trim" && e.uuid === "a").map((e) => e.state);
-    expect(trimStates).toEqual(["analysing", "ready"]);
+    // analyse-stage ready, then the gate re-emits ready after resolving the cut-set.
+    expect(trimStates).toEqual(["analysing", "ready", "ready"]);
     const stagesDone = events.filter((e) => e.type === "stage" && e.state === "done").map((e) => e.stage);
     expect(stagesDone).toContain("trim");
+    expect(stagesDone).toContain("review");
   });
 
-  it("a needs-review cut is HELD BACK from the converter (never auto-applied)", async () => {
+  it("a needs-review cut starts GREY and is NOT cut unless the user selects it", async () => {
     fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
 
     const transcribeFn = vi.fn(async () => ({ segments: [
@@ -1180,8 +1271,9 @@ describe("runSync trim stage", () => {
       { start: 700, end: 1300, text: "y" },
       { start: 1300, end: 1700, text: "long sketchy ad" },
     ] }));
-    // One clean cut (40s, within the hard cap), one needs-review cut. Only the clean
-    // one may reach convert; the flagged 400s mid-roll is held back.
+    // One clean cut (confident -> pre-yellow), one needs-review cut (flagged ->
+    // starts GREY). The user keeps the confident one and leaves the flagged one
+    // grey, so the explicit cut-set is just the clean cut.
     const detectAdsFn = vi.fn(async () => ({
       ads: [
         { startSec: 600, endSec: 640, needsReview: false, reasons: [] },
@@ -1190,27 +1282,29 @@ describe("runSync trim stage", () => {
       stats: {},
     }));
     const convertFn = vi.fn(async ({ dest, cuts }) => {
-      // The needs-review [1300,1700] cut must NOT be present.
+      // The flagged [1300,1700] cut must NOT be present - only the kept confident one.
       expect(cuts).toEqual([[600, 640]]);
       fs.writeFileSync(dest, Buffer.from("partially trimmed"));
       return { bytes: 17, durationSec: 60, fromCache: false };
     });
+    // The gate surfaces both; the resolution keeps only the confident cut.
+    const awaitReview = vi.fn(async () => ({ a: { __cutSet: [[600, 640]] } }));
 
     const events = [];
     const res = await runSync({
       devicePath, cacheDir, queue: [trimItem()],
-      transcribeFn, detectAdsFn, convertFn,
+      transcribeFn, detectAdsFn, convertFn, awaitReview,
       onEvent: (e) => events.push(e),
     });
 
     expect(res.ok).toBe(true);
     expect(convertFn).toHaveBeenCalledOnce();
-    // The emitted cut list still carries BOTH cuts (so the review layer can show
-    // the held-back one), but only the clean one was auto-applied above.
-    const trimReady = events.find((e) => e.type === "trim" && e.state === "needs-review");
-    expect(trimReady).toBeTruthy();
-    expect(trimReady.cuts).toHaveLength(2);
-    expect(trimReady.cuts.filter((c) => c.needsReview)).toHaveLength(1);
+    // The episode was surfaced with BOTH cuts (so the review layer shows the flagged
+    // one as a grey, opt-in line); the analyse-stage emit carries both.
+    const analyseEmit = events.find((e) => e.type === "trim" && e.state === "needs-review");
+    expect(analyseEmit).toBeTruthy();
+    expect(analyseEmit.cuts).toHaveLength(2);
+    expect(analyseEmit.cuts.filter((c) => c.needsReview)).toHaveLength(1);
   });
 
   it("a detector failure skips the trim but still converts the episode uncut", async () => {
@@ -1278,6 +1372,9 @@ describe("runSync trim stage", () => {
       if (cuts && cuts.length) throw new Error("atrim ffmpeg crashed");
       throw new Error("should not retry-encode a plain mp3");
     });
+    // The confident cut is surfaced and kept by the user -> reaches convert (and hits
+    // the atrim-failure degrade path). Episode "b" has no trim, so it is not surfaced.
+    const awaitReview = vi.fn(async () => ({ a: { __cutSet: [[600, 640]] } }));
 
     const events = [];
     const res = await runSync({
@@ -1286,7 +1383,7 @@ describe("runSync trim stage", () => {
         trimItem(),
         makeItem({ uuid: "b", show: "RADIOLAB", slot: 2, ext: "mp3", filename: "02_radiolab.mp3" }),
       ],
-      transcribeFn, detectAdsFn, convertFn,
+      transcribeFn, detectAdsFn, convertFn, awaitReview,
       onEvent: (e) => events.push(e),
     });
 
@@ -1345,11 +1442,13 @@ describe("runSync trim stage", () => {
       fs.writeFileSync(dest, Buffer.from("sped no trim"));
       return { bytes: 12, durationSec: 60, fromCache: false };
     });
+    // The confident cut is surfaced and kept -> reaches convert with cuts.
+    const awaitReview = vi.fn(async () => ({ a: { __cutSet: [[600, 640]] } }));
 
     const events = [];
     const res = await runSync({
       devicePath, cacheDir, queue: [trimItem()], speed: 1.5,
-      transcribeFn, detectAdsFn, convertFn,
+      transcribeFn, detectAdsFn, convertFn, awaitReview,
       onEvent: (e) => events.push(e),
     });
 
@@ -1556,10 +1655,11 @@ describe("runSync trim stage", () => {
     expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
   });
 
-  it("no gate when every cut is confident: awaitReview is never called", async () => {
+  it("CARDINAL (Fix 1): a confident-only episode is STILL surfaced for review (no silent auto-cut)", async () => {
     fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
-    // A confident mid-roll within the 45s hard cap (and away from edges, so no
-    // edge-snap) -> nothing flagged -> the review gate is skipped entirely.
+    // A confident mid-roll within the 45s hard cap (away from edges). Under the
+    // redesign this is NOT cut silently - it is surfaced for review (pre-yellow), and
+    // only applied once the user's resolution includes it.
     const transcribeFn = vi.fn(async () => ({ segments: [
       { start: 0, end: 50, text: "open" },
       { start: 200, end: 240, text: "clean mid-roll" },
@@ -1571,9 +1671,63 @@ describe("runSync trim stage", () => {
     }));
     const convertFn = vi.fn(async ({ dest, cuts }) => {
       expect(cuts).toEqual([[200, 240]]);
-      fs.writeFileSync(dest, Buffer.from("auto-trimmed"));
+      fs.writeFileSync(dest, Buffer.from("approved-trim"));
       return { bytes: 12, durationSec: 60, fromCache: false };
     });
+    // The gate fires; the user keeps the pre-yellow confident cut.
+    const awaitReview = vi.fn(async () => ({ a: { __cutSet: [[200, 240]] } }));
+
+    const events = [];
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn, detectAdsFn, convertFn, awaitReview,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(res.ok).toBe(true);
+    expect(awaitReview).toHaveBeenCalledOnce();
+    expect(events.some((e) => e.type === "review")).toBe(true);
+    expect(convertFn).toHaveBeenCalledOnce();
+  });
+
+  it("CARDINAL (Fix 1): a surfaced confident cut the gate does NOT resolve is NOT cut (fail closed)", async () => {
+    const payload = Buffer.from("confident-but-unresolved must survive");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);
+    const transcribeFn = vi.fn(async () => ({ segments: [
+      { start: 0, end: 50, text: "open" },
+      { start: 200, end: 240, text: "clean mid-roll" },
+      { start: 380, end: 1200, text: "rest of the show" },
+    ] }));
+    const detectAdsFn = vi.fn(async () => ({
+      ads: [{ startSec: 200, endSec: 240, needsReview: false, reasons: [] }],
+      stats: {},
+    }));
+    const convertFn = vi.fn();
+    // The gate returns NO entry for "a" (a failed/empty gate). The fold fails closed:
+    // a surfaced episode with no resolution cuts NOTHING - the confident cut is held.
+    const awaitReview = vi.fn(async () => ({}));
+
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn, detectAdsFn, convertFn, awaitReview,
+      onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    expect(awaitReview).toHaveBeenCalledOnce();
+    expect(convertFn).not.toHaveBeenCalled(); // nothing cut -> plain mp3 copied
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
+  });
+
+  it("no gate when the episode has NO cuts at all: awaitReview is never called", async () => {
+    const payload = Buffer.from("clean episode, nothing detected");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);
+    const transcribeFn = vi.fn(async () => ({ segments: [
+      { start: 0, end: 50, text: "open" },
+      { start: 200, end: 1200, text: "all content, no ads" },
+    ] }));
+    const detectAdsFn = vi.fn(async () => ({ ads: [], stats: {} }));
+    const convertFn = vi.fn();
     const awaitReview = vi.fn(async () => ({}));
 
     const events = [];
@@ -1586,7 +1740,8 @@ describe("runSync trim stage", () => {
     expect(res.ok).toBe(true);
     expect(awaitReview).not.toHaveBeenCalled();
     expect(events.some((e) => e.type === "review")).toBe(false);
-    expect(convertFn).toHaveBeenCalledOnce();
+    expect(convertFn).not.toHaveBeenCalled(); // no cuts -> plain copy
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
   });
 
   it("a cancel during review aborts before convert (cut nothing) via an aborting gate", async () => {
@@ -1605,5 +1760,104 @@ describe("runSync trim stage", () => {
     })).rejects.toThrow();
 
     expect(convertFn).not.toHaveBeenCalled();
+  });
+
+  // --- Transcript-toggle redesign: the gate may resolve to an EXPLICIT cut-set ---
+
+  it("an explicit __cutSet from the gate REPLACES the cuts and applies exactly those ranges", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+    const convertFn = vi.fn(async ({ dest, cuts }) => {
+      // The user reviewed the transcript and selected [210,300] (a SHRUNK / shifted
+      // range, NOT the detector's original [200,380]). Exactly that must be cut.
+      expect(cuts).toEqual([[210, 300]]);
+      fs.writeFileSync(dest, Buffer.from("toggled"));
+      return { bytes: 7, durationSec: 60, fromCache: false };
+    });
+    const awaitReview = vi.fn(async () => ({ a: { __cutSet: [[210, 300]] } }));
+
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: flaggedTranscribe(), detectAdsFn: flaggedDetect(), convertFn,
+      awaitReview, onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    expect(convertFn).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).toString()).toBe("toggled");
+  });
+
+  it("CARDINAL: an EMPTY __cutSet cuts nothing (user de-selected everything)", async () => {
+    const payload = Buffer.from("nothing selected, ship whole");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);
+    const convertFn = vi.fn();
+    const awaitReview = vi.fn(async () => ({ a: { __cutSet: [] } }));
+
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: flaggedTranscribe(), detectAdsFn: flaggedDetect(), convertFn,
+      awaitReview, onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    expect(convertFn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
+  });
+
+  it("an explicit __cutSet can EXTEND beyond the detected cut (a range the detector never proposed)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+    const convertFn = vi.fn(async ({ dest, cuts }) => {
+      // The user added the open sketch [0,50] AND kept the mid-roll [200,380].
+      expect(cuts).toEqual([[0, 50], [200, 380]]);
+      fs.writeFileSync(dest, Buffer.from("extended"));
+      return { bytes: 8, durationSec: 60, fromCache: false };
+    });
+    const awaitReview = vi.fn(async () => ({ a: { __cutSet: [[0, 50], [200, 380]] } }));
+
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: flaggedTranscribe(), detectAdsFn: flaggedDetect(), convertFn,
+      awaitReview, onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    expect(convertFn).toHaveBeenCalledOnce();
+  });
+});
+
+describe("resolveEpisodeCuts (legacy map OR explicit cut-set)", () => {
+  const flaggedMid = { startSec: 200, endSec: 380, needsReview: true, reasons: ["over-threshold"], label: "ad" };
+
+  it("legacy 'remove' map un-flags the detected cut (auto-applies)", () => {
+    const out = resolveEpisodeCuts([flaggedMid], { "200000-380000": "remove" });
+    expect(out).toHaveLength(1);
+    expect(out[0].needsReview).toBe(false);
+  });
+
+  it("legacy 'keep' map drops the cut", () => {
+    expect(resolveEpisodeCuts([flaggedMid], { "200000-380000": "keep" })).toEqual([]);
+  });
+
+  it("an empty legacy map holds the flagged cut (stays needsReview)", () => {
+    const out = resolveEpisodeCuts([flaggedMid], {});
+    expect(out[0].needsReview).toBe(true);
+  });
+
+  it("an explicit __cutSet REPLACES the cuts with auto-apply ranges", () => {
+    const out = resolveEpisodeCuts([flaggedMid], { __cutSet: [[210, 300], [600, 660]] });
+    expect(out).toEqual([
+      { startSec: 210, endSec: 300, needsReview: false, reasons: [], label: "ad", decided: "remove" },
+      { startSec: 600, endSec: 660, needsReview: false, reasons: [], label: "ad", decided: "remove" },
+    ]);
+  });
+
+  it("CARDINAL: an explicit __cutSet drops malformed ranges, never widens", () => {
+    const out = resolveEpisodeCuts([flaggedMid], { __cutSet: [[300, 210], [400, 400], [500, 560]] });
+    expect(out).toEqual([
+      { startSec: 500, endSec: 560, needsReview: false, reasons: [], label: "ad", decided: "remove" },
+    ]);
+  });
+
+  it("an empty explicit __cutSet yields no cuts (cut nothing)", () => {
+    expect(resolveEpisodeCuts([flaggedMid], { __cutSet: [] })).toEqual([]);
   });
 });

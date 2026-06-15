@@ -83,6 +83,15 @@ function decisionSidecarPath(src, fp) {
   return path.join(dir, `.${base}.decisions.${fp}.json`);
 }
 
+// Sidecar path for the EXPLICIT cut-set (transcript-toggle redesign). A SEPARATE
+// file from the legacy decision sidecar so the two never clobber each other and the
+// concerns stay distinct. Same fingerprint-keying so a re-download misses it.
+function cutSetSidecarPath(src, fp) {
+  const dir = path.dirname(src);
+  const base = path.basename(src);
+  return path.join(dir, `.${base}.cutset.${fp}.json`);
+}
+
 // Read the decision map for an episode. Returns a plain object { cutKey: "keep" |
 // "remove" }, or {} on any miss (no file, unreadable, corrupt JSON, wrong shape).
 // Never throws.
@@ -141,6 +150,78 @@ async function writeDecisions({ src, fp, decisions } = {}) {
   }
 }
 
+// --- Explicit cut-set persistence (transcript-toggle redesign) -------------------
+//
+// The redesigned review surface commits an episode's FINAL cut-set: an explicit list
+// of [startSec,endSec] ranges (the contiguous selected/yellow sentence runs). Unlike
+// the legacy decision map - which can ONLY transform DETECTED needs-review cuts
+// (keep/remove/adjust) - the cut-set is the authoritative selection and must replay
+// VERBATIM on re-process, including: an EMPTY set (the user de-selected everything ->
+// cut nothing), a de-selected CONFIDENT cut, and a user-ADDED range the detector
+// never proposed. So we persist it as a first-class field in its own sidecar:
+//   { version, writtenAt, cutSet: [[startSec,endSec], ...] }
+// A persisted cutSet (even []) means "the user reviewed this episode - apply exactly
+// these ranges". The ABSENCE of the sidecar means "no reviewed selection" (readCutSet
+// returns null), so generateCuts falls back to the detector + legacy decision path.
+
+// Sanitise a ranges input to forward [start,end] tuples (start>=0, start<end). Drops
+// anything malformed - never widens. Accepts [s,e] tuples or {startSec,endSec}.
+function sanitizeCutSet(ranges) {
+  const out = [];
+  if (!Array.isArray(ranges)) return out;
+  for (const r of ranges) {
+    const s = Array.isArray(r) ? Number(r[0]) : Number(r && r.startSec);
+    const e = Array.isArray(r) ? Number(r[1]) : Number(r && r.endSec);
+    if (!Number.isFinite(s) || !Number.isFinite(e) || s < 0 || !(e > s)) continue;
+    out.push([s, e]);
+  }
+  out.sort((a, b) => a[0] - b[0]);
+  return out;
+}
+
+// Persist an episode's explicit cut-set. `ranges` may be [] (a valid "cut nothing"
+// state - the user de-selected everything). Returns true on success. Never throws.
+async function writeCutSet({ src, fp, ranges } = {}) {
+  if (!src) return false;
+  let fingerprintValue = fp;
+  if (!fingerprintValue) {
+    try { fingerprintValue = await fingerprint(src); }
+    catch { return false; }
+  }
+  const cutSet = sanitizeCutSet(ranges);
+  const p = cutSetSidecarPath(src, fingerprintValue);
+  const payload = { version: 1, writtenAt: new Date().toISOString(), cutSet };
+  try {
+    await fsp.writeFile(p, JSON.stringify(payload), "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Read an episode's explicit cut-set. Returns:
+//   - an array of [start,end] tuples (possibly []) when a cut-set WAS persisted, OR
+//   - null when none was (no file, unreadable, corrupt, or no cutSet field).
+// The null-vs-[] distinction is load-bearing: [] means "reviewed, cut nothing"; null
+// means "never reviewed" (fall back to detector + legacy decisions). Never throws.
+async function readCutSet({ src, fp } = {}) {
+  if (!src) return null;
+  let fingerprintValue = fp;
+  if (!fingerprintValue) {
+    try { fingerprintValue = await fingerprint(src); }
+    catch { return null; }
+  }
+  const p = cutSetSidecarPath(src, fingerprintValue);
+  try {
+    const raw = await fsp.readFile(p, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.cutSet)) return null;
+    return sanitizeCutSet(parsed.cutSet);
+  } catch {
+    return null;
+  }
+}
+
 // Apply a cached decision map to a freshly-detected cut list, returning a new cut
 // list. This is the trust-layer reuse step:
 //   - A cut with a cached "remove": the user already approved it at the detector
@@ -194,4 +275,8 @@ module.exports = {
   readDecisions,
   writeDecisions,
   applyDecisions,
+  cutSetSidecarPath,
+  writeCutSet,
+  readCutSet,
+  sanitizeCutSet,
 };

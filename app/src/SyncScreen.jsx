@@ -3,9 +3,9 @@ import { Btn, CoverArt, Progress } from "./Atoms.jsx";
 import { Toolbar } from "./Shell.jsx";
 import { fnameFor } from "./TodayScreen.jsx";
 import { formatMB } from "./useDevice.js";
-import { CutlistReview } from "./CutlistReview.jsx";
-import { TranscriptEvidence } from "./TranscriptEvidence.jsx";
-import { buildTrimAudioUrls, applyCutEdit } from "./trimAudio.js";
+import { TranscriptCutReview } from "./TranscriptCutReview.jsx";
+import { buildTrimAudioUrls } from "./trimAudio.js";
+import { sentenceLines, preselectFromCuts, toggleSentence, selectedToRanges, selectedCount } from "./transcriptToggle.js";
 
 function buildStages({ hasVideo, playbackSpeed, boost }) {
   const reEncode = playbackSpeed !== 1.0 || boost;
@@ -142,25 +142,25 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   // raise an overlay over the running view until the user clicks Continue, then
   // call sync.resolveReview() to release the pipeline. `null` = no gate open.
   const [review, setReview] = useState(null);
-  // Decisions/edits the user makes IN the overlay, mirrored locally for an
-  // immediate redraw (the per-cut IPC is the persistence layer the backend reads
-  // back on resume). Keyed by uuid.
-  const [reviewDecisions, setReviewDecisions] = useState({});
-  const [reviewEditedCuts, setReviewEditedCuts] = useState({});
+  // TRANSCRIPT-TOGGLE REDESIGN. The SELECTED (yellow) sentence indices per reviewed
+  // episode, keyed by uuid -> Set<number>. The user reviews the whole transcript and
+  // toggles sentences in/out; this is the authoritative review state. Seeded from
+  // each review item's cuts (preselectFromCuts) when the `review` event arrives, so
+  // the detector's cuts start yellow (default == today). Updated ONLY locally while
+  // the overlay is open; Continue commits it via trim.setCuts and fails closed.
+  const [reviewSelected, setReviewSelected] = useState({});
   const reviewAudioUrls = useMemo(() => buildTrimAudioUrls(downloadByUuid), [downloadByUuid]);
-  // The gate is correct by construction: keep/remove/edit update ONLY local state
-  // while the overlay is open (no incremental IPC), then Continue RE-SENDS the
-  // authoritative current state to the backend, awaits every write, and only
-  // resolves if all landed. This removes any dependence on earlier writes having
-  // succeeded - a failed or dropped write can never leave the backend on stale
-  // state, because Continue re-establishes it from scratch and fails closed.
-  // A synchronous lock (ref, not state) is taken the instant Continue is pressed
-  // so no decision/edit can mutate state mid-send; the boolean mirror drives the
+  // The gate is correct by construction: toggles update ONLY local state while the
+  // overlay is open (no incremental IPC), then Continue RE-SENDS the authoritative
+  // final cut-set (the contiguous selected runs) to the backend, awaits every write,
+  // and only resolves if all landed. A failed/dropped write can never leave the
+  // backend on stale state - Continue re-establishes the whole set from scratch and
+  // fails closed. A synchronous lock (ref, not state) is taken the instant Continue
+  // is pressed so no toggle can mutate state mid-send; the boolean mirror drives the
   // disabled buttons + error line.
   const reviewLock = useRef(false);
   const [reviewResolving, setReviewResolving] = useState(false);
   const [reviewError, setReviewError] = useState(null);
-  const cutKeyOf = (cut) => `${Math.round(Number(cut.startSec) * 1000)}-${Math.round(Number(cut.endSec) * 1000)}`;
 
   // Base stages + any analysis stages that have started. Title lookup for log lines.
   const stages = useMemo(() => insertAnalysisStages(STAGES, stageState), [STAGES, stageState]);
@@ -193,7 +193,17 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
         reviewLock.current = false;
         setReviewResolving(false);
         setReviewError(null);
-        setReview({ items: Array.isArray(evt.items) ? evt.items : [] });
+        const items = Array.isArray(evt.items) ? evt.items : [];
+        setReview({ items });
+        // Seed each episode's selected (yellow) set from its detector cuts, so the
+        // transcript opens with the detector's cuts already selected (default ==
+        // today: the detector's cuts get cut unless the user greys them).
+        const seed = {};
+        for (const item of items) {
+          const lines = sentenceLines({ segments: item.segments || [] });
+          seed[item.uuid] = preselectFromCuts(lines, { cuts: item.cuts || [] });
+        }
+        setReviewSelected(seed);
       }
       else if (evt.type === "log") setLogByKey((m) => ({ ...m, [logKey(evt)]: evt }));
       else if (evt.type === "transcribe" || evt.type === "trim" || evt.type === "announce") {
@@ -222,52 +232,42 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     onBack();
   };
 
-  // --- Review gate handlers ---
-  // Keep/remove choice - LOCAL state only (the authoritative re-send happens at
-  // Continue). Default stays KEEP - only an explicit REMOVE ever cuts (cardinal
-  // rule). Keyed by the cut's CURRENT key so an edited-then-decided cut records
-  // under its edited key; Continue reconciles both keys.
-  const reviewDecide = (uuid, cut, decision) => {
+  // --- Review gate handlers (transcript-toggle) ---
+  // Toggle one sentence in/out of an episode's selected (yellow) set - LOCAL state
+  // only (the authoritative commit happens at Continue). CARDINAL RULE: a sentence
+  // is cut only when selected at Continue; toggling cuts nothing itself.
+  const onReviewToggle = (uuid, index) => {
     if (reviewLock.current) return; // gate is resolving - state is frozen
-    if (!uuid || !cut) return;
-    const key = cutKeyOf(cut);
-    const value = decision === "remove" ? "remove" : "keep";
-    setReviewDecisions((p) => ({ ...p, [uuid]: { ...(p[uuid] || {}), [key]: value } }));
+    if (!uuid || !Number.isFinite(index)) return;
+    setReviewSelected((p) => ({ ...p, [uuid]: toggleSentence(p[uuid] || new Set(), index) }));
   };
-  // Boundary nudge/typed edit - LOCAL state only. Swaps the new boundaries into
-  // the displayed cut list (it only changes WHAT a later REMOVE would cut).
-  const reviewEdit = (uuid, originalCut, newCut) => {
-    if (reviewLock.current) return; // gate is resolving - state is frozen
-    if (!uuid || !originalCut || !newCut) return;
-    setReviewEditedCuts((p) => {
-      const cur = p[uuid] || (review && review.items.find((x) => x.uuid === uuid)?.cuts) || [];
-      const next = applyCutEdit(cur, originalCut, newCut);
-      if (next === cur) return p;
-      return { ...p, [uuid]: next };
-    });
+  // Per-episode final cut ranges = the contiguous selected sentence runs. Computed
+  // from the live selection + the episode's sentence lines. This is exactly what
+  // gets cut at Continue.
+  const reviewRangesFor = (item) => {
+    const lines = sentenceLines({ segments: item.segments || [] });
+    return selectedToRanges(lines, reviewSelected[item.uuid] || new Set());
   };
   // Release the pipeline. CARDINAL-RULE-SAFE ORDERING:
-  // (1) take the synchronous lock so no decision/edit can mutate state mid-send;
-  // (2) RE-SEND the authoritative current state to the backend - for every flagged
-  //     DETECTED cut, send its current keep/remove (keyed by the detected cut so
-  //     the backend's applyDecisions finds it), plus the boundary edit when the
-  //     user adjusted it (so a remove applies at the adjusted range). This
-  //     overrides any earlier dropped/failed write - the backend store is rebuilt
-  //     from what is on screen RIGHT NOW;
+  // (1) take the synchronous lock so no toggle can mutate state mid-send;
+  // (2) RE-SEND the authoritative final cut-set per episode (the contiguous selected
+  //     runs -> [startSec,endSec] ranges) via trim.setCuts. This OVERRIDES any earlier
+  //     state - the backend's cut-set is rebuilt from what is selected RIGHT NOW. An
+  //     episode with nothing selected sends [] (cut nothing - cardinal-rule safe);
   // (3) await every write and verify each LANDED (a rejected promise OR an
-  //     { ok:false } reply = FAIL CLOSED: keep the gate open, show an error, do
-  //     NOT resolve - never resume on uncertain state);
-  // (4) only when all writes landed, resolve - itself fail-closed: if resolve
-  //     errors, restore the gate rather than leaving the pipeline released-but-
-  //     overlay-gone. The backend then resumes and emits stage:review done.
+  //     { ok:false } reply = FAIL CLOSED: keep the gate open, show an error, do NOT
+  //     resolve - never resume on uncertain state);
+  // (4) only when all writes landed, resolve - itself fail-closed: if resolve errors,
+  //     restore the gate rather than leave the pipeline released-but-overlay-gone.
+  //     The backend then cuts EXACTLY the sent ranges and emits stage:review done.
   const continueReview = async () => {
     if (reviewLock.current) return;
     reviewLock.current = true;
     setReviewResolving(true);
     setReviewError(null);
-    // Any abnormal path keeps the gate OPEN with an error - never resume on
-    // uncertain state. A missing bridge, a missing required edit, a rejected or
-    // { ok:false } write, or a thrown call ALL fail closed here.
+    // Any abnormal path keeps the gate OPEN with an error - never resume on uncertain
+    // state. A missing bridge, a rejected or { ok:false } write, or a thrown call ALL
+    // fail closed here.
     const failClosed = (msg) => {
       reviewLock.current = false;
       setReviewResolving(false);
@@ -279,38 +279,20 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       const syncApi = window.openswim && window.openswim.sync;
       // The bridges that actually commit + release MUST be present.
       if (!syncApi || !syncApi.resolveReview) { failClosed("Sync bridge unavailable - cannot resume. Try again."); return; }
-      if (!trimApi || !trimApi.decide) { failClosed("Decision bridge unavailable - cannot save choices. Try again."); return; }
+      if (!trimApi || !trimApi.setCuts) { failClosed("Decision bridge unavailable - cannot save choices. Try again."); return; }
 
+      // Send EVERY reviewed episode's final cut-set (including the empty set, so an
+      // episode the user fully de-selected is explicitly committed to "cut nothing"
+      // and the backend never falls back to the detector's flagged cuts).
       const sends = [];
-      let editMissing = false;
       for (const item of (review ? review.items : [])) {
-        const detected = item.cuts || [];
-        const current = reviewEditedCuts[item.uuid] || detected;
-        const decs = reviewDecisions[item.uuid] || {};
-        detected.forEach((dcut, k) => {
-          if (!dcut || !dcut.needsReview) return;
-          const ccut = current[k] || dcut;
-          const dKey = cutKeyOf(dcut);
-          const cKey = cutKeyOf(ccut);
-          // Decision may be recorded under the edited key (decided after editing)
-          // or the detected key (decided before). Either reads as the intent.
-          const value = (decs[cKey] || decs[dKey]) === "remove" ? "remove" : "keep";
-          // A REMOVE at an adjusted boundary REQUIRES the edit to land first, else
-          // the backend would cut the original (wider) detected range - the exact
-          // cardinal-rule violation. Fail closed if the edit bridge is missing.
-          if (value === "remove" && cKey !== dKey) {
-            if (!trimApi.edit) { editMissing = true; return; }
-            sends.push(Promise.resolve(trimApi.edit(item.uuid, dcut, { startSec: ccut.startSec, endSec: ccut.endSec })));
-          }
-          // Decision keyed by the DETECTED cut (backend looks it up there).
-          sends.push(Promise.resolve(trimApi.decide(item.uuid, dcut, value)));
-        });
+        const ranges = reviewRangesFor(item).map((r) => [r.startSec, r.endSec]);
+        sends.push(Promise.resolve(trimApi.setCuts(item.uuid, ranges, item.ext)));
       }
-      if (editMissing) { failClosed("Couldn't save an adjusted boundary. Try again."); return; }
 
       const results = await Promise.allSettled(sends);
       const failed = results.some((r) => r.status === "rejected" || (r.value && r.value.ok === false));
-      if (failed) { failClosed("A decision didn't save. Check the choices and press Continue again."); return; }
+      if (failed) { failClosed("A choice didn't save. Check the lines and press Continue again."); return; }
 
       const r = await syncApi.resolveReview();
       if (r && r.ok === false) { failClosed("Couldn't resume the transfer. Press Continue again."); return; }
@@ -323,9 +305,10 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     }
   };
 
-  const reviewFlaggedCount = review
-    ? review.items.reduce((n, it) =>
-        n + ((reviewEditedCuts[it.uuid] || it.cuts || []).filter((c) => c && c.needsReview).length), 0)
+  // Total selected (yellow) lines across all reviewed episodes - shown in the gate
+  // header so the user sees how much is queued to cut before they commit.
+  const reviewSelectedLines = review
+    ? review.items.reduce((n, it) => n + selectedCount(reviewSelected[it.uuid]), 0)
     : 0;
 
   const stageCounts = stages.map((st) => ({
@@ -480,33 +463,30 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
               <div>
                 <div className="ct-label" style={{ color: "var(--ct-amber)" }}>Review before sending</div>
                 <div className="ct-subhead" style={{ marginTop: 4 }}>
-                  {reviewFlaggedCount} cut{reviewFlaggedCount !== 1 ? "s" : ""} across {review.items.length} episode{review.items.length !== 1 ? "s" : ""} need a decision
+                  {reviewSelectedLines} line{reviewSelectedLines !== 1 ? "s" : ""} selected to cut across {review.items.length} episode{review.items.length !== 1 ? "s" : ""}
                 </div>
               </div>
               <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--ct-amber)" }}></div>
             </div>
             <div className="ct-dialog__body" style={{ overflow: "auto", flex: 1, padding: 0 }}>
               <div className="ct-meta" style={{ color: "var(--fg-muted)", padding: "12px 20px 4px" }}>
-                These were left intact because they were ambiguous or over the safe length.
-                Confident cuts have already been applied. Anything you don't mark{" "}
-                <span style={{ color: "var(--ct-amber)" }}>REMOVE</span> is kept.
+                Open an episode and read its transcript.{" "}
+                <span style={{ color: "var(--ct-amber)" }}>Yellow</span> lines will be cut;
+                grey lines are kept. Click any line to add or remove it from the cut.
               </div>
-              {review.items.map((item) => {
-                const cuts = reviewEditedCuts[item.uuid] || item.cuts || [];
-                return (
-                  <div key={item.uuid} style={{ marginTop: 8 }}>
-                    <div className="ct-label" style={{ padding: "0 20px" }}>{item.title}</div>
-                    <CutlistReview
-                      uuid={item.uuid}
-                      trimEntry={{ cuts }}
-                      decisions={reviewDecisions[item.uuid] || {}}
-                      audioUrl={reviewAudioUrls[item.uuid]}
-                      onDecide={reviewDecide}
-                      onEditCut={reviewEdit} />
-                    <TranscriptEvidence uuid={item.uuid} transcript={item.segments} trimEntry={{ cuts }} />
-                  </div>
-                );
-              })}
+              {review.items.map((item) => (
+                <div key={item.uuid} style={{ marginTop: 8 }}>
+                  <div className="ct-label" style={{ padding: "0 20px" }}>{item.title}</div>
+                  <TranscriptCutReview
+                    uuid={item.uuid}
+                    transcript={item.segments}
+                    trimEntry={{ cuts: item.cuts || [] }}
+                    selected={reviewSelected[item.uuid]}
+                    onToggleSentence={onReviewToggle}
+                    audioUrl={reviewAudioUrls[item.uuid]}
+                    defaultOpen={review.items.length === 1} />
+                </div>
+              ))}
             </div>
             {reviewError && (
               <div className="ct-meta" style={{ color: "var(--ct-error)", padding: "0 20px 8px" }}>
