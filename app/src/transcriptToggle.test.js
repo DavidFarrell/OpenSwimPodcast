@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   splitSentences, toSegments, interpTime, sentenceLines,
   selectableCuts, lineInCuts, preselectFromCuts, toggleSentence,
-  selectedToRanges, panelSummary, selectedCount, flaggedLines, heldCutCount,
+  selectedToRanges, panelSummary, selectedCount, flaggedLines, heldLines, heldCutCount,
 } from "./transcriptToggle.js";
 
 describe("splitSentences", () => {
@@ -267,6 +267,47 @@ describe("flaggedLines + heldCutCount (held cuts stay VISIBLE but opt-in)", () =
     ] })).toBe(2);
     expect(heldCutCount({ cuts: [{ startSec: 0, endSec: 30, needsReview: false }] })).toBe(0);
     expect(heldCutCount(undefined)).toBe(0);
+  });
+});
+
+describe("heldLines (the precise ⚑ marker set - held cuts ONLY, not confident)", () => {
+  const transcript = { segments: [
+    { start: 0, end: 30, text: "Welcome to the show." },        // line 0, mid 15
+    { start: 600, end: 660, text: "Sponsored by Acme today." },  // line 1, mid 630
+    { start: 660, end: 700, text: "Acme makes great widgets." }, // line 2, mid 680
+    { start: 720, end: 760, text: "Back to the topic." },        // line 3, mid 740
+  ] };
+
+  it("returns ONLY lines inside a held (needsReview) cut - a confident cut gets no ⚑", () => {
+    const lines = sentenceLines(transcript);
+    const held = heldLines(lines, { cuts: [
+      { startSec: 0, endSec: 30, needsReview: false, label: "intro" }, // confident -> NOT held
+      { startSec: 600, endSec: 700, needsReview: true, label: "ad" },  // HELD -> lines 1,2
+    ] });
+    expect([...held].sort((a, b) => a - b)).toEqual([1, 2]);
+  });
+
+  it("is a STRICT SUBSET of flaggedLines (held ⊆ flagged); the difference is confident-cut lines", () => {
+    const lines = sentenceLines(transcript);
+    const trimEntry = { cuts: [
+      { startSec: 0, endSec: 30, needsReview: false, label: "intro" }, // confident -> line 0
+      { startSec: 600, endSec: 700, needsReview: true, label: "ad" },  // held -> lines 1,2
+    ] };
+    const flagged = flaggedLines(lines, trimEntry);
+    const held = heldLines(lines, trimEntry);
+    // held marks 1,2; flagged marks 0,1,2; line 0 (the confident cut) is flagged-not-held.
+    expect([...held].sort((a, b) => a - b)).toEqual([1, 2]);
+    expect([...flagged].sort((a, b) => a - b)).toEqual([0, 1, 2]);
+    expect([...held].every((i) => flagged.has(i))).toBe(true);
+    expect(flagged.has(0)).toBe(true);
+    expect(held.has(0)).toBe(false);
+  });
+
+  it("returns an empty set when there are no held cuts (all confident) or no cuts", () => {
+    const lines = sentenceLines(transcript);
+    expect(heldLines(lines, { cuts: [{ startSec: 0, endSec: 30, needsReview: false }] }).size).toBe(0);
+    expect(heldLines(lines, { cuts: [] }).size).toBe(0);
+    expect(heldLines(lines, undefined).size).toBe(0);
   });
 });
 

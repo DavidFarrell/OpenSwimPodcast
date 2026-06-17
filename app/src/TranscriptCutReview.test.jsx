@@ -110,6 +110,84 @@ describe("TranscriptCutReview - yellow (in-cut) vs grey (kept) marking", () => {
   });
 });
 
+describe("TranscriptCutReview - binary colour + ⚑ as a SEPARATE annotation axis", () => {
+  // A HELD (needsReview) mid-roll: lines 1,2 are flagged-but-not-pre-selected.
+  const heldTranscript = {
+    segments: [
+      { start: 0, end: 30, text: "Welcome to the show." },         // line 0 (content)
+      { start: 600, end: 660, text: "This might be sponsored." },   // line 1 (held ad)
+      { start: 660, end: 700, text: "Acme makes great widgets." },  // line 2 (held ad)
+      { start: 720, end: 760, text: "Back to the topic." },         // line 3 (content)
+    ],
+  };
+  const heldEntry = { cuts: [{ startSec: 600, endSec: 700, needsReview: true, label: "ad" }] };
+
+  it("the cut decision is text-colour only - NO wash background, NO dashed left rule", () => {
+    const html = renderToStaticMarkup(
+      <TranscriptCutReview uuid="e1" transcript={transcript} trimEntry={trimEntry} selected={preselected()} />
+    );
+    // The amber WASH (--ct-amber-dim) and the dashed flag-as-state rule are both gone.
+    expect(html).not.toContain("amber-dim");
+    expect(html).not.toContain("dashed");
+    // A cut (selected) line carries the bright amber text...
+    expect(html).toContain("var(--ct-amber)");
+    // ...and a kept line the muted grey - both present (binary).
+    expect(html).toContain("var(--fg-muted)");
+  });
+
+  it("a held cut starts GREY (not pre-selected) but carries a ⚑ so it is discoverable", () => {
+    const html = renderToStaticMarkup(
+      <TranscriptCutReview uuid="e1" transcript={heldTranscript} trimEntry={heldEntry}
+        selected={new Set()} />
+    );
+    // Cardinal rule: nothing auto-selected for a held-only episode.
+    expect((html.match(/data-selected="true"/g) || []).length).toBe(0);
+    // The two held lines are MARKED (data-held) and flagged as unreviewed...
+    expect((html.match(/data-held="true"/g) || []).length).toBe(2);
+    expect((html.match(/data-unreviewed="true"/g) || []).length).toBe(2);
+    // ...and the ⚑ glyph is rendered (twice, one per held line).
+    expect((html.match(/⚑/g) || []).length).toBeGreaterThanOrEqual(2);
+    // The held panel auto-opens so the user is pulled straight to the review.
+    expect(html).toContain("open");
+    // The jump-to button is present with the held count.
+    expect(html).toContain("flagged for review");
+  });
+
+  it("the ⚑ is INDEPENDENT of selection: opting a held line in keeps its ⚑ but clears 'unreviewed'", () => {
+    // Select line 1 (opt it into the cut). It stays held (⚑) but is no longer unreviewed.
+    const html = renderToStaticMarkup(
+      <TranscriptCutReview uuid="e1" transcript={heldTranscript} trimEntry={heldEntry}
+        selected={new Set([1])} />
+    );
+    expect((html.match(/data-held="true"/g) || []).length).toBe(2);      // both still held
+    expect((html.match(/data-unreviewed="true"/g) || []).length).toBe(1); // only line 2 left
+    expect((html.match(/data-selected="true"/g) || []).length).toBe(1);   // line 1 now cut
+  });
+
+  it("exposes the held/flagged status on the button's accessible name (⚑ is aria-hidden)", () => {
+    const html = renderToStaticMarkup(
+      <TranscriptCutReview uuid="e1" transcript={heldTranscript} trimEntry={heldEntry}
+        selected={new Set()} />
+    );
+    // The decorative glyph is hidden from AT...
+    expect(html).toContain('aria-hidden="true"');
+    // ...so a held line carries "flagged for review" in its aria-label instead.
+    expect(html).toContain("flagged for review: This might be sponsored.");
+    // A non-held (kept content) line's label has no "flagged for review".
+    expect(html).toContain('aria-label="0:00: Welcome to the show."');
+  });
+
+  it("a CONFIDENT cut never gets a ⚑ (the marker means 'unsure', not 'will cut')", () => {
+    // trimEntry is a confident mid-roll: its lines are selected (amber) but NOT held.
+    const html = renderToStaticMarkup(
+      <TranscriptCutReview uuid="e1" transcript={transcript} trimEntry={trimEntry} selected={preselected()} />
+    );
+    // No line carries the held marker (the ⚑ in the hint copy is static, not a line).
+    expect(html).not.toContain('data-held="true"');
+    expect(html).not.toContain('data-unreviewed="true"');
+  });
+});
+
 describe("TranscriptCutReview - sentence toggle wiring (the editing gesture)", () => {
   function setup(selected) {
     const onToggleSentence = vi.fn();

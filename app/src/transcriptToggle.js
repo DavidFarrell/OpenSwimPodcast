@@ -272,6 +272,25 @@ export function flaggedLines(lines, trimEntry) {
   return out;
 }
 
+// The sentence lines that belong to a HELD (needsReview === true) cut, as a Set of
+// indices. This is the PRECISE "the detector was unsure here" set - a strict subset of
+// flaggedLines (which also includes confident-cut lines). The binary review surface
+// uses THIS (not flaggedLines) to place the ⚑ review marker, so the marker means exactly
+// "held / opt-in cut" and never appears on a confident cut. It is INDEPENDENT of the
+// selection: a held line keeps its ⚑ whether or not the user has opted it into the
+// yellow set (the flag is an annotation axis, not a cut-state). A confident cut that the
+// user manually de-selects does NOT become flagged (that was a latent ambiguity when the
+// marker keyed off flaggedLines && !selected). Pure; mirrors flaggedLines' midpoint test.
+export function heldLines(lines, trimEntry) {
+  const held = selectableCuts(trimEntry).filter((c) => c && c.needsReview === true);
+  const out = new Set();
+  if (!Array.isArray(lines) || held.length === 0) return out;
+  for (const line of lines) {
+    if (lineInCuts(line, held)) out.add(line.index);
+  }
+  return out;
+}
+
 // Count of detector cuts that are HELD (needsReview === true) - surfaced for the user
 // but NOT pre-selected. Drives the "N flagged for review" hint so the user knows to
 // look even when nothing is pre-selected yellow. Pure.
