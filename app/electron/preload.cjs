@@ -66,4 +66,10 @@ contextBridge.exposeInMainWorld("openswim", {
     setCuts: (uuid, ranges, ext) => invoke("trim:setCuts", { uuid, ranges, ext }),
     cutSet: (uuid) => invoke("trim:cutSet", uuid),
   },
+  review: {
+    // Persist the renderer-built review records (src/reviewCapture.js) to the local
+    // NDJSON dataset via the main-process write edge. Best-effort; resolves to a
+    // result object and never throws into the renderer.
+    capture: (records) => invoke("review:capture", records),
+  },
 });

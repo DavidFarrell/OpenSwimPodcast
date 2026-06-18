@@ -6,6 +6,7 @@ const { createDeviceWatcher } = require("./device.cjs");
 const { runSync, readManifest } = require("./sync.cjs");
 const { probeDurationSec } = require("./converter.cjs");
 const { writeDecisions, writeCutSet } = require("./decisionCache.cjs");
+const { appendRecords } = require("./reviewDataset.cjs");
 
 function serializeError(e) {
   return { message: e.message || String(e), code: e.code, status: e.status };
@@ -514,6 +515,13 @@ function buildHandlers() {
       return stored;
     },
     "trim:cutSet": (_, uuid) => getTrimCutSet(uuid),
+
+    // Review-capture WRITE EDGE (slice 3): persist the renderer-built review records
+    // (src/reviewCapture.js) to the local NDJSON dataset. The payload is UNTRUSTED -
+    // appendRecords validates it at the trust boundary, writes to the FIXED userData
+    // path (never a renderer-supplied path), and is best-effort (returns a result
+    // object, never throws), so a capture failure can never block a sync.
+    "review:capture": (_, records) => appendRecords(records),
   };
 }
 

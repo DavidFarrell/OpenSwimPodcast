@@ -337,3 +337,21 @@ describe("explicit cut-set store (setTrimCutSet / getTrimCutSet, transcript-togg
     expect(getTrimCutSet("epCS4")).toEqual([{ startSec: 600, endSec: 660 }]);
   });
 });
+
+describe("review:capture IPC handler (slice 3 write edge)", () => {
+  it("is wired into the handler map and routes the payload to appendRecords", async () => {
+    const handlers = buildHandlers();
+    expect(typeof handlers["review:capture"]).toBe("function");
+    // A non-array payload is whole-batch rejected by appendRecords (no fs touched), so
+    // this asserts the handler genuinely calls appendRecords - a stub returning the
+    // queue would not produce this exact result object. It also confirms it returns a
+    // Promise that resolves (best-effort) rather than throwing.
+    const res = await handlers["review:capture"]({}, { not: "an array" });
+    expect(res).toMatchObject({ ok: false, written: 0, error: "not-an-array" });
+  });
+
+  it("never throws on a null payload (best-effort)", async () => {
+    const handler = buildHandlers()["review:capture"];
+    await expect(handler({}, null)).resolves.toMatchObject({ ok: false });
+  });
+});

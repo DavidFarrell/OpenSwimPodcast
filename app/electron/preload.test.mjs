@@ -78,4 +78,15 @@ describe("preload trim bridge", () => {
     expect(calls[0].channel).toBe("trim:setCuts");
     expect(calls[0].arg).toEqual({ uuid: "u1", ranges: [[600, 660], [1390, 1445]], ext: "m4a" });
   });
+
+  // Slice 3 write edge: the renderer commits review records via review.capture,
+  // forwarding the records array straight to the review:capture channel.
+  it("exposes review.capture and forwards the records array to review:capture", () => {
+    expect(typeof exposed.review.capture).toBe("function");
+    const records = [{ schemaVersion: 1, uuid: "u1" }];
+    exposed.review.capture(records);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].channel).toBe("review:capture");
+    expect(calls[0].arg).toBe(records);
+  });
 });
