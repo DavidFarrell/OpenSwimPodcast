@@ -233,3 +233,57 @@ export function buildReviewRecord({ initialSnapshot, finalSelected, transcript, 
     },
   };
 }
+
+// Build the array of review records for every OPENED episode, from frozen gate state.
+// Pure: every side-effecting value (captureId, committedAt) is injected, so the same
+// inputs always produce the same records and the unit tests are deterministic. Only
+// uuids in `reviewedUuids` (the ones the user opened) contribute - a never-opened
+// episode is absent. `finalSelected` per uuid MUST be the SAME Set the gate sends to
+// trim.setCuts (buildReviewRecord throws on a non-Set), so collapsedRanges describes
+// exactly the committed cut-set.
+//
+//   items          the gate's review items ({ uuid, title, segments, ... }).
+//   reviewedUuids  Set<uuid> of episodes the user opened (built records only for these).
+//   snapshots      uuid -> frozen snapshotInitial({lines,cuts}), taken at first open.
+//   finalSelected  uuid -> Set<number> of selected indices (== what the gate committed).
+//   openedAt       uuid -> ms timestamp of first open (for openDurationMs).
+//   toggleCounts   uuid -> number of toggles (drives edited + toggleCount).
+//   committedAt    ms timestamp stamped now (one value for the whole batch).
+//   makeCaptureId  () => string, injected (parent passes crypto.randomUUID).
+//   metaFor        optional uuid -> extra meta (showId/model/etc.) merged per record.
+export function buildCaptureRecords({
+  items = [], reviewedUuids, snapshots = {}, finalSelected = {},
+  openedAt = {}, toggleCounts = {}, committedAt = null, makeCaptureId, metaFor,
+}) {
+  const opened = reviewedUuids instanceof Set ? reviewedUuids : new Set(reviewedUuids || []);
+  const records = [];
+  for (const item of items) {
+    const uuid = item && item.uuid;
+    if (!uuid || !opened.has(uuid)) continue;
+    const snapshot = snapshots[uuid];
+    if (!snapshot) continue; // opened but never snapshotted - nothing to describe
+    const sel = finalSelected[uuid];
+    const openMs = openedAt[uuid] ?? null;
+    const toggles = toggleCounts[uuid] ?? 0;
+    const extraMeta = (typeof metaFor === "function" ? metaFor(uuid) : null) || {};
+    records.push(buildReviewRecord({
+      initialSnapshot: snapshot,
+      finalSelected: sel,
+      transcript: { segments: item.segments || [] },
+      meta: {
+        captureId: typeof makeCaptureId === "function" ? makeCaptureId() : null,
+        uuid,
+        title: item.title ?? null,
+        ...extraMeta,
+      },
+      behavioural: {
+        openedAt: openMs,
+        committedAt,
+        openDurationMs: (openMs != null && committedAt != null) ? committedAt - openMs : null,
+        edited: toggles > 0,
+        toggleCount: toggles,
+      },
+    }));
+  }
+  return records;
+}

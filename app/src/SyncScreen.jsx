@@ -6,6 +6,8 @@ import { formatMB } from "./useDevice.js";
 import { TranscriptCutReview } from "./TranscriptCutReview.jsx";
 import { buildTrimAudioUrls } from "./trimAudio.js";
 import { sentenceLines, preselectFromCuts, toggleSentence, selectedToRanges, selectedCount } from "./transcriptToggle.js";
+import { snapshotInitial, buildCaptureRecords } from "./reviewCapture.js";
+import { commitAndCapture, cancelTransfer } from "./commitCapture.js";
 
 // Two visible phases (presentational only - one runSync arc, not two IPC sessions).
 // PREPARING covers the analysis + the review gate; TRANSFERRING covers the device
@@ -208,6 +210,20 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   const [reviewResolving, setReviewResolving] = useState(false);
   const [reviewError, setReviewError] = useState(null);
 
+  // REVIEW-CAPTURE TRACKING (slice 4). Plain refs, NOT state: this is observational
+  // metadata for the best-effort dataset write, never anything the cut-set or the
+  // render depends on, so it must not trigger re-renders or interact with the commit.
+  //   reviewedUuids   episodes the user OPENED (records are built only for these).
+  //   reviewSnapshots uuid -> frozen snapshotInitial taken at FIRST open (the proposal
+  //                   + lines the user saw); captures intent before any toggle.
+  //   reviewOpenedAt  uuid -> ms of first open (for openDurationMs).
+  //   reviewToggles   uuid -> toggle count (drives edited + toggleCount).
+  // ALL are reset when a new `review` event arrives so a prior gate never leaks in.
+  const reviewedUuids = useRef(new Set());
+  const reviewSnapshots = useRef({});
+  const reviewOpenedAt = useRef({});
+  const reviewToggles = useRef({});
+
   // Base stages + any analysis stages that have started. Title lookup for log lines.
   const stages = useMemo(() => insertAnalysisStages(STAGES, stageState), [STAGES, stageState]);
   const titleByUuid = useMemo(() => {
@@ -239,6 +255,12 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
         reviewLock.current = false;
         setReviewResolving(false);
         setReviewError(null);
+        // New gate session - clear all capture tracking so a prior gate's opens,
+        // snapshots, or toggle counts can never leak into this one's records.
+        reviewedUuids.current = new Set();
+        reviewSnapshots.current = {};
+        reviewOpenedAt.current = {};
+        reviewToggles.current = {};
         const items = Array.isArray(evt.items) ? evt.items : [];
         setReview({ items });
         // Seed each episode's selected (yellow) set from its detector cuts, so the
@@ -272,11 +294,13 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     return () => off && off();
   }, [phase, devicePath]);
 
-  const cancel = async () => {
-    const api = window.openswim && window.openswim.sync;
-    if (api) await api.cancel();
-    onBack();
-  };
+  // Cancel/abandon. Routes through cancelTransfer (the commit/capture counterpart) so
+  // the "capture never fires on cancel" guarantee is structural: this path cannot reach
+  // setCuts, resolveReview, or review.capture.
+  const cancel = () => cancelTransfer({
+    cancel: () => { const api = window.openswim && window.openswim.sync; return api && api.cancel(); },
+    onBack,
+  });
 
   // --- Review gate handlers (transcript-toggle) ---
   // Toggle one sentence in/out of an episode's selected (yellow) set - LOCAL state
@@ -285,7 +309,29 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   const onReviewToggle = (uuid, index) => {
     if (reviewLock.current) return; // gate is resolving - state is frozen
     if (!uuid || !Number.isFinite(index)) return;
+    // A toggle implies the panel is open; count it for the capture's edited signal.
+    // Pure observation - never affects the selection or the commit.
+    reviewToggles.current[uuid] = (reviewToggles.current[uuid] || 0) + 1;
     setReviewSelected((p) => ({ ...p, [uuid]: toggleSentence(p[uuid] || new Set(), index) }));
+  };
+  // The user opened an episode's panel. Record it as REVIEWED and, on the FIRST open,
+  // freeze the initial snapshot (the proposal + lines as the detector posed them) from
+  // the SAME sentenceLines the gate collapses at Continue. Wrapped so a snapshot error
+  // can never break the gate; capture for that episode is simply dropped. Best-effort
+  // and side-effect-free with respect to the cut-set.
+  const onReviewOpen = (uuid) => {
+    if (!uuid || reviewedUuids.current.has(uuid)) return;
+    reviewedUuids.current.add(uuid);
+    reviewOpenedAt.current[uuid] = Date.now();
+    try {
+      const item = (review ? review.items : []).find((it) => it.uuid === uuid);
+      if (item) {
+        const lines = sentenceLines({ segments: item.segments || [] });
+        reviewSnapshots.current[uuid] = snapshotInitial({ lines, cuts: item.cuts || [] });
+      }
+    } catch {
+      // snapshot failed - leave it absent so buildCaptureRecords skips this episode
+    }
   };
   // Per-episode final cut ranges = the contiguous selected sentence runs. Computed
   // from the live selection + the episode's sentence lines. This is exactly what
@@ -327,25 +373,60 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       if (!syncApi || !syncApi.resolveReview) { failClosed("Sync bridge unavailable - cannot resume. Try again."); return; }
       if (!trimApi || !trimApi.setCuts) { failClosed("Decision bridge unavailable - cannot save choices. Try again."); return; }
 
-      // Send EVERY reviewed episode's final cut-set (including the empty set, so an
-      // episode the user fully de-selected is explicitly committed to "cut nothing"
-      // and the backend never falls back to the detector's flagged cuts).
-      const sends = [];
-      for (const item of (review ? review.items : [])) {
-        const ranges = reviewRangesFor(item).map((r) => [r.startSec, r.endSec]);
-        sends.push(Promise.resolve(trimApi.setCuts(item.uuid, ranges, item.ext)));
+      const items = review ? review.items : [];
+
+      // GATHER capture inputs BEFORE any await. resolveReview can unmount/clear the
+      // gate, so the inputs must be frozen here or they can be lost. This is purely
+      // observational - if it throws, captureInputs stays null and the commit proceeds
+      // EXACTLY as today (no capture). It can never perturb what setCuts receives.
+      let captureInputs = null;
+      try {
+        const finalSelected = {};
+        for (const item of items) finalSelected[item.uuid] = new Set(reviewSelected[item.uuid] || new Set());
+        captureInputs = {
+          items,
+          reviewedUuids: new Set(reviewedUuids.current),
+          snapshots: { ...reviewSnapshots.current },
+          finalSelected,
+          openedAt: { ...reviewOpenedAt.current },
+          toggleCounts: { ...reviewToggles.current },
+        };
+      } catch {
+        captureInputs = null;
       }
 
-      const results = await Promise.allSettled(sends);
-      const failed = results.some((r) => r.status === "rejected" || (r.value && r.value.ok === false));
-      if (failed) { failClosed("A choice didn't save. Check the lines and press Continue again."); return; }
+      // Commit + capture via the cardinal-safe seam. setCuts gets EXACTLY today's
+      // ranges; capture fires fire-and-forget ONLY after a successful resolve, fully
+      // wrapped. A capture throw / absent bridge cannot change the committed cut-set or
+      // fail-close the transfer (proven in commitCapture.test.js). The capture bridge is
+      // resolved LAZILY inside the callback, so window.openswim.review is not even touched
+      // until after a successful setCuts + resolveReview - a side-effecting getter cannot
+      // run pre-commit. The callback is invoked inside commitAndCapture's wrapped try.
+      const result = await commitAndCapture({
+        items,
+        rangesFor: (item) => reviewRangesFor(item).map((r) => [r.startSec, r.endSec]),
+        setCuts: (uuid, ranges, ext) => trimApi.setCuts(uuid, ranges, ext),
+        resolveReview: () => syncApi.resolveReview(),
+        capture: (records) => {
+          const reviewApi = window.openswim && window.openswim.review;
+          if (reviewApi && typeof reviewApi.capture === "function") return reviewApi.capture(records);
+        },
+        buildRecords: captureInputs
+          ? () => buildCaptureRecords({ ...captureInputs, committedAt: Date.now(), makeCaptureId: () => crypto.randomUUID() })
+          : () => [],
+        onResolved: () => {
+          setReview(null);
+          setReviewResolving(false);
+          reviewLock.current = false;
+        },
+      });
 
-      const r = await syncApi.resolveReview();
-      if (r && r.ok === false) { failClosed("Couldn't resume the transfer. Press Continue again."); return; }
-
-      setReview(null);
-      setReviewResolving(false);
-      reviewLock.current = false;
+      if (!result.ok) {
+        const msg = result.reason === "setCuts"
+          ? "A choice didn't save. Check the lines and press Continue again."
+          : "Couldn't resume the transfer. Press Continue again.";
+        failClosed(msg);
+      }
     } catch {
       failClosed("Something went wrong saving your choices. Press Continue again.");
     }
@@ -548,7 +629,8 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
                     selected={reviewSelected[item.uuid]}
                     onToggleSentence={onReviewToggle}
                     audioUrl={reviewAudioUrls[item.uuid]}
-                    defaultOpen={review.items.length === 1} />
+                    defaultOpen={false}
+                    onOpen={onReviewOpen} />
                 </div>
               ))}
             </div>

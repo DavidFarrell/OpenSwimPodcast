@@ -37,14 +37,18 @@ import { previewJoinWindows } from "./cutlistReview.js";
 //   onToggleSentence  (uuid, index) => void - toggle one sentence in/out.
 //   audioUrl          the converted-or-original episode file the <audio> previews
 //                     play; previews are disabled (and the ▶ buttons inert) without it.
-//   defaultOpen       start expanded (the SyncScreen gate wants the transcript open
-//                     so the user reviews immediately; the Today pre-sync list leaves
-//                     it collapsed for a quiet overview).
+//   defaultOpen       start expanded. The SyncScreen gate now passes false for ALL
+//                     panels (every open is a deliberate user action that onOpen
+//                     reports); the held-count summary cue is the nudge, not an
+//                     auto-open. Defaults to false.
+//   onOpen            (uuid) => void - fired when the user opens the panel (the open
+//                     transition of <details>, never on close). The parent dedupes to
+//                     first-open and freezes its capture snapshot there.
 //
 // Renders nothing when there is no usable cut OR no usable transcript - no clutter
 // for episodes whose cuts all auto-applied with nothing to read, matching today.
 export function TranscriptCutReview({
-  uuid, transcript, trimEntry, selected, onToggleSentence, audioUrl, defaultOpen = false,
+  uuid, transcript, trimEntry, selected, onToggleSentence, audioUrl, defaultOpen = false, onOpen,
 }) {
   const cuts = selectableCuts(trimEntry);
   const lines = sentenceLines(transcript);
@@ -60,7 +64,9 @@ export function TranscriptCutReview({
   // its ⚑ whether or not the user opts it into the yellow set, and a confident cut
   // never gets a ⚑. Marking never selects - the cardinal rule (cut only the yellow set
   // at Continue) is unchanged. "Unreviewed" = held AND not yet selected: those drive the
-  // jump button and the auto-open, so the user is pulled to the cuts still needing a look.
+  // jump button. The panel no longer auto-opens on held cuts; the held-count cue on the
+  // <summary> (shown while collapsed) is now the only nudge, with the jump button
+  // reachable once the user opens the panel.
   const held = heldLines(lines, trimEntry);
   const heldCount = heldCutCount(trimEntry);
   const hasUnreviewedHeld = [...held].some((i) => !sel.has(i));
@@ -184,7 +190,11 @@ export function TranscriptCutReview({
   });
 
   return (
-    <details className="transcript-cut-review" data-uuid={uuid || ""} {...((defaultOpen || hasUnreviewedHeld) ? { open: true } : {})}
+    <details className="transcript-cut-review" data-uuid={uuid || ""} {...(defaultOpen ? { open: true } : {})}
+      // onToggle fires on BOTH open and close; report only the open transition. The
+      // parent dedupes to "first open" (it freezes the snapshot then). Since the gate
+      // always passes defaultOpen={false}, every open here is a user action.
+      onToggle={(e) => { if (e.target && e.target.open && onOpen) onOpen(uuid); }}
       style={{ borderTop: "1px solid var(--rule)", padding: "6px 20px 10px",
         background: "var(--ct-coffee-deep)" }}>
       <summary className="transcript-cut-review__summary"

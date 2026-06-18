@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  snapshotInitial, buildReviewRecord, hashTranscript, hashProposal,
+  snapshotInitial, buildReviewRecord, buildCaptureRecords, hashTranscript, hashProposal,
   SCHEMA_VERSION, SPLITTER_VERSION,
 } from "./reviewCapture.js";
 import { sentenceLines, selectedToRanges } from "./transcriptToggle.js";
@@ -286,5 +286,72 @@ describe("CARDINAL: collapsedRanges == selectedToRanges(lines, finalSelected)", 
     // Set it sends to trim.setCuts.
     expect(() => buildReviewRecord({ initialSnapshot: snap, finalSelected: undefined, transcript, meta, behavioural })).toThrow(TypeError);
     expect(() => buildReviewRecord({ initialSnapshot: snap, finalSelected: [0, 1], transcript, meta, behavioural })).toThrow();
+  });
+});
+
+describe("buildCaptureRecords - opened-only, deterministic, signals carried through", () => {
+  // Two episodes. The gate seeds finalSelected = each snapshot's preselect; the parent
+  // freezes a snapshot per opened episode. The same fixtures as above feed episode A.
+  const itemA = { uuid: "ep-a", title: "Ep A", segments: transcript.segments, cuts };
+  const itemB = { uuid: "ep-b", title: "Ep B", segments: transcript.segments, cuts };
+  const snapA = snapshotInitial({ lines: sentenceLines({ segments: itemA.segments }), cuts });
+  const snapB = snapshotInitial({ lines: sentenceLines({ segments: itemB.segments }), cuts });
+  // A deterministic, injected id source so the test can assert exact captureIds.
+  function counter() { let n = 0; return () => `cap-${++n}`; }
+
+  function build(over = {}) {
+    return buildCaptureRecords({
+      items: [itemA, itemB],
+      reviewedUuids: new Set(["ep-a"]),     // only A was opened
+      snapshots: { "ep-a": snapA, "ep-b": snapB },
+      finalSelected: { "ep-a": new Set([0]), "ep-b": new Set([1, 2]) },
+      openedAt: { "ep-a": 1000 },
+      toggleCounts: { "ep-a": 3 },
+      committedAt: 4000,
+      makeCaptureId: counter(),
+      ...over,
+    });
+  }
+
+  it("builds records ONLY for opened episodes (a never-opened episode is absent)", () => {
+    const recs = build();
+    expect(recs).toHaveLength(1);
+    expect(recs[0].uuid).toBe("ep-a");
+  });
+
+  it("an OPENED episode without a snapshot is skipped (best-effort, never throws)", () => {
+    const recs = buildCaptureRecords({
+      items: [itemA], reviewedUuids: new Set(["ep-a"]), snapshots: {}, // snapshot missing
+      finalSelected: { "ep-a": new Set([0]) }, openedAt: { "ep-a": 1 },
+      toggleCounts: { "ep-a": 0 }, committedAt: 2, makeCaptureId: counter(),
+    });
+    expect(recs).toEqual([]);
+  });
+
+  it("derives behavioural signals from the injected values (deterministic)", () => {
+    const rec = build()[0];
+    expect(rec.captureId).toBe("cap-1");
+    expect(rec.title).toBe("Ep A");
+    expect(rec.behavioural).toEqual({
+      openedAt: 1000, committedAt: 4000, openDurationMs: 3000, edited: true, toggleCount: 3,
+    });
+  });
+
+  it("an opened-but-UNEDITED episode reads edited:false, toggleCount:0", () => {
+    const rec = build({ toggleCounts: { "ep-a": 0 } })[0];
+    expect(rec.behavioural.edited).toBe(false);
+    expect(rec.behavioural.toggleCount).toBe(0);
+  });
+
+  it("CARDINAL: the record's collapsedRanges == selectedToRanges(lines, the committed Set)", () => {
+    // finalSelected for ep-a is the SAME Set the gate sends; collapsedRanges must match.
+    const rec = build({ finalSelected: { "ep-a": new Set([1, 2]) } })[0];
+    expect(rec.collapsedRanges).toEqual(selectedToRanges(snapA.lines, new Set([1, 2])));
+  });
+
+  it("merges per-episode extra meta (showId/model) via metaFor", () => {
+    const rec = build({ metaFor: (uuid) => uuid === "ep-a" ? { showId: "s1", model: "m1" } : null })[0];
+    expect(rec.showId).toBe("s1");
+    expect(rec.detector.model).toBe("m1");
   });
 });
