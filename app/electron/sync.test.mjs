@@ -5,7 +5,8 @@ import path from "node:path";
 import os from "node:os";
 
 const require = createRequire(import.meta.url);
-const { runSync, isOurFilename, sha256File, buildPlan, itemNeedsEncode, readManifest, writeManifest, MANIFEST_FILE, generateCuts, adToCut, resolveEpisodeCuts, EDGE_SNAP_SEC, generateIntro, INTRO_PIPELINE_VERSION } = require("./sync.cjs");
+const { runSync, isOurFilename, sha256File, buildPlan, itemNeedsEncode, readManifest, writeManifest, MANIFEST_FILE, generateCuts, adToCut, assignCutIds, resolveEpisodeCuts, EDGE_SNAP_SEC, generateIntro, INTRO_PIPELINE_VERSION } = require("./sync.cjs");
+const { cutId } = require("./detectAds.cjs");
 
 function mkTmp(label = "os-sync-") { return fs.mkdtempSync(path.join(os.tmpdir(), label)); }
 function rmTmp(d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
@@ -893,6 +894,110 @@ describe("adToCut positional intro/outro handling", () => {
   });
 });
 
+describe("adToCut cut-provenance passthrough (Slice 1)", () => {
+  const segments = [
+    { start: 5, end: 30, text: "leading" },
+    { start: 900, end: 1000, text: "midroll" },
+    { start: 1780, end: 1800, text: "signoff" },
+  ];
+
+  it("passes the detector's verbatim quotes straight through (additive)", () => {
+    const cut = adToCut({
+      ad: {
+        startSec: 900, endSec: 1000, needsReview: false, reasons: [],
+        firstLineQuote: "Brought to you by Acme.", lastLineQuote: "Visit acme dot com.",
+      },
+      segments,
+    });
+    expect(cut.firstLineQuote).toBe("Brought to you by Acme.");
+    expect(cut.lastLineQuote).toBe("Visit acme dot com.");
+    // The cut-shape fields are unchanged - quotes are additive only.
+    expect(cut.startSec).toBe(900);
+    expect(cut.endSec).toBe(1000);
+    expect(cut.label).toBe("ad");
+    expect(cut.needsReview).toBe(false);
+  });
+
+  it("leaves quotes undefined when the ad carried none (e.g. a reused cut-set range)", () => {
+    const cut = adToCut({ ad: { startSec: 900, endSec: 1000, needsReview: false, reasons: [] }, segments });
+    expect(cut.firstLineQuote).toBeUndefined();
+    expect(cut.lastLineQuote).toBeUndefined();
+  });
+});
+
+describe("assignCutIds (Slice 1) - stable, order-independent cut ids", () => {
+  it("stamps every cut with a stable 8-char base id derived from start/end/label", () => {
+    const cuts = [
+      { startSec: 0, endSec: 30, label: "intro" },
+      { startSec: 900, endSec: 1000, label: "ad" },
+    ];
+    const out = assignCutIds(cuts);
+    expect(out).toHaveLength(2);
+    for (const c of out) expect(c.cutId).toMatch(/^[0-9a-f]{8}$/);
+    // Distinct identities -> distinct ids.
+    expect(out[0].cutId).not.toBe(out[1].cutId);
+  });
+
+  it("does not mutate the input cuts (returns new objects)", () => {
+    const cuts = [{ startSec: 0, endSec: 30, label: "intro" }];
+    const out = assignCutIds(cuts);
+    expect("cutId" in cuts[0]).toBe(false);
+    expect(out[0]).not.toBe(cuts[0]);
+  });
+
+  it("is stable across re-runs AND independent of array order", () => {
+    const a = [
+      { startSec: 0, endSec: 30, label: "intro" },
+      { startSec: 900, endSec: 1000, label: "ad" },
+      { startSec: 1780, endSec: 1800, label: "outro" },
+    ];
+    // The same proposal in a SHUFFLED array order.
+    const b = [a[2], a[0], a[1]];
+    const ra = assignCutIds(a);
+    const rb = assignCutIds(b);
+    // Build identity -> id maps; the id for a given identity must match regardless
+    // of the array order it was presented in.
+    const idFor = (out) => Object.fromEntries(out.map((c) => [`${c.startSec}-${c.endSec}-${c.label}`, c.cutId]));
+    expect(idFor(rb)).toEqual(idFor(ra));
+  });
+
+  it("collision path: identical-duplicate cuts get unique, suffixed ids (never collide)", () => {
+    // Two genuinely identical cuts (same identity AND same provenance) in one episode.
+    // They are indistinguishable, so WHICH one gets the bare id is immaterial - the
+    // guarantee here is only that they do NOT collide to the same id. (Order-
+    // independence of the id->cut MAPPING, where the cuts differ, is proven in the
+    // next test; it cannot be proven with indistinguishable duplicates.)
+    const out = assignCutIds([
+      { startSec: 100, endSec: 200, label: "ad" },
+      { startSec: 100, endSec: 200, label: "ad" },
+      { startSec: 50, endSec: 80, label: "ad" }, // earlier start, distinct identity
+    ]);
+    const ids = out.map((c) => c.cutId);
+    expect(new Set(ids).size).toBe(3); // all unique - no collision
+    // The two duplicates: one bare base, one "-2" suffix.
+    const base = ids[0].replace(/-\d+$/, "");
+    expect(ids[0]).toBe(base);
+    expect(ids[1]).toBe(`${base}-2`);
+  });
+
+  it("collision with DIFFERENT provenance: the id->cut mapping survives array reversal", () => {
+    // Two cuts sharing start|end|label but with DIFFERENT provenance (quotes). The
+    // bare id vs the -2 suffix must follow the cut's CONTENT, not its array position:
+    // reversing the input must NOT swap which logical cut owns the bare id.
+    const a = [
+      { startSec: 100, endSec: 200, label: "ad", firstLineQuote: "Alpha opener.", lastLineQuote: "Alpha closer.", reasons: [], needsReview: false },
+      { startSec: 100, endSec: 200, label: "ad", firstLineQuote: "Bravo opener.", lastLineQuote: "Bravo closer.", reasons: [], needsReview: false },
+    ];
+    const idByQuote = (out) => Object.fromEntries(out.map((c) => [c.firstLineQuote, c.cutId]));
+    const forward = idByQuote(assignCutIds(a));
+    const reversed = idByQuote(assignCutIds([a[1], a[0]]));
+    // Same logical cut (keyed by its quote) gets the SAME id in both orders.
+    expect(reversed).toEqual(forward);
+    // And the two are genuinely distinguished (one bare, one suffixed).
+    expect(new Set(Object.values(forward)).size).toBe(2);
+  });
+});
+
 describe("generateCuts", () => {
   it("returns ready with cuts when the detector finds clean ads", async () => {
     // A clean mid-roll within the 45s hard cap (and far from the episode edges, so
@@ -910,6 +1015,31 @@ describe("generateCuts", () => {
     expect(out.status).toBe("ready");
     expect(out.cuts).toHaveLength(1);
     expect(out.cuts[0].startSec).toBe(600);
+  });
+
+  it("Slice 1: threads cutId + the detector's verbatim quotes onto the final cuts", async () => {
+    const transcribeFn = vi.fn(async () => ({ segments: [
+      { start: 0, end: 10, text: "intro" },
+      { start: 600, end: 630, text: "ad" },
+      { start: 700, end: 1300, text: "content" },
+    ] }));
+    const detectAdsFn = vi.fn(async () => ({
+      ads: [{
+        startIndex: 1, endIndex: 1, startSec: 600, endSec: 630, needsReview: false, reasons: [],
+        firstLineQuote: "Brought to you by Acme.", lastLineQuote: "Visit acme dot com.",
+      }],
+      stats: {},
+    }));
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn });
+    expect(out.cuts).toHaveLength(1);
+    expect(out.cuts[0].cutId).toMatch(/^[0-9a-f]{8}$/);
+    expect(out.cuts[0].firstLineQuote).toBe("Brought to you by Acme.");
+    expect(out.cuts[0].lastLineQuote).toBe("Visit acme dot com.");
+    // Cardinal-additive: the boundaries and flag are exactly what the detector
+    // proposed (this mid-roll is far from the edges, so no edge-snap).
+    expect(out.cuts[0].startSec).toBe(600);
+    expect(out.cuts[0].endSec).toBe(630);
+    expect(out.cuts[0].needsReview).toBe(false);
   });
 
   it("returns needs-review status when any cut is flagged", async () => {
@@ -1168,10 +1298,14 @@ describe("generateCuts explicit cut-set reuse (Fix 3 - reviewed selection sticks
     const readCutSetFn = vi.fn(async () => [[615, 690]]);
     const readDecisionsFn = vi.fn(async () => ({ "600000-700000": "remove" })); // legacy says full range
     const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn, readCutSetFn, readDecisionsFn });
-    // Cut-set wins: the narrowed range, not the detector's full 600-700.
-    expect(out.cuts).toEqual([
-      { startSec: 615, endSec: 690, needsReview: false, reasons: [], label: "ad", decided: "remove" },
-    ]);
+    // Cut-set wins: the narrowed range, not the detector's full 600-700. A stable
+    // cutId is the ONLY new field (Slice 1, additive). Lock the old shape EXACTLY by
+    // stripping just cutId and asserting the rest is byte-for-byte the pre-slice shape
+    // - so an unrelated extra/mutated field cannot slip through the additive guarantee.
+    expect(out.cuts).toHaveLength(1);
+    expect(out.cuts[0].cutId).toMatch(/^[0-9a-f]{8}$/);
+    const { cutId: _id, ...rest } = out.cuts[0];
+    expect(rest).toEqual({ startSec: 615, endSec: 690, needsReview: false, reasons: [], label: "ad", decided: "remove" });
     // The legacy decision path is not even consulted when a cut-set exists.
     expect(readDecisionsFn).not.toHaveBeenCalled();
   });
@@ -1901,20 +2035,49 @@ describe("resolveEpisodeCuts (legacy map OR explicit cut-set)", () => {
 
   it("an explicit __cutSet REPLACES the cuts with auto-apply ranges", () => {
     const out = resolveEpisodeCuts([flaggedMid], { __cutSet: [[210, 300], [600, 660]] });
-    expect(out).toEqual([
+    // Each cut carries a stable cutId (Slice 1, additive); strip it and assert the
+    // rest of the shape is the exact pre-slice cut-set shape.
+    expect(out.map(({ cutId, ...rest }) => rest)).toEqual([
       { startSec: 210, endSec: 300, needsReview: false, reasons: [], label: "ad", decided: "remove" },
       { startSec: 600, endSec: 660, needsReview: false, reasons: [], label: "ad", decided: "remove" },
     ]);
+    for (const c of out) expect(c.cutId).toMatch(/^[0-9a-f]{8}$/);
   });
 
   it("CARDINAL: an explicit __cutSet drops malformed ranges, never widens", () => {
     const out = resolveEpisodeCuts([flaggedMid], { __cutSet: [[300, 210], [400, 400], [500, 560]] });
-    expect(out).toEqual([
+    expect(out.map(({ cutId, ...rest }) => rest)).toEqual([
       { startSec: 500, endSec: 560, needsReview: false, reasons: [], label: "ad", decided: "remove" },
     ]);
   });
 
   it("an empty explicit __cutSet yields no cuts (cut nothing)", () => {
     expect(resolveEpisodeCuts([flaggedMid], { __cutSet: [] })).toEqual([]);
+  });
+
+  it("Slice 1: a __cutSet cut's cutId is derived from its FINAL (user) boundaries", () => {
+    // The id on a cut-set range must match cutId() of THAT range's final start/end/
+    // label - not the detector's discarded boundaries. This is what makes the id a
+    // faithful handle on the cut the renderer actually shows.
+    const out = resolveEpisodeCuts([flaggedMid], { __cutSet: [[210, 300]] });
+    expect(out[0].cutId).toBe(cutId(210, 300, "ad"));
+    // And it is NOT the id of the detector's original 200-380 range.
+    expect(out[0].cutId).not.toBe(cutId(200, 380, "ad"));
+  });
+
+  it("Slice 1: an adjusted-remove decision re-derives the cutId at the adjusted boundaries", () => {
+    // A legacy adjusted-remove mutates the cut's startSec/endSec; the cutId must be
+    // re-stamped to the ADJUSTED boundaries. Seed a STALE pre-adjust id on the input so
+    // this proves the OVERWRITE (the Round-3 failure mode: applyDecisions keeps the old
+    // id via spread while mutating the boundaries), not merely filling a missing id.
+    const stale = { ...flaggedMid, cutId: cutId(200, 380, "ad") };
+    const out = resolveEpisodeCuts([stale], {
+      "200000-380000": { action: "remove", startSec: 215, endSec: 360 },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0].startSec).toBe(215);
+    expect(out[0].endSec).toBe(360);
+    expect(out[0].cutId).toBe(cutId(215, 360, "ad"));
+    expect(out[0].cutId).not.toBe(cutId(200, 380, "ad")); // the stale id was overwritten
   });
 });
