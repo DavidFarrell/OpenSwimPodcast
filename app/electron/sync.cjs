@@ -6,7 +6,7 @@ const { convert: defaultConvert } = require("./converter.cjs");
 const { transcribe: defaultTranscribe } = require("./transcribe.cjs");
 const { buildAnnouncementText: defaultBuildAnnouncementText } = require("./announce.cjs");
 const { renderIntro: defaultRenderIntro } = require("./tts.cjs");
-const { detectAds: defaultDetectAds, toSegments } = require("./detectAds.cjs");
+const { detectAds: defaultDetectAds, toSegments, cutId } = require("./detectAds.cjs");
 const { readDecisions: defaultReadDecisions, applyDecisions, readCutSet: defaultReadCutSet } = require("./decisionCache.cjs");
 const { logEvent } = require("./logger.cjs");
 
@@ -344,7 +344,63 @@ function adToCut({ ad, segments }) {
     needsReview,
     reasons,
     label: labels.join("+"),
+    // Provenance from the detector's emitted ad: the model's VERBATIM boundary
+    // quotes. Passed straight through (additive) so the renderer can show what the
+    // detector claimed the cut's first/last line was. Undefined when the ad carried
+    // no quotes (e.g. a reused cut-set range).
+    firstLineQuote: ad.firstLineQuote,
+    lastLineQuote: ad.lastLineQuote,
   };
+}
+
+// A deterministic, ORDER-INDEPENDENT discriminator for two cuts that share the same
+// base identity (startSec|endSec|label). When two such cuts also differ in their
+// provenance (quotes, reasons, needsReview, decided), the suffix (-2/-3) they get
+// must follow the cut's CONTENT, never its array position - otherwise reversing the
+// input would swap which logical cut owns the bare id. We hash the provenance fields
+// to a stable string so the same logical cut always sorts to the same slot.
+function cutProvenanceKey(c) {
+  return JSON.stringify([
+    c.firstLineQuote ?? null,
+    c.lastLineQuote ?? null,
+    Array.isArray(c.reasons) ? c.reasons : [],
+    !!c.needsReview,
+    c.decided ?? null,
+  ]);
+}
+
+// Assign a stable cutId to every cut in the episode's FINAL cut list. The id is a
+// hash of the cut's identity (startSec|endSec|label) computed over the post-snap,
+// post-decision values that actually reach the renderer. Two cuts with the SAME
+// identity (a real collision within one episode) are disambiguated by a "-2"/"-3"
+// suffix assigned in a STABLE, CONTENT-derived order - ascending startSec, then
+// endSec, then label, then a hash of the cut's provenance (cutProvenanceKey) - so
+// the same proposal always yields the same id->cut mapping regardless of array
+// order. The base id is left bare; only genuine collisions get a suffix. Returns a
+// NEW array of cuts with `cutId` added; input cuts are not mutated. Additive only -
+// no other field changes.
+function assignCutIds(cuts) {
+  // Order by content, never by array position. We carry the original index only to
+  // restore transcript order at the end; it is NOT a sort tiebreak.
+  // Deterministic code-unit comparator (NOT localeCompare): the suffix guarantee
+  // must not depend on the host locale/ICU, and provenance quotes are untrusted and
+  // may be non-ASCII.
+  const byCodeUnit = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+  const ordered = cuts.map((c, i) => ({ c, i, k: cutProvenanceKey(c) }))
+    .sort((a, b) =>
+      (a.c.startSec - b.c.startSec)
+      || (a.c.endSec - b.c.endSec)
+      || byCodeUnit(String(a.c.label), String(b.c.label))
+      || byCodeUnit(a.k, b.k));
+  const counts = new Map(); // base id -> how many already assigned
+  const out = new Array(cuts.length);
+  for (const { c, i } of ordered) {
+    const base = cutId(c.startSec, c.endSec, c.label);
+    const n = (counts.get(base) || 0) + 1;
+    counts.set(base, n);
+    out[i] = { ...c, cutId: n === 1 ? base : `${base}-${n}` };
+  }
+  return out;
 }
 
 // Run the detector over an episode transcript and turn the result into a cut
@@ -457,6 +513,12 @@ async function generateCuts({
       cuts = applyDecisions(detected, decisions);
     }
 
+    // Stamp a stable cutId on every FINAL cut (post-snap, post-decision / cut-set),
+    // regardless of which branch produced it. Done here, once, over the values that
+    // actually reach the renderer, so the id is computed from the same startSec/
+    // endSec/label the user sees. Additive only.
+    cuts = assignCutIds(cuts);
+
     if (cuts.length === 0) return { status: "ready", cuts: [], segments: [] };
     const status = cuts.some((c) => c.needsReview) ? "needs-review" : "ready";
     // Carry the normalised segments so the renderer's Advanced transcript-as-
@@ -489,6 +551,11 @@ async function generateCuts({
 // non-forward) is dropped, never widened, so an ambiguous range is never cut.
 function resolveEpisodeCuts(detectedCuts, decision) {
   const cuts = Array.isArray(detectedCuts) ? detectedCuts : [];
+  // Both branches produce FINAL cuts whose boundaries may differ from what was
+  // detected (an explicit cut-set is brand new; an adjusted-remove decision mutates
+  // startSec/endSec). Re-stamp cutId over these final values so the post-gate cuts
+  // re-emitted to the renderer carry ids derived from the boundaries they now have -
+  // never a missing id (cut-set branch) or a stale pre-adjust id (adjusted-remove).
   if (decision && typeof decision === "object" && Array.isArray(decision.__cutSet)) {
     const out = [];
     for (const r of decision.__cutSet) {
@@ -498,10 +565,10 @@ function resolveEpisodeCuts(detectedCuts, decision) {
       out.push({ startSec: s, endSec: e, needsReview: false, reasons: [], label: "ad", decided: "remove" });
     }
     out.sort((a, b) => a.startSec - b.startSec);
-    return out;
+    return assignCutIds(out);
   }
   // Legacy per-cut decision map.
-  return applyDecisions(cuts, decision || {});
+  return assignCutIds(applyDecisions(cuts, decision || {}));
 }
 
 // The review gate. When an episode has cuts still flagged needs-review after
@@ -1001,4 +1068,4 @@ async function runSync({
   return { ok: true, files: dests, transferred, totals };
 }
 
-module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, generateCuts, adToCut, resolveEpisodeCuts, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE, EDGE_SNAP_SEC, HARD_FINAL_CUT_MAX_SEC, EDGE_SNAP_GROWTH_MAX_SEC, INTRO_PIPELINE_VERSION };
+module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, generateCuts, adToCut, assignCutIds, resolveEpisodeCuts, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE, EDGE_SNAP_SEC, HARD_FINAL_CUT_MAX_SEC, EDGE_SNAP_GROWTH_MAX_SEC, INTRO_PIPELINE_VERSION };

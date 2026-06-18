@@ -23,6 +23,7 @@
 // LM Studio endpoint. Any tool outage, parse failure or unexpected shape degrades
 // to an empty result (no cuts) - this never throws into the pipeline.
 
+const crypto = require("node:crypto");
 const { logEvent } = require("./logger.cjs");
 
 const LMSTUDIO_URL = "http://localhost:1234/v1/chat/completions";
@@ -608,7 +609,24 @@ function mapGepaSpan({
     reasons,
     type,
     subtype,
+    // VERBATIM boundary claims (the model's start_quote/end_quote), carried as the
+    // same provenance fields legacy emits. Additive only.
+    firstLineQuote: startQuote,
+    lastLineQuote: endQuote,
   };
+}
+
+// Derive a stable cut id from the cut's identity: a short hash of
+// `startSec|endSec|label`. Deterministic and order-independent, so the same
+// proposal always yields the same id across re-runs. Seconds are rounded to the
+// millisecond before hashing so floating-point noise from char-interpolation does
+// not change the id. This is the BASE id; collisions (two cuts sharing identity in
+// one episode) are suffixed by the caller (see assignCutIds in sync.cjs).
+function cutId(startSec, endSec, label) {
+  const s = Number.isFinite(startSec) ? Math.round(startSec * 1000) : "x";
+  const e = Number.isFinite(endSec) ? Math.round(endSec * 1000) : "x";
+  const l = typeof label === "string" ? label : "";
+  return crypto.createHash("sha1").update(`${s}|${e}|${l}`).digest("hex").slice(0, 8);
 }
 
 // Detect ads across the whole transcript. Returns:
@@ -749,12 +767,24 @@ async function detectAds({
 
       const key = `${si}-${ei}`;
       if (seen.has(key)) {
-        // Same range from another window. If either sighting had a clean boundary,
-        // keep the clean classification.
-        if (endQuoteMapped) seen.get(key).endQuoteMapped = true;
+        // Same range from another window. If THIS sighting is the one with a clean
+        // boundary (endQuoteMapped) and the kept one was not, upgrade the kept entry
+        // AND adopt this sighting's quotes - so the clean classification is paired
+        // with the quotes that actually produced it, not an earlier unmatched pair.
+        // Otherwise keep the first sighting's values (deterministic - windows iterate
+        // in order).
+        const prev = seen.get(key);
+        if (endQuoteMapped && !prev.endQuoteMapped) {
+          prev.endQuoteMapped = true;
+          prev.firstLineQuote = fl;
+          prev.lastLineQuote = ll;
+        }
         continue;
       }
-      seen.set(key, { startIndex: si, endIndex: ei, endQuoteMapped });
+      // firstLineQuote/lastLineQuote are the model's VERBATIM boundary claims (fl/ll
+      // before any normalisation) - provenance for the renderer. Additive only; the
+      // index range, endQuoteMapped and downstream classification are unchanged.
+      seen.set(key, { startIndex: si, endIndex: ei, endQuoteMapped, firstLineQuote: fl, lastLineQuote: ll });
     }
   }
 
@@ -765,7 +795,7 @@ async function detectAds({
     ? [...seen.values()].sort((a, b) => a.startIndex - b.startIndex)
     : [...seen.values()]
       .sort((a, b) => a.startIndex - b.startIndex)
-      .map(({ startIndex, endIndex, endQuoteMapped }) => {
+      .map(({ startIndex, endIndex, endQuoteMapped, firstLineQuote, lastLineQuote }) => {
         const { needsReview, reasons } = classifyRange({
           startIndex, endIndex, segments, endQuoteMapped, needsReviewMaxSec,
         });
@@ -782,6 +812,8 @@ async function detectAds({
           endSec,
           needsReview,
           reasons,
+          firstLineQuote,
+          lastLineQuote,
         };
       });
 
@@ -798,6 +830,7 @@ module.exports = {
   toSegments,
   buildWindows,
   classifyRange,
+  cutId,
   callModel,
   // gepa mode (selectable; legacy stays the default)
   resolveMode,

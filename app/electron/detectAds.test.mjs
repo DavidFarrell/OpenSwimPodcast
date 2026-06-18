@@ -11,6 +11,7 @@ const {
   toSegments,
   buildWindows,
   classifyRange,
+  cutId,
   resolveMode,
   gepaLine,
   mapQuoteToOffset,
@@ -611,6 +612,21 @@ describe("mapGepaSpan() - char interpolation + guards + type policy", () => {
     expect(cut.reasons).toEqual([]);
   });
 
+  it("Slice 1: carries the gepa span's verbatim start/end quotes as firstLineQuote/lastLineQuote", () => {
+    // gepa mode must populate the SAME provenance fields as legacy, sourced from the
+    // span's start_quote/end_quote. Deleting that threading must fail here.
+    const cut = mapGepaSpan({
+      span: {
+        type: "ad", subtype: "mid-roll",
+        start_quote: "Our show today is brought to you by Acme VPN.",
+        end_quote: "Visit acme dot com slash show for three months free.",
+      },
+      segments, normSegs, idxList,
+    });
+    expect(cut.firstLineQuote).toBe("Our show today is brought to you by Acme VPN.");
+    expect(cut.lastLineQuote).toBe("Visit acme dot com slash show for three months free.");
+  });
+
   it("SKIPS (returns null) when the opening quote maps to no segment - fail safe, never cut", () => {
     const cut = mapGepaSpan({
       span: { type: "ad", subtype: null, start_quote: "this is nowhere in the window", end_quote: "nor this" },
@@ -978,6 +994,11 @@ describe("ZERO REGRESSION: legacy mode is byte-for-byte unchanged by the gepa wo
       endSec: 14, // whole-segment end
       needsReview: false,
       reasons: [],
+      // Slice 1 cut-provenance: the model's VERBATIM boundary quotes, additive only.
+      // The cut-shape fields above (indices, start/end, needsReview, reasons) are
+      // untouched.
+      firstLineQuote: "Our show today is brought to you by Acme VPN.",
+      lastLineQuote: "Visit Acme dot com slash show for three months free.",
     });
     // Legacy ad objects carry NO type/subtype keys (that is a gepa-only addition).
     expect("type" in ads[0]).toBe(false);
@@ -990,5 +1011,105 @@ describe("ZERO REGRESSION: legacy mode is byte-for-byte unchanged by the gepa wo
     const a = await detectAds({ transcript: LEGACY_AD, fetch: fetchReturning(legacyQuotes) });
     const b = await detectAds({ transcript: LEGACY_AD, fetch: fetchReturning(legacyQuotes), mode: "legacy" });
     expect(b.ads).toEqual(a.ads);
+  });
+});
+
+describe("cutId() - stable provenance hash", () => {
+  it("is deterministic for the same identity", () => {
+    expect(cutId(600, 700, "ad")).toBe(cutId(600, 700, "ad"));
+  });
+
+  it("differs when any of startSec, endSec or label differ", () => {
+    const base = cutId(600, 700, "ad");
+    expect(cutId(601, 700, "ad")).not.toBe(base);
+    expect(cutId(600, 701, "ad")).not.toBe(base);
+    expect(cutId(600, 700, "intro")).not.toBe(base);
+  });
+
+  it("is a short 8-char hex digest", () => {
+    expect(cutId(600, 700, "ad")).toMatch(/^[0-9a-f]{8}$/);
+  });
+
+  it("is immune to sub-millisecond float noise (rounds to the ms)", () => {
+    // Char-interpolation produces non-round seconds; identical-to-the-ms values
+    // must hash the same so the id is stable across re-runs.
+    expect(cutId(600.00004, 700, "ad")).toBe(cutId(600, 700, "ad"));
+  });
+});
+
+describe("Slice 1 cut-provenance - quotes on emitted cuts", () => {
+  it("legacy: each cut carries the model's verbatim first/last line quotes", async () => {
+    const { ads } = await detectAds({
+      transcript: AD_TRANSCRIPT,
+      fetch: fetchReturning([{
+        first_line: "Our show today is brought to you by Acme VPN.",
+        last_line: "Visit Acme dot com slash show for three months free.",
+      }]),
+    });
+    expect(ads).toHaveLength(1);
+    expect(ads[0].firstLineQuote).toBe("Our show today is brought to you by Acme VPN.");
+    expect(ads[0].lastLineQuote).toBe("Visit Acme dot com slash show for three months free.");
+  });
+
+  it("CARDINAL: adding quotes does not change boundaries, needsReview, or which cuts are emitted", async () => {
+    // Same input as the "maps a clean ad" test above - the cut-shape fields must be
+    // byte-for-byte what they were before provenance was added. Delete the quote
+    // threading and these assertions still pass; delete the boundary logic and they
+    // fail - so this locks the additive guarantee, not the framework.
+    const { ads, stats } = await detectAds({
+      transcript: AD_TRANSCRIPT,
+      fetch: fetchReturning([{
+        first_line: "Our show today is brought to you by Acme VPN.",
+        last_line: "Visit Acme dot com slash show for three months free.",
+      }]),
+    });
+    expect(ads).toHaveLength(1);
+    expect(ads[0].startIndex).toBe(1);
+    expect(ads[0].endIndex).toBe(2);
+    expect(ads[0].startSec).toBe(4);
+    expect(ads[0].endSec).toBe(14);
+    expect(ads[0].needsReview).toBe(false);
+    expect(ads[0].reasons).toEqual([]);
+    expect(stats.adsReturned).toBe(1);
+    expect(stats.quoteMapFailures).toBe(0);
+  });
+
+  it("CROSS-WINDOW: when a later window maps the boundary clean, the emitted quotes follow the clean sighting", async () => {
+    // An ad whose segments sit in the [1620,1800) overlap, so it is quoted in BOTH
+    // window 0 ([0,1800)) and window 1 ([1620,3420)). Window 0 returns a last_line that
+    // does NOT map (endQuoteMapped=false, ambiguous); window 1 returns the SAME first_line
+    // with a last_line that DOES map (clean). The merged cut must end up clean AND carry
+    // window 1's quotes - not window 0's stale unmatched pair.
+    // A SINGLE-segment ad in the [1620,1800) overlap, so both windows produce the
+    // SAME si-ei key (0-0) and the de-dupe/upgrade path is exercised. Window 0 fails
+    // the last_line (falls back to ei=si, ambiguous); window 1 maps the last_line
+    // INTO the same segment (clean). Both keep ei=0, so the kept entry is upgraded.
+    const transcript = {
+      segments: [
+        { speaker: "S", start: 1700, end: 1705, text: "Our sponsor today is Acme VPN, the fast one. Visit Acme dot com slash deal for a discount." },
+        { speaker: "S", start: 1705, end: 1710, text: "Anyway, back to the show and the topic at hand now." },
+      ],
+    };
+    // Window 0 and window 1 return DIFFERENT first_line AND last_line quotes that BOTH
+    // map to segment 0 (so the same si-ei key 0-0). Window 0's last_line maps nowhere
+    // (ambiguous); window 1's maps clean. The clean sighting must win BOTH quote fields,
+    // so different quotes prove firstLineQuote is also adopted (not just lastLineQuote).
+    let call = 0;
+    const fetch = vi.fn(async () => {
+      call += 1;
+      const ad = call === 1
+        ? { first_line: "Our sponsor today is Acme VPN", last_line: "A closing line that maps nowhere at all." }
+        : { first_line: "Our sponsor today is Acme VPN, the fast one.", last_line: "Visit Acme dot com slash deal for a discount." };
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ ads: [ad] }) } }] }) };
+    });
+    const { ads } = await detectAds({ transcript, fetch });
+    expect(fetch).toHaveBeenCalledTimes(2); // two windows ran
+    expect(ads).toHaveLength(1);
+    // The clean (window-2) sighting won: boundary not ambiguous, and BOTH emitted quote
+    // fields are window 2's (the stale window-1 first_line "...Acme VPN" was replaced by
+    // window 2's "...the fast one.").
+    expect(ads[0].reasons).not.toContain("ambiguous-boundary");
+    expect(ads[0].firstLineQuote).toBe("Our sponsor today is Acme VPN, the fast one.");
+    expect(ads[0].lastLineQuote).toBe("Visit Acme dot com slash deal for a discount.");
   });
 });
