@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createRequire } from "node:module";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 
 const require = createRequire(import.meta.url);
-const { createDeviceWatcher } = require("./device.cjs");
+const { createDeviceWatcher, validateDevice } = require("./device.cjs");
 
 function mkTmp() { return fs.mkdtempSync(path.join(os.tmpdir(), "os-dev-")); }
 function rmTmp(d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
@@ -198,5 +199,212 @@ describe("createDeviceWatcher", () => {
     const churn = events.slice(startCount);
     expect(churn.length).toBeLessThanOrEqual(2);
     expect(churn.at(-1).mounted).toBe(true);
+  });
+});
+
+describe("validateDevice", () => {
+  let root;
+  const MARKER = ".openswim-podcast";
+  const noSleep = async () => {};
+
+  beforeEach(() => { root = mkTmp(); });
+  afterEach(() => {
+    // Restore perms in case a read-only test left the dir locked, so rmTmp can remove it.
+    try { fs.chmodSync(root, 0o700); } catch {}
+    rmTmp(root);
+  });
+
+  it("passes a good marked writable dir", async () => {
+    fs.writeFileSync(path.join(root, MARKER), "");
+    const res = await validateDevice(root, { markerFile: MARKER, sleep: noSleep });
+    expect(res).toEqual({ ok: true, path: root });
+  });
+
+  it("returns no-path for an empty devicePath without throwing", async () => {
+    expect(await validateDevice("", { markerFile: MARKER, sleep: noSleep })).toEqual({ ok: false, reason: "no-path" });
+    expect(await validateDevice(undefined, { markerFile: MARKER, sleep: noSleep })).toEqual({ ok: false, reason: "no-path" });
+  });
+
+  it("fails a missing-marker dir (wrong device) and does not retry it", async () => {
+    let slept = 0;
+    const sleep = async () => { slept++; };
+    const res = await validateDevice(root, { markerFile: MARKER, attempts: 5, sleep });
+    expect(res).toEqual({ ok: false, reason: "missing-marker" });
+    expect(slept).toBe(0);
+  });
+
+  it("fails a read-only dir with not-writable", async () => {
+    fs.writeFileSync(path.join(root, MARKER), "");
+    fs.chmodSync(root, 0o500);
+    const res = await validateDevice(root, { markerFile: MARKER, attempts: 2, sleep: noSleep });
+    expect(res).toEqual({ ok: false, reason: "not-writable" });
+    fs.chmodSync(root, 0o700);
+  });
+
+  it("fails no-marker-configured when no markerFile is given (never bypasses the device proof)", async () => {
+    // Without a marker we cannot prove this is our device, so a bare writable dir must
+    // NOT pass - this is the cardinal-rule guard against writing to a random USB volume.
+    expect(await validateDevice(root, { sleep: noSleep })).toEqual({ ok: false, reason: "no-marker-configured" });
+    expect(await validateDevice(root, { markerFile: "", sleep: noSleep })).toEqual({ ok: false, reason: "no-marker-configured" });
+  });
+
+  it("never throws on a null or non-object options argument", async () => {
+    expect(await validateDevice(root, null)).toEqual({ ok: false, reason: "no-marker-configured" });
+    expect(await validateDevice(root)).toEqual({ ok: false, reason: "no-marker-configured" });
+    expect(await validateDevice("", null)).toEqual({ ok: false, reason: "no-path" });
+  });
+
+  it("rejects a non-string markerFile without throwing", async () => {
+    for (const bad of [true, 1, {}, [], Symbol("x")]) {
+      const res = await validateDevice(root, { markerFile: bad, sleep: noSleep });
+      expect(res).toEqual({ ok: false, reason: "no-marker-configured" });
+    }
+  });
+
+  it("does not pass a wrong device when the marker disappears between retries (re-checks every attempt)", async () => {
+    // The marker is present at the start (passes the upfront check + attempt 0's
+    // re-check), but the dir is read-only so readiness fails and we retry. Before the
+    // retry we remove the marker AND make the dir writable - simulating the volume
+    // being swapped for a different writable dir. The re-check must catch this and
+    // refuse rather than return ok for the now-unmarked writable dir.
+    fs.writeFileSync(path.join(root, MARKER), "");
+    fs.chmodSync(root, 0o500);
+    let slept = 0;
+    const sleep = async () => {
+      slept++;
+      fs.chmodSync(root, 0o700);
+      fs.unlinkSync(path.join(root, MARKER));
+    };
+    const res = await validateDevice(root, { markerFile: MARKER, attempts: 5, sleep });
+    expect(res).toEqual({ ok: false, reason: "missing-marker" });
+    expect(slept).toBe(1); // terminal on the marker-gone re-check, no further retries
+  });
+
+  it("a temp file it cannot delete is a terminal not-writable (no retry, no further leaks)", async () => {
+    fs.writeFileSync(path.join(root, MARKER), "");
+    const realUnlink = fsp.unlink;
+    let unlinkCalls = 0;
+    fsp.unlink = async (p) => { unlinkCalls++; throw new Error("unlink denied"); };
+    let slept = 0;
+    const sleep = async () => { slept++; };
+    try {
+      const res = await validateDevice(root, { markerFile: MARKER, attempts: 5, sleep });
+      expect(res).toEqual({ ok: false, reason: "not-writable" });
+      expect(slept).toBe(0); // terminal: stops immediately, does not retry
+      expect(unlinkCalls).toBe(1); // only one temp written, so only one failed unlink
+    } finally {
+      fsp.unlink = realUnlink;
+    }
+    for (const nm of fs.readdirSync(root)) {
+      if (nm.startsWith(".openswim-validate-")) fs.unlinkSync(path.join(root, nm));
+    }
+  });
+
+  it("is terminal if writeFile fails AFTER creating the temp and cleanup also fails (no retry, no growing leak)", async () => {
+    fs.writeFileSync(path.join(root, MARKER), "");
+    const realWrite = fsp.writeFile;
+    const realUnlink = fsp.unlink;
+    // writeFile creates the temp then rejects (a partial write); the cleanup unlink then
+    // fails with a non-ENOENT error, so a temp leaked - this must be terminal.
+    fsp.writeFile = async (p) => { await realWrite(p, ""); throw new Error("disk full mid-write"); };
+    fsp.unlink = async () => { throw Object.assign(new Error("unlink denied"), { code: "EACCES" }); };
+    let slept = 0;
+    const sleep = async () => { slept++; };
+    try {
+      const res = await validateDevice(root, { markerFile: MARKER, attempts: 5, sleep });
+      expect(res).toEqual({ ok: false, reason: "not-writable" });
+      expect(slept).toBe(0); // terminal: no retry, so no further temps written
+    } finally {
+      fsp.writeFile = realWrite;
+      fsp.unlink = realUnlink;
+    }
+    for (const nm of fs.readdirSync(root)) {
+      if (nm.startsWith(".openswim-validate-")) fs.unlinkSync(path.join(root, nm));
+    }
+  });
+
+  it("rejects a marker with a separator or . / .. so it cannot prove a marker outside the device", async () => {
+    fs.writeFileSync(path.join(root, MARKER), "");
+    for (const bad of [".", "..", "sub/.marker", "../escape", "/abs/marker"]) {
+      const res = await validateDevice(root, { markerFile: bad, sleep: noSleep });
+      expect(res).toEqual({ ok: false, reason: "bad-marker" });
+    }
+  });
+
+  it("fails unreadable when the marked path cannot be listed", async () => {
+    // Put the marker on a subdir that exists, then chmod it 0o100 (execute-only): the
+    // marker access (R_OK on a named file) is allowed via the exec bit but readdir of
+    // the dir is denied, exercising the readdir failure branch with a real marker.
+    const dir = path.join(root, "dev");
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, MARKER), "");
+    fs.chmodSync(dir, 0o100);
+    const res = await validateDevice(dir, { markerFile: MARKER, attempts: 2, sleep: noSleep });
+    fs.chmodSync(dir, 0o700);
+    expect(res).toEqual({ ok: false, reason: "unreadable" });
+  });
+
+  it("reports not-writable when the temp delete cannot complete (round-trip incomplete, no false pass)", async () => {
+    fs.writeFileSync(path.join(root, MARKER), "");
+    const realUnlink = fsp.unlink;
+    fsp.unlink = async () => { throw new Error("unlink denied"); };
+    try {
+      const res = await validateDevice(root, { markerFile: MARKER, attempts: 1, sleep: noSleep });
+      expect(res).toEqual({ ok: false, reason: "not-writable" });
+    } finally {
+      fsp.unlink = realUnlink;
+    }
+    // Clean the temp the failed unlink left behind so the dir can be removed.
+    for (const n of fs.readdirSync(root)) {
+      if (n.startsWith(".openswim-validate-")) fs.unlinkSync(path.join(root, n));
+    }
+  });
+
+  it("never throws even when the injected sleep rejects", async () => {
+    fs.writeFileSync(path.join(root, MARKER), "");
+    fs.chmodSync(root, 0o500);
+    const sleep = async () => { throw new Error("sleep blew up"); };
+    const res = await validateDevice(root, { markerFile: MARKER, attempts: 3, sleep });
+    fs.chmodSync(root, 0o700);
+    expect(res).toEqual({ ok: false, reason: "not-writable" });
+  });
+
+  it("clamps a huge attempts value so it cannot retry forever", async () => {
+    fs.writeFileSync(path.join(root, MARKER), "");
+    fs.chmodSync(root, 0o500);
+    let slept = 0;
+    const sleep = async () => { slept++; };
+    const res = await validateDevice(root, { markerFile: MARKER, attempts: 1e9, sleep });
+    fs.chmodSync(root, 0o700);
+    expect(res).toEqual({ ok: false, reason: "not-writable" });
+    // 20 attempts max -> at most 19 sleeps between them, bounded regardless of input.
+    expect(slept).toBeLessThanOrEqual(19);
+  });
+
+  it("retry succeeds when readiness arrives on attempt N", async () => {
+    fs.writeFileSync(path.join(root, MARKER), "");
+    // Start the dir read-only (not yet writable, like a freshly-attached volume), then
+    // flip it writable after the 2nd sleep so the 3rd attempt's temp write succeeds.
+    fs.chmodSync(root, 0o500);
+    let slept = 0;
+    const sleep = async () => { slept++; if (slept === 2) fs.chmodSync(root, 0o700); };
+    const res = await validateDevice(root, { markerFile: MARKER, attempts: 5, delayMs: 1, sleep });
+    expect(res).toEqual({ ok: true, path: root });
+    expect(slept).toBe(2);
+  });
+
+  it("never throws and cleans up its temp file (no leak)", async () => {
+    fs.writeFileSync(path.join(root, MARKER), "");
+    const res = await validateDevice(root, { markerFile: MARKER, sleep: noSleep });
+    expect(res.ok).toBe(true);
+    const leftover = fs.readdirSync(root).filter((n) => n.startsWith(".openswim-validate-"));
+    expect(leftover).toEqual([]);
+  });
+
+  it("a stale leftover temp from a crash does not break a later validate", async () => {
+    fs.writeFileSync(path.join(root, MARKER), "");
+    fs.writeFileSync(path.join(root, ".openswim-validate-stale-from-crash"), "");
+    const res = await validateDevice(root, { markerFile: MARKER, sleep: noSleep });
+    expect(res).toEqual({ ok: true, path: root });
   });
 });
