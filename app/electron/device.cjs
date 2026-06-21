@@ -16,6 +16,107 @@ function defaultExec(cmd, args) {
   });
 }
 
+// Prove a just-attached volume is really OUR device and actually writable before
+// slice 4 does any destructive delete/transfer. macOS can report a volume attached
+// before it is mounted+writable, so a real temp-file write+delete round-trip is the
+// load-bearing readiness proof. Total: returns a typed result, never throws.
+// Reasons: "no-path" / "no-marker-configured" / "bad-marker" / "missing-marker" / "unreadable" / "not-writable".
+const MAX_ATTEMPTS = 20;
+async function validateDevice(devicePath, options) {
+  // Normalize rather than destructure-default so a null/garbage options arg cannot
+  // throw - the function is total.
+  const { markerFile, attempts = 5, delayMs = 250, sleep = defaultSleep } =
+    (options && typeof options === "object") ? options : {};
+
+  if (!devicePath) return { ok: false, reason: "no-path" };
+
+  // The marker is the ONLY thing that proves this is our device and not a random
+  // writable USB volume, so a missing or non-string markerFile is a hard fail - never
+  // skip the check and never let a bad marker config turn into a destructive write.
+  if (!markerFile || typeof markerFile !== "string") return { ok: false, reason: "no-marker-configured" };
+
+  // The marker must be a plain filename directly inside devicePath. A value with a
+  // separator or "."/".." could prove a marker OUTSIDE the device (or match any dir),
+  // which would defeat the device proof and risk a write to the wrong volume.
+  if (markerFile !== path.basename(markerFile) || markerFile === "." || markerFile === "..") {
+    return { ok: false, reason: "bad-marker" };
+  }
+
+  // A missing marker means this is the wrong/no device, not a transient state, so
+  // fail fast rather than retry - we must never wait out a destructive write to a
+  // random USB volume.
+  try {
+    await fsp.access(path.join(devicePath, markerFile), fs.constants.R_OK);
+  } catch {
+    return { ok: false, reason: "missing-marker" };
+  }
+
+  // Clamp attempts so a bad caller value cannot retry forever and cannot throw on
+  // coercion. Retry only the transient readiness checks: a real volume can need a
+  // moment after attach before readdir/write succeed.
+  const n = typeof attempts === "number" && Number.isFinite(attempts) ? attempts : 5;
+  const tries = Math.min(Math.max(1, Math.floor(n)), MAX_ATTEMPTS);
+
+  let lastReason = "unreadable";
+  for (let i = 0; i < tries; i++) {
+    const r = await probe(devicePath, markerFile);
+    if (r === null) return { ok: true, path: devicePath };
+    lastReason = r.reason;
+    // A terminal failure must stop the loop: either the device was swapped away (marker
+    // gone) or it is not cleanly writable (a temp we could not delete). Retrying would
+    // risk passing a wrong device or leaking more temps.
+    if (r.terminal) return { ok: false, reason: r.reason };
+    // A rejecting injected sleep must not escape as a throw - the function is total.
+    if (i < tries - 1) { try { await sleep(delayMs); } catch {} }
+  }
+  return { ok: false, reason: lastReason };
+}
+
+// One full attempt: re-prove the marker (device identity), then prove readiness with
+// a readdir + temp write + temp delete round-trip. Returns null when all pass, else
+// { reason, terminal }. Re-checking the marker EVERY attempt closes the race where the
+// volume is swapped for a different writable dir between retries; if the marker is gone
+// the device changed under us, so that is terminal (do not wait out a wrong device).
+// A failed readdir or write is retryable (transient mid-attach); a temp we wrote but
+// could NOT delete is terminal, since that leaves the device not cleanly writable.
+async function probe(devicePath, markerFile) {
+  try {
+    await fsp.access(path.join(devicePath, markerFile), fs.constants.R_OK);
+  } catch {
+    return { reason: "missing-marker", terminal: true };
+  }
+  try {
+    await fsp.readdir(devicePath);
+  } catch {
+    return { reason: "unreadable", terminal: false };
+  }
+  const tmp = path.join(devicePath, `.openswim-validate-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  try {
+    await fsp.writeFile(tmp, "");
+  } catch {
+    // writeFile can create/truncate the temp before rejecting, so remove it to avoid a
+    // leftover. ENOENT means no temp was created (e.g. a read-only dir) - nothing leaked,
+    // so that stays retryable. Any other cleanup failure means a temp leaked and could
+    // not be removed, which is terminal - do not retry and risk leaking more.
+    try {
+      await fsp.unlink(tmp);
+    } catch (e) {
+      if (e && e.code !== "ENOENT") return { reason: "not-writable", terminal: true };
+    }
+    return { reason: "not-writable", terminal: false };
+  }
+  try {
+    await fsp.unlink(tmp);
+  } catch {
+    return { reason: "not-writable", terminal: true };
+  }
+  return null;
+}
+
+function defaultSleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 function createDeviceWatcher({
   volumesRoot,
   labelPattern = /^openswim/i,
@@ -159,4 +260,4 @@ function createDeviceWatcher({
   return { start, stop, current, on, scan, listVolumes, claim, eject };
 }
 
-module.exports = { createDeviceWatcher };
+module.exports = { createDeviceWatcher, validateDevice };
