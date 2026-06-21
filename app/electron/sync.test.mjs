@@ -102,7 +102,9 @@ describe("runSync happy path", () => {
     expect(convertFn).toHaveBeenCalledOnce();
 
     const stages = events.filter((e) => e.type === "stage" && e.state === "done").map((e) => e.stage);
-    expect(stages).toEqual(["finalise", "delete", "convert", "transfer", "verify"]);
+    // Convert now runs BEFORE delete (slice 1): the old device files survive a convert
+    // failure, so the safer order is convert -> delete -> transfer -> verify.
+    expect(stages).toEqual(["finalise", "convert", "delete", "transfer", "verify"]);
     expect(events.at(-1).type).toBe("complete");
   });
 
@@ -1928,10 +1930,11 @@ describe("runSync trim stage", () => {
     expect(convertFn).not.toHaveBeenCalled();
   });
 
-  // The delete now runs AFTER the review gate resolves (Transferring phase): on an
-  // approved run the stage:done ORDER is finalise -> ... -> review -> delete -> convert
-  // -> transfer -> verify, never delete-before-review.
-  it("on an approved run, delete runs AFTER review (review done precedes delete done)", async () => {
+  // The delete runs AFTER the review gate resolves AND after convert (Transferring
+  // phase): on an approved run the stage:done ORDER is finalise -> ... -> review ->
+  // convert -> delete -> transfer -> verify, never delete-before-review and (slice 1)
+  // never delete-before-convert.
+  it("on an approved run, delete runs AFTER review AND after convert", async () => {
     fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
     // A superseded device file so a delete stage actually fires.
     fs.writeFileSync(path.join(devicePath, "07_oldshow.mp3"), Buffer.from("stale"));
@@ -1947,10 +1950,107 @@ describe("runSync trim stage", () => {
 
     expect(res.ok).toBe(true);
     const doneOrder = events.filter((e) => e.type === "stage" && e.state === "done").map((e) => e.stage);
-    // review precedes delete, delete precedes convert (the relocation invariant).
-    expect(doneOrder.indexOf("review")).toBeLessThan(doneOrder.indexOf("delete"));
-    expect(doneOrder.indexOf("delete")).toBeLessThan(doneOrder.indexOf("convert"));
-    expect(doneOrder).toEqual(["finalise", "transcribe", "trim", "review", "delete", "convert", "transfer", "verify"]);
+    // review precedes convert, convert precedes delete (the slice-1 ordering invariant).
+    expect(doneOrder.indexOf("review")).toBeLessThan(doneOrder.indexOf("convert"));
+    expect(doneOrder.indexOf("convert")).toBeLessThan(doneOrder.indexOf("delete"));
+    expect(doneOrder).toEqual(["finalise", "transcribe", "trim", "review", "convert", "delete", "transfer", "verify"]);
+  });
+
+  // --- Slice 1: convert-before-delete (no-device-data-loss on convert failure) ---
+
+  // THE slice-1 regression catcher. Convert runs before delete, so a HARD convert
+  // failure (one with no intro/cuts fallback to fall back to) throws with the device's
+  // OLD superseded files STILL ON THE DEVICE - nothing was unlinked. If the reorder is
+  // reverted (delete-before-convert), delete runs first and this old file is gone by
+  // the time convert throws: the device is left wiped with nothing written. This test
+  // MUST fail if convert is moved back before delete.
+  it("a HARD convert failure leaves the superseded device files INTACT (convert runs before delete)", async () => {
+    // A video episode forces a re-encode with no intro/cuts, so there is NO degrade
+    // fallback - the convert failure propagates and runSync rejects.
+    fs.writeFileSync(path.join(cacheDir, "a.mp4"), Buffer.from("video bytes"));
+    // An old superseded file (different show => computeRemovals marks it for removal,
+    // not replacement) that a delete-first ordering would already have unlinked.
+    const oldFile = path.join(devicePath, "07_oldshow.mp3");
+    fs.writeFileSync(oldFile, Buffer.from("yesterday's episode - must survive a convert failure"));
+
+    const convertFn = vi.fn(async () => { throw new Error("ffmpeg blew up"); });
+
+    const events = [];
+    await expect(runSync({
+      devicePath, cacheDir,
+      queue: [makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp4", filename: "01_hardfork.mp3" })],
+      convertFn, onEvent: (e) => events.push(e),
+    })).rejects.toThrow("ffmpeg blew up");
+
+    // The old file survives: convert threw BEFORE the delete block ran.
+    expect(fs.existsSync(oldFile)).toBe(true);
+    expect(fs.readFileSync(oldFile).toString()).toBe("yesterday's episode - must survive a convert failure");
+    // The delete stage never even started (it is past a successful convert).
+    expect(events.some((e) => e.type === "stage" && e.stage === "delete")).toBe(false);
+    // Convert reached its error state, proving the failure happened in convert.
+    expect(events.some((e) => e.stage === "convert" && e.state === "error")).toBe(true);
+  });
+
+  // The convert-failure DEGRADE path (intro/cuts dropped, original audio still shipped)
+  // is unchanged by the reorder: it still ships untrimmed audio, never unreviewed cuts,
+  // AND the superseded old file is correctly removed once convert succeeds via fallback.
+  it("convert-failure degrade still ships untrimmed audio and then removes the old file", async () => {
+    const epPayload = Buffer.from("real episode audio that must survive");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), epPayload);
+    const oldFile = path.join(devicePath, "07_oldshow.mp3");
+    fs.writeFileSync(oldFile, Buffer.from("stale"));
+
+    // A confident cut is surfaced and approved, so convert is asked to trim - but the
+    // trim convert throws. Because the episode is a plain speed-1.0 mp3, dropping the
+    // cuts means the ORIGINAL untrimmed audio ships (never the unreviewed cut).
+    const convertFn = vi.fn(async ({ cuts }) => {
+      if (cuts && cuts.length) throw new Error("atrim ffmpeg crashed");
+      throw new Error("unexpected re-encode of a plain mp3");
+    });
+    const awaitReview = vi.fn(async () => ({ a: { __cutSet: [[600, 640]] } }));
+
+    const events = [];
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: flaggedTranscribe(), detectAdsFn: flaggedDetect(), convertFn,
+      awaitReview, onEvent: (e) => events.push(e),
+    });
+
+    expect(res.ok).toBe(true);
+    // The ORIGINAL untrimmed audio reached the device (degrade ships audio, not cuts).
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(epPayload)).toBe(true);
+    // No convert error escaped - the failure degraded, not propagated.
+    expect(events.some((e) => e.stage === "convert" && e.state === "error")).toBe(false);
+    // Convert succeeded via degrade, so delete ran: the old superseded file is gone.
+    expect(fs.existsSync(oldFile)).toBe(false);
+  });
+
+  // A cancel that fires REENTRANTLY from the delete-stage "active" emit (an onEvent
+  // callback that aborts) must still leave the device untouched: the guard sits
+  // immediately before each unlink, not only at the loop top. Without that guard the
+  // old file would be unlinked despite the abort.
+  it("a reentrant cancel from the delete 'active' emit leaves the old file INTACT", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("new episode audio"));
+    const oldFile = path.join(devicePath, "07_oldshow.mp3");
+    fs.writeFileSync(oldFile, Buffer.from("must survive a reentrant cancel"));
+
+    // Plain mp3, no trim/announce: convert is a no-op copy, so the run reaches delete.
+    const convertFn = vi.fn();
+    const ac = new AbortController();
+    // Abort the moment the delete stage announces itself, BEFORE any unlink.
+    const onEvent = (e) => {
+      if (e.type === "log" && e.stage === "delete" && e.state === "active") ac.abort();
+    };
+
+    await expect(runSync({
+      devicePath, cacheDir,
+      queue: [makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" })],
+      convertFn, signal: ac.signal, onEvent,
+    })).rejects.toThrow();
+
+    // The unlink never happened - the per-iteration guard caught the reentrant abort.
+    expect(fs.existsSync(oldFile)).toBe(true);
+    expect(fs.readFileSync(oldFile).toString()).toBe("must survive a reentrant cancel");
   });
 
   // --- Transcript-toggle redesign: the gate may resolve to an EXPLICIT cut-set ---

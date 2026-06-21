@@ -192,12 +192,6 @@ function buildPlan({ queue, existingDeviceFiles = [], existingManifest = [], nee
   const plan = [];
   plan.push({ stage: "finalise", kind: "info", text: `order locked · ${queue.length} slots` });
 
-  const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
-  for (const r of removals) {
-    const verb = r.replaced ? "replace" : "rm";
-    plan.push({ stage: "delete", kind: "del", text: `${verb} ${r.filename}`, filename: r.filename, replaced: r.replaced });
-  }
-
   for (const it of queue) {
     if (it.announce) {
       plan.push({ stage: "announce", kind: "ann", text: it.title, uuid: it.uuid, slot: it.slot });
@@ -208,6 +202,15 @@ function buildPlan({ queue, existingDeviceFiles = [], existingManifest = [], nee
     if (itemNeedsEncode(it, needsEncode)) {
       plan.push({ stage: "convert", kind: "conv", text: it.title, uuid: it.uuid, slot: it.slot });
     }
+  }
+
+  // Delete is planned AFTER convert: that is the execution order (convert builds every
+  // output before any superseded device file is removed), so the plan preview reads
+  // chronologically.
+  const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
+  for (const r of removals) {
+    const verb = r.replaced ? "replace" : "rm";
+    plan.push({ stage: "delete", kind: "del", text: `${verb} ${r.filename}`, filename: r.filename, replaced: r.replaced });
   }
 
   for (const it of queue) {
@@ -658,13 +661,10 @@ async function runSync({
   const introTexts = new Array(queue.length).fill("");
   const trimResults = new Array(queue.length).fill(null).map(() => ({ status: "idle", cuts: [] }));
 
-  // NOTE: "Stage: delete" (remove superseded device files) USED to run here, before
-  // the analysis + the review gate. That was a data-loss footgun: cancelling at the
-  // review gate left the device's old files already deleted with NOTHING written in
-  // their place. The delete block has been MOVED to AFTER the gate resolves (into the
-  // Transferring phase, just before convert) so a cancel-at-gate leaves the device
-  // untouched. See the relocated block below, just before "Stage: convert". What gets
-  // deleted is unchanged (same computeRemovals); only WHEN it runs has moved.
+  // NOTE: "Stage: delete" (remove superseded device files) does NOT run here. It runs
+  // in the Transferring phase, AFTER the review gate AND after convert has built every
+  // output, so neither a cancel-at-gate nor a convert failure can wipe the device with
+  // nothing written. See the convert + delete blocks below for the rationale.
 
   // Stage: analyse (transcribe -> detect cuts -> build intro)
   // SEQUENTIAL, one episode at a time, one GPU-heavy step at a time. Running
@@ -825,36 +825,14 @@ async function runSync({
     emit({ type: "stage", stage: "review", state: "done" });
   }
 
-  // Stage: delete (RELOCATED - cardinal-rule-critical).
-  // Remove superseded device files. This MUST run AFTER the review gate resolves, not
-  // before the analysis as it used to: if it ran first, cancelling at the gate would
-  // leave the device's old files already deleted with nothing written in their place
-  // (data loss). By deleting here - past the gate, in the Transferring phase, just
-  // before convert/transfer - a CANCEL at the gate aborts the run (cancelSync resolves
-  // the parked gate then aborts; the throwIfAborted() below raises AbortError) BEFORE
-  // a single file is unlinked, so the device is left exactly as it was. What gets
-  // deleted is identical to before (same computeRemovals on the same inputs); only the
-  // timing moved. The "delete" stage now shows under Transferring. Verify still runs
-  // last.
-  throwIfAborted();
-  emit({ type: "stage", stage: "delete", state: "active" });
-  const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
-  for (const r of removals) {
-    throwIfAborted();
-    const verb = r.replaced ? "replace" : "rm";
-    emit({ type: "log", stage: "delete", state: "active", text: `${verb} ${r.filename}` });
-    if (!r.replaced) {
-      try { await fsp.unlink(path.join(devicePath, r.filename)); }
-      catch (e) {
-        emit({ type: "log", stage: "delete", state: "error", text: `rm ${r.filename}: ${e.message}` });
-        throw e;
-      }
-    }
-    emit({ type: "log", stage: "delete", state: "done", text: `${verb} ${r.filename}` });
-  }
-  emit({ type: "stage", stage: "delete", state: "done" });
-
-  // Stage: convert
+  // Stage: convert (RUNS BEFORE delete - cardinal-rule-critical).
+  // Build every transfer source in cacheDir. Convert never touches devicePath, so it is
+  // safe to run before the device delete - and it MUST run first: if delete ran first
+  // (as it used to), a HARD convert failure (one past the intro/cuts-drop fallback)
+  // would leave the device's superseded files already unlinked with nothing written in
+  // place - data loss. Converting first means a hard failure throws here with the old
+  // device files still intact. What convert produces is unchanged (same cache-variant
+  // logic, same intro/cuts fallback); only its position relative to delete moved.
   emit({ type: "stage", stage: "convert", state: "active" });
   const sources = new Array(queue.length);
   const speedSuffix = (speed && speed !== 1.0) ? `-speed${String(speed).replace(".", "_")}` : "";
@@ -981,6 +959,36 @@ async function runSync({
     }
   }
   emit({ type: "stage", stage: "convert", state: "done" });
+
+  // Stage: delete (RUNS AFTER convert - see the convert comment above for the WHY).
+  // Remove superseded device files only once convert has built every output. A
+  // throwIfAborted() sits immediately before EACH unlink (not just at the loop top), so
+  // once a cancel is seen - including one triggered reentrantly from an emit/onEvent
+  // callback - NO FURTHER file is unlinked. (Already-unlinked earlier removals in the
+  // same run cannot be undone; the guarantee is that no unlink happens after a cancel,
+  // and on a cancel-at-the-gate - covered earlier by the post-review throwIfAborted -
+  // none have run at all.) What gets deleted is identical to before (same
+  // computeRemovals on the same inputs).
+  throwIfAborted();
+  emit({ type: "stage", stage: "delete", state: "active" });
+  const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
+  for (const r of removals) {
+    throwIfAborted();
+    const verb = r.replaced ? "replace" : "rm";
+    emit({ type: "log", stage: "delete", state: "active", text: `${verb} ${r.filename}` });
+    if (!r.replaced) {
+      // Guard immediately before the side effect: an emit above could, in principle,
+      // drive a reentrant cancel, and no old file may be unlinked after a cancel.
+      throwIfAborted();
+      try { await fsp.unlink(path.join(devicePath, r.filename)); }
+      catch (e) {
+        emit({ type: "log", stage: "delete", state: "error", text: `rm ${r.filename}: ${e.message}` });
+        throw e;
+      }
+    }
+    emit({ type: "log", stage: "delete", state: "done", text: `${verb} ${r.filename}` });
+  }
+  emit({ type: "stage", stage: "delete", state: "done" });
 
   // Stage: transfer
   emit({ type: "stage", stage: "transfer", state: "active" });

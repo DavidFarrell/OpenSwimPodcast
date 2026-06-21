@@ -12,12 +12,14 @@ import { commitAndCapture, cancelTransfer } from "./commitCapture.js";
 // Two visible phases (presentational only - one runSync arc, not two IPC sessions).
 // PREPARING covers the analysis + the review gate; TRANSFERRING covers the device
 // IO. Every stage id is mapped to one of these so the stage list can render under a
-// phase header. The execution order after the remove-old reorder is
+// phase header. The execution order is
 //   finalise -> transcribe -> find cuts -> write intros -> [review gate]
-//     -> remove old -> encode -> copy -> verify
-// but the DISPLAY groups the analysis stages first (Preparing) and the device IO
-// after (Transferring); "Finalise order" is shown under Transferring for legibility
-// even though it executes first (it is a no-op label step, not device IO).
+//     -> encode -> remove old -> copy -> verify
+// Encode runs BEFORE remove-old so a convert failure cannot leave the device wiped
+// with nothing written. The DISPLAY groups the analysis stages first (Preparing) and
+// the device IO after (Transferring), and lists them in that execution order;
+// "Finalise order" is shown under Transferring for legibility even though it executes
+// first (it is a no-op label step, not device IO).
 const PHASE_PREPARING = "preparing";
 const PHASE_TRANSFERRING = "transferring";
 const PHASE_OF = {
@@ -54,8 +56,8 @@ function buildStages({ hasVideo, playbackSpeed, boost }) {
   }
   return [
     { id: "finalise", label: "Finalise order", detail: "locking slot numbers" },
-    { id: "delete",   label: "Remove old",    detail: "delete superseded files" },
     { id: "convert",  label: "Encode",        detail: encodeDetail },
+    { id: "delete",   label: "Remove old",    detail: "delete superseded files" },
     { id: "transfer", label: "Transfer",      detail: "copy to OpenSwim Pro" },
     { id: "verify",   label: "Verify",        detail: "checksum + eject-safe" },
   ];
