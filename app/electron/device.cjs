@@ -25,10 +25,16 @@ const MAX_ATTEMPTS = 20;
 async function validateDevice(devicePath, options) {
   // Normalize rather than destructure-default so a null/garbage options arg cannot
   // throw - the function is total.
-  const { markerFile, attempts = 5, delayMs = 250, sleep = defaultSleep } =
+  const { markerFile, attempts = 5, delayMs = 250, sleep = defaultSleep, signal } =
     (options && typeof options === "object") ? options : {};
 
   if (!devicePath) return { ok: false, reason: "no-path" };
+
+  // Cancellation (slice 4): when the caller passes an abort signal, bail at the safe
+  // points (before each probe attempt and before the inter-attempt sleep) so a cancel
+  // stops the readiness probe's temp write+delete from running on the device after the
+  // user cancelled. The function stays total - it returns a typed not-ok, never throws.
+  if (signal && signal.aborted) return { ok: false, reason: "aborted" };
 
   // The marker is the ONLY thing that proves this is our device and not a random
   // writable USB volume, so a missing or non-string markerFile is a hard fail - never
@@ -59,13 +65,17 @@ async function validateDevice(devicePath, options) {
 
   let lastReason = "unreadable";
   for (let i = 0; i < tries; i++) {
-    const r = await probe(devicePath, markerFile);
+    // Bail before the probe's temp write+delete if the caller cancelled, so no device
+    // write happens after a cancel.
+    if (signal && signal.aborted) return { ok: false, reason: "aborted" };
+    const r = await probe(devicePath, markerFile, signal);
     if (r === null) return { ok: true, path: devicePath };
     lastReason = r.reason;
     // A terminal failure must stop the loop: either the device was swapped away (marker
     // gone) or it is not cleanly writable (a temp we could not delete). Retrying would
     // risk passing a wrong device or leaking more temps.
     if (r.terminal) return { ok: false, reason: r.reason };
+    if (signal && signal.aborted) return { ok: false, reason: "aborted" };
     // A rejecting injected sleep must not escape as a throw - the function is total.
     if (i < tries - 1) { try { await sleep(delayMs); } catch {} }
   }
@@ -79,7 +89,7 @@ async function validateDevice(devicePath, options) {
 // the device changed under us, so that is terminal (do not wait out a wrong device).
 // A failed readdir or write is retryable (transient mid-attach); a temp we wrote but
 // could NOT delete is terminal, since that leaves the device not cleanly writable.
-async function probe(devicePath, markerFile) {
+async function probe(devicePath, markerFile, signal) {
   try {
     await fsp.access(path.join(devicePath, markerFile), fs.constants.R_OK);
   } catch {
@@ -90,6 +100,11 @@ async function probe(devicePath, markerFile) {
   } catch {
     return { reason: "unreadable", terminal: false };
   }
+  // The temp write+delete is the ONLY device write in this probe. A cancel that landed
+  // since the loop's pre-probe check (the marker access / readdir above are async) must
+  // stop here, before the write, so a cancel-while-validating leaves the device
+  // untouched. Treated as terminal so the loop does not retry the write after a cancel.
+  if (signal && signal.aborted) return { reason: "aborted", terminal: true };
   const tmp = path.join(devicePath, `.openswim-validate-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   try {
     await fsp.writeFile(tmp, "");

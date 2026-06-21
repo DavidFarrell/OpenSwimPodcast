@@ -4,6 +4,7 @@ const pc = require("./pocketcasts.cjs");
 const { DownloadManager } = require("./downloader.cjs");
 const { createDeviceWatcher } = require("./device.cjs");
 const { runSync, readManifest } = require("./sync.cjs");
+const { validateDevice } = require("./device.cjs");
 const { probeDurationSec } = require("./converter.cjs");
 const { writeDecisions, writeCutSet } = require("./decisionCache.cjs");
 const { appendRecords } = require("./reviewDataset.cjs");
@@ -21,12 +22,17 @@ function broadcast(channel, payload) {
   }
 }
 
+// The marker file that proves a writable volume is OUR device. Shared by the watcher
+// (to recognise the device) and the slice-4 park's validateDevice (to fail closed on a
+// wrong/not-ready volume before any destructive write).
+const MARKER_FILE = ".openswim-podcast";
+
 function getWatcher() {
   if (watcher) return watcher;
   watcher = createDeviceWatcher({
     volumesRoot: "/Volumes",
     labelPattern: /^openswim/i,
-    markerFile: ".openswim-podcast",
+    markerFile: MARKER_FILE,
     pollMs: 2000,
     debounceMs: 200,
   });
@@ -298,6 +304,89 @@ function persistTrimCutSet(uuid, ext) {
 
 let syncController = null;
 
+// The in-flight device park (slice 4). When runSync reaches the await-device gate it
+// calls the injected awaitDevice(), which parks a resolver here (analogous to
+// pendingReview) and subscribes to the device watcher. cancelSync settles this so a
+// cancel-while-parked unblocks runSync, whose throwIfAborted() then aborts before any
+// device IO. Holding the same in-flight runSync call across the park is what keeps the
+// single-run guard (syncController) rejecting a second sync:start while parked.
+let pendingDevice = null; // { resolve, cleanup }
+
+// Build the real device park: an async fn runSync awaits, plus the cancel hook that
+// settles it. Resolves with a VALIDATED { ok, path } as soon as a marked, ready device
+// is present - immediately if one is already mounted, else on the next marked attach.
+//
+// Cardinal-safe by construction:
+//  - We resolve ok ONLY after validateDevice passes (the marker proves it is OUR device
+//    and a write+delete round-trip proves it is ready), so the destructive tail never
+//    runs against a wrong/not-ready volume.
+//  - A mounted-but-not-yet-valid device does NOT resolve the park not-ok (which would
+//    kill the run); we keep waiting for a later attach/change that validates. Only a
+//    CANCEL resolves it not-ok, so a parked run waits indefinitely for the real device
+//    rather than failing on a transient/wrong volume.
+//  - The watcher listener is removed on EVERY exit path (resolve, cancel, error) via a
+//    single idempotent cleanup, so no leaked listener can resume a dead run on a later
+//    attach.
+//
+// Injectable getWatcher + validateFn keep it unit-testable without electron.
+function createDevicePark({ getWatcher, validateFn, markerFile, setPending }) {
+  let settled = false;
+  let unsubscribe = null;
+  // Validation runs serially: while one validateFn is in flight we do not start another
+  // for a subsequent watcher tick, so overlapping attaches cannot double-resolve.
+  let validating = false;
+
+  const awaitDevice = () => new Promise((resolve) => {
+    const cleanup = () => {
+      if (unsubscribe) { try { unsubscribe(); } catch {} unsubscribe = null; }
+    };
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      setPending(null);
+      resolve(result);
+    };
+
+    // Cancel hook stored for cancelSync: settle the park not-ok so runSync unblocks and
+    // its post-park throwIfAborted() aborts before any device IO.
+    setPending({ resolve: () => finish({ ok: false, reason: "cancelled" }), cleanup });
+
+    const watcher = getWatcher();
+
+    const tryValidate = async (state) => {
+      if (settled || validating) return;
+      if (!state || !state.mounted || !state.path) return;
+      validating = true;
+      let r;
+      try {
+        r = await validateFn(state.path);
+      } catch (e) {
+        r = { ok: false, reason: e && e.message ? e.message : "validate-threw" };
+      } finally {
+        validating = false;
+      }
+      if (r && r.ok) { finish({ ok: true, path: r.path || state.path }); return; }
+      // Not ok: keep parked. Re-check ONLY if the device CHANGED while we were validating
+      // (e.g. re-seated to a different volume), so we do not miss a settled window between
+      // watcher ticks. We must NOT re-check the SAME still-mounted path - that would busy-
+      // loop forever on a device that is mounted but permanently not-valid. An unchanged
+      // path just waits for the next watcher tick (the user re-seating fires one).
+      if (settled) return;
+      let now;
+      try { now = watcher.current(); } catch { now = null; }
+      if (now && now.mounted && now.path && now.path !== state.path) tryValidate(now);
+    };
+
+    // Subscribe BEFORE the immediate check so an attach landing in the gap is not missed.
+    unsubscribe = watcher.on((state) => { tryValidate(state); });
+    // Immediate path: a marked device already mounted resolves without waiting.
+    tryValidate(watcher.current());
+  });
+
+  return { awaitDevice, markerFile };
+}
+
 // The in-flight review gate. When runSync hands us flagged cuts, we park a
 // resolver here and broadcast the `review` event (runSync already emits it via
 // onEvent); the renderer shows its review surface and calls sync:review:resolve
@@ -364,8 +453,22 @@ async function startSync(spec) {
       trimCutSets.delete(it.uuid);
     }
   }
+  // The real device park (slice 4): resolve from the watcher and validate with the
+  // marker. Built per-run so its `settled` state is fresh. cancelSync settles
+  // pendingDevice (set inside the park) to unblock a parked run.
+  const devicePark = createDevicePark({
+    getWatcher,
+    // Pass the run's abort signal so a cancel-while-validating stops the readiness
+    // probe's device temp write+delete (validateDevice bails to { ok:false }).
+    validateFn: (p) => validateDevice(p, { markerFile: MARKER_FILE, signal: syncController.signal }),
+    markerFile: MARKER_FILE,
+    setPending: (v) => { pendingDevice = v; },
+  });
   try {
     const res = await runSync({
+      // devicePath is no longer the device handle (slice 4): the validated handle comes
+      // from awaitDevice() below. We still forward spec.devicePath so a same-process test
+      // path could use it, but the production park ignores it and reads the watcher.
       devicePath: spec.devicePath,
       queue,
       speed: spec.speed || 1.0,
@@ -396,6 +499,14 @@ async function startSync(spec) {
         const uuids = (items || []).map((it) => it && it.uuid).filter(Boolean);
         pendingReview = { resolve, uuids };
       }),
+      // The device park (slice 4): block until a validated marked device is present.
+      // Resolves immediately if one is already mounted, else on the next marked attach.
+      awaitDevice: devicePark.awaitDevice,
+      // Revalidate-before-delete (slice 4): re-prove the resolved device immediately
+      // before the destructive delete so a device that vanished/went not-ready between
+      // attach and delete fails closed - nothing is unlinked. The abort signal lets a
+      // cancel stop the probe's device write mid-revalidate.
+      validateDeviceFn: (p) => validateDevice(p, { markerFile: MARKER_FILE, signal: syncController.signal }),
       // Real processed-duration probe for the authoritative success report (the
       // renderer uses the returned `res` as the source of truth, not its live
       // queue - so a download finishing mid-run can never be reported as
@@ -409,6 +520,10 @@ async function startSync(spec) {
     broadcast("sync:event", { type: "finished", ok: false, error: { message: e.message, code: e.code, name: e.name } });
     throw e;
   } finally {
+    // Belt-and-braces: the park clears pendingDevice on every exit path itself, but if
+    // the run ended while still parked (an error before/around the gate), remove the
+    // watcher listener and drop the resolver so nothing leaks into the next run.
+    if (pendingDevice) { try { pendingDevice.cleanup && pendingDevice.cleanup(); } catch {} pendingDevice = null; }
     syncController = null;
   }
 }
@@ -419,6 +534,11 @@ function cancelSync() {
   // raises AbortError and nothing reaches the converter - a cancel mid-review
   // cuts nothing, exactly as expected.
   if (pendingReview) { const { resolve } = pendingReview; pendingReview = null; resolve({}); }
+  // Release a parked device wait the same way (slice 4): settle awaitDevice not-ok so
+  // runSync unblocks, then abort. Its post-park throwIfAborted() raises AbortError
+  // BEFORE any device read/write - a cancel-while-parked touches no device. The park's
+  // resolver also removes the watcher listener, so no leaked listener resumes the run.
+  if (pendingDevice) { const { resolve } = pendingDevice; pendingDevice = null; resolve(); }
   if (syncController) { syncController.abort(); return true; }
   return false;
 }
@@ -544,4 +664,5 @@ module.exports = {
   setTrimEdit, getTrimEdits, mergeDecisionsWithEdits,
   setTrimCutSet, getTrimCutSet, sanitizeRanges,
   resolveReview, cancelSync,
+  createDevicePark,
 };
