@@ -103,8 +103,11 @@ describe("runSync happy path", () => {
 
     const stages = events.filter((e) => e.type === "stage" && e.state === "done").map((e) => e.stage);
     // Convert now runs BEFORE delete (slice 1): the old device files survive a convert
-    // failure, so the safer order is convert -> delete -> transfer -> verify.
-    expect(stages).toEqual(["finalise", "convert", "delete", "transfer", "verify"]);
+    // failure, so the safer order is convert -> delete -> transfer -> verify. Slice 4
+    // inserts the device park (waiting-for-device) between convert and delete; with a
+    // device-present default-resolved park it resolves instantly, so the ONLY change to
+    // this list is the new stage in that position - the device-touching order is intact.
+    expect(stages).toEqual(["finalise", "convert", "waiting-for-device", "delete", "transfer", "verify"]);
     expect(events.at(-1).type).toBe("complete");
   });
 
@@ -2213,7 +2216,9 @@ describe("runSync trim stage", () => {
     // review precedes convert, convert precedes delete (the slice-1 ordering invariant).
     expect(doneOrder.indexOf("review")).toBeLessThan(doneOrder.indexOf("convert"));
     expect(doneOrder.indexOf("convert")).toBeLessThan(doneOrder.indexOf("delete"));
-    expect(doneOrder).toEqual(["finalise", "transcribe", "trim", "review", "convert", "delete", "transfer", "verify"]);
+    // Slice 4: the device park (waiting-for-device) sits between convert and delete. The
+    // device-present default park resolves instantly, so the order is otherwise unchanged.
+    expect(doneOrder).toEqual(["finalise", "transcribe", "trim", "review", "convert", "waiting-for-device", "delete", "transfer", "verify"]);
   });
 
   // --- Slice 1: convert-before-delete (no-device-data-loss on convert failure) ---
@@ -2439,5 +2444,231 @@ describe("resolveEpisodeCuts (legacy map OR explicit cut-set)", () => {
     expect(out[0].endSec).toBe(360);
     expect(out[0].cutId).toBe(cutId(215, 360, "ad"));
     expect(out[0].cutId).not.toBe(cutId(200, 380, "ad")); // the stale id was overwritten
+  });
+});
+
+// --- Slice 4: the await-device park (device-decouple CORE) ---
+// runSync now PARKS between convert and delete until a validated device is present.
+// These tests inject a fake awaitDevice (the park) + a fake validateDeviceFn so they
+// are hermetic and assert the cardinal invariants directly.
+describe("runSync await-device park (slice 4)", () => {
+  let devicePath, cacheDir;
+  beforeEach(() => { devicePath = mkTmp("os-device-"); cacheDir = mkTmp("os-cache-"); });
+  afterEach(() => { rmTmp(devicePath); rmTmp(cacheDir); });
+
+  function plainItem() {
+    return makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" });
+  }
+
+  // DEVICE-PRESENT-UNCHANGED: the default park resolves instantly with the entry
+  // devicePath (no watcher, no validate). With it injected as an immediate resolve the
+  // run must produce the EXACT same on-device outcome as a pre-slice-4 run.
+  it("device present at start (instant resolve) = same outcome as today", async () => {
+    const payload = Buffer.from("episode audio that lands on the device");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);
+
+    const events = [];
+    const awaitDevice = vi.fn(async () => ({ ok: true, path: devicePath }));
+    const res = await runSync({
+      devicePath, cacheDir, queue: [plainItem()],
+      convertFn: async () => {}, awaitDevice,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(res.ok).toBe(true);
+    expect(awaitDevice).toHaveBeenCalledOnce();
+    // File transferred + verified + manifest written, byte-identical to a plain copy.
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
+    expect(fs.existsSync(path.join(devicePath, MANIFEST_FILE))).toBe(true);
+    expect(res.transferred).toHaveLength(1);
+    expect(res.transferred[0].fname).toBe("01_hardfork.mp3");
+    // The park's waiting-for-device stage fired and resolved; the plan came AFTER it.
+    const stagesDone = events.filter((e) => e.type === "stage" && e.state === "done").map((e) => e.stage);
+    expect(stagesDone).toEqual(["finalise", "convert", "waiting-for-device", "delete", "transfer", "verify"]);
+    const planIdx = events.findIndex((e) => e.type === "plan");
+    const waitDoneIdx = events.findIndex((e) => e.type === "stage" && e.stage === "waiting-for-device" && e.state === "done");
+    expect(planIdx).toBeGreaterThan(waitDoneIdx);
+  });
+
+  // A device-free `prepared` summary + waiting-for-device active emit BEFORE the park
+  // blocks, so the UI (slice 5) can render the parked state.
+  it("emits a device-free prepared summary and waiting-for-device:active before parking", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("audio"));
+    const events = [];
+    // The park resolves only once we let it; capture the events emitted up to that point.
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const awaitDevice = vi.fn(async () => { await gate; return { ok: true, path: devicePath }; });
+
+    const run = runSync({
+      devicePath, cacheDir, queue: [plainItem()],
+      convertFn: async () => {}, awaitDevice,
+      onEvent: (e) => events.push(e),
+    });
+    // Let the microtasks up to the park settle.
+    await Promise.resolve(); await Promise.resolve();
+    const prepared = events.find((e) => e.type === "prepared");
+    expect(prepared).toBeTruthy();
+    expect(prepared.items).toEqual([{ uuid: "a", title: "Ep", show: "HARD FORK", slot: 1, filename: "01_hardfork.mp3" }]);
+    expect(events.some((e) => e.type === "stage" && e.stage === "waiting-for-device" && e.state === "active")).toBe(true);
+    // No device IO yet: no plan, no delete stage.
+    expect(events.some((e) => e.type === "plan")).toBe(false);
+    expect(events.some((e) => e.type === "stage" && e.stage === "delete")).toBe(false);
+    release();
+    await run;
+  });
+
+  // DEVICE-ABSENT-THEN-ATTACH: the park resolves LATER (simulated attach) and the run
+  // then proceeds to a full successful transfer against the resolved path.
+  it("device absent then attach: parks, then proceeds on a simulated attach", async () => {
+    const payload = Buffer.from("waited for the headphones");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);
+
+    // The device only becomes usable when the fake park resolves (deferred).
+    let attach;
+    const attached = new Promise((r) => { attach = r; });
+    const awaitDevice = vi.fn(async () => { await attached; return { ok: true, path: devicePath }; });
+
+    const events = [];
+    const run = runSync({
+      devicePath, cacheDir, queue: [plainItem()],
+      convertFn: async () => {}, awaitDevice,
+      onEvent: (e) => events.push(e),
+    });
+    await Promise.resolve(); await Promise.resolve();
+    // Still parked: nothing written.
+    expect(fs.existsSync(path.join(devicePath, "01_hardfork.mp3"))).toBe(false);
+    // Simulate the attach.
+    attach();
+    const res = await run;
+    expect(res.ok).toBe(true);
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
+  });
+
+  // CANCEL-WHILE-PARKED-NO-IO: a cancel during the park does NO device IO (no readdir
+  // of the device for the plan, no unlink, no copy) and leaves the device untouched.
+  // This fails if throwIfAborted() is not placed immediately after the park resolves.
+  it("cancel while parked does NO device IO and leaves the device untouched", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("audio"));
+    // Pre-existing device contents that must be untouched by a cancelled run.
+    const oldFile = path.join(devicePath, "07_oldshow.mp3");
+    fs.writeFileSync(oldFile, Buffer.from("must survive a cancel-while-parked"));
+
+    const ctrl = new AbortController();
+    // The park: settle (as cancelSync would, not-ok) AFTER the abort fires, mirroring the
+    // IPC cancel order (resolve the parked promise, then abort).
+    const awaitDevice = vi.fn(async () => {
+      ctrl.abort();
+      return { ok: false, reason: "cancelled" };
+    });
+    const copyFn = vi.fn();
+    const validateDeviceFn = vi.fn(async (p) => ({ ok: true, path: p }));
+
+    await expect(runSync({
+      devicePath, cacheDir, queue: [plainItem()],
+      convertFn: async () => {}, copyFn, awaitDevice, validateDeviceFn,
+      signal: ctrl.signal, onEvent: () => {},
+    })).rejects.toMatchObject({ name: "AbortError" });
+
+    // No device IO at all past the park: revalidate was never called, no copy, the old
+    // file is intact, no new file, no manifest.
+    expect(validateDeviceFn).not.toHaveBeenCalled();
+    expect(copyFn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(oldFile).toString()).toBe("must survive a cancel-while-parked");
+    const remaining = fs.readdirSync(devicePath);
+    expect(remaining).toEqual(["07_oldshow.mp3"]);
+    expect(remaining).not.toContain(MANIFEST_FILE);
+  });
+
+  // The waiting-for-device stage must be CLOSED on a cancel (not left active in the
+  // event stream): a terminal `cancelled` state fires, and `done` never does.
+  it("a cancel-while-parked closes the waiting-for-device stage (cancelled, not done)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("audio"));
+    const ctrl = new AbortController();
+    const awaitDevice = vi.fn(async () => { ctrl.abort(); return { ok: false, reason: "cancelled" }; });
+    const events = [];
+    await expect(runSync({
+      devicePath, cacheDir, queue: [plainItem()],
+      convertFn: async () => {}, awaitDevice, signal: ctrl.signal,
+      onEvent: (e) => events.push(e),
+    })).rejects.toMatchObject({ name: "AbortError" });
+    const waitStates = events.filter((e) => e.type === "stage" && e.stage === "waiting-for-device").map((e) => e.state);
+    expect(waitStates).toContain("active");
+    expect(waitStates).toContain("cancelled");
+    expect(waitStates).not.toContain("done");
+  });
+
+  // The plan (and the device read it is built from) runs ONLY after the park resolves,
+  // against the freshly-resolved path - never a stale entry path.
+  it("buildPlan / plan event runs only AFTER the device resolves, against the resolved path", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("audio"));
+    // The park resolves to a DIFFERENT directory than the entry devicePath; the plan +
+    // the transfer must use the RESOLVED dir.
+    const resolvedDir = mkTmp("os-resolved-");
+    try {
+      fs.writeFileSync(path.join(resolvedDir, "07_oldshow.mp3"), Buffer.from("stale on the real device"));
+      const events = [];
+      const awaitDevice = vi.fn(async () => ({ ok: true, path: resolvedDir }));
+      const res = await runSync({
+        devicePath, cacheDir, queue: [plainItem()],
+        convertFn: async () => {}, awaitDevice,
+        onEvent: (e) => events.push(e),
+      });
+      expect(res.ok).toBe(true);
+      // The plan's delete entry reflects the RESOLVED dir's contents (07_oldshow.mp3),
+      // proving the device was read fresh at attach time, not the empty entry dir.
+      const planEvent = events.find((e) => e.type === "plan");
+      expect(planEvent.plan.some((p) => p.stage === "delete" && /07_oldshow\.mp3/.test(p.text))).toBe(true);
+      // The file landed on the RESOLVED dir, and the entry dir was never written to.
+      expect(fs.existsSync(path.join(resolvedDir, "01_hardfork.mp3"))).toBe(true);
+      expect(fs.existsSync(path.join(devicePath, "01_hardfork.mp3"))).toBe(false);
+    } finally { rmTmp(resolvedDir); }
+  });
+
+  // REVALIDATE-FAILS-CLOSED: if the device vanishes/goes not-ready between the park
+  // resolving and the delete, the revalidate fails closed and NOTHING is unlinked. This
+  // fails if the revalidate-before-delete guard is removed.
+  it("revalidate fails closed: a device that goes not-ready after attach is NOT written/deleted", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("audio"));
+    const oldFile = path.join(devicePath, "07_oldshow.mp3");
+    fs.writeFileSync(oldFile, Buffer.from("must survive a failed revalidate"));
+
+    const awaitDevice = vi.fn(async () => ({ ok: true, path: devicePath }));
+    // The device was valid at attach but is not-ready now (e.g. swapped/yanked).
+    const validateDeviceFn = vi.fn(async () => ({ ok: false, reason: "missing-marker" }));
+    const copyFn = vi.fn();
+
+    await expect(runSync({
+      devicePath, cacheDir, queue: [plainItem()],
+      convertFn: async () => {}, copyFn, awaitDevice, validateDeviceFn,
+      onEvent: () => {},
+    })).rejects.toThrow(/revalidate failed/i);
+
+    // Nothing unlinked, nothing copied, no manifest - the device is untouched.
+    expect(copyFn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(oldFile).toString()).toBe("must survive a failed revalidate");
+    expect(fs.existsSync(path.join(devicePath, MANIFEST_FILE))).toBe(false);
+  });
+
+  // A not-available park resolution (no device, no real park) fails the run closed
+  // rather than hanging or writing.
+  it("a not-available device resolution fails the run closed", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("audio"));
+    const awaitDevice = vi.fn(async () => ({ ok: false, reason: "no-device" }));
+    await expect(runSync({
+      devicePath, cacheDir, queue: [plainItem()],
+      convertFn: async () => {}, awaitDevice, onEvent: () => {},
+    })).rejects.toThrow(/device not available/i);
+    expect(fs.existsSync(path.join(devicePath, "01_hardfork.mp3"))).toBe(false);
+  });
+
+  // With NO devicePath and NO injected park, runSync fails closed (does not hang) - the
+  // default awaitDevice resolves not-ok.
+  it("with no devicePath and no injected park, the run fails closed (does not hang)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("audio"));
+    await expect(runSync({
+      cacheDir, queue: [plainItem()],
+      convertFn: async () => {}, onEvent: () => {},
+    })).rejects.toThrow(/device not available|no-device/i);
   });
 });

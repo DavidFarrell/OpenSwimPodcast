@@ -13,6 +13,7 @@ const {
   setTrimEdit, getTrimEdits, mergeDecisionsWithEdits,
   setTrimCutSet, getTrimCutSet, sanitizeRanges,
   resolveReview, cancelSync,
+  createDevicePark,
 } = require("./ipc.cjs");
 
 describe("announce toggle intent (ipc helpers, { ok, data } surface)", () => {
@@ -353,5 +354,130 @@ describe("review:capture IPC handler (slice 3 write edge)", () => {
   it("never throws on a null payload (best-effort)", async () => {
     const handler = buildHandlers()["review:capture"];
     await expect(handler({}, null)).resolves.toMatchObject({ ok: false });
+  });
+});
+
+describe("createDevicePark (slice 4 - the await-device park)", () => {
+  // A fake watcher mirroring device.cjs createDeviceWatcher's on/current contract:
+  // on(cb) returns an unsubscribe; current() returns the latest state; emit(state)
+  // notifies live listeners. We track live listener count to prove cleanup.
+  function makeWatcher(initial = { mounted: false }) {
+    let listeners = [];
+    let state = initial;
+    return {
+      on(cb) { listeners.push(cb); return () => { listeners = listeners.filter((x) => x !== cb); }; },
+      current() { return state; },
+      emit(next) { state = next; for (const cb of listeners.slice()) cb(state); },
+      listenerCount() { return listeners.length; },
+    };
+  }
+
+  function makePark(watcher, validateFn) {
+    let pending = null;
+    const park = createDevicePark({
+      getWatcher: () => watcher,
+      validateFn,
+      markerFile: ".marker",
+      setPending: (v) => { pending = v; },
+    });
+    return { park, getPending: () => pending };
+  }
+
+  it("resolves IMMEDIATELY when a marked, valid device is already mounted", async () => {
+    const watcher = makeWatcher({ mounted: true, path: "/Volumes/openswim" });
+    const validateFn = async (p) => ({ ok: true, path: p });
+    const { park } = makePark(watcher, validateFn);
+    const res = await park.awaitDevice();
+    expect(res).toEqual({ ok: true, path: "/Volumes/openswim" });
+    // Listener removed on resolve - no leak.
+    expect(watcher.listenerCount()).toBe(0);
+  });
+
+  it("parks when no device, then resolves on a marked attach (and removes the listener)", async () => {
+    const watcher = makeWatcher({ mounted: false });
+    const validateFn = async (p) => ({ ok: true, path: p });
+    const { park } = makePark(watcher, validateFn);
+    const p = park.awaitDevice();
+    // Parked: a listener is registered, nothing resolved yet.
+    expect(watcher.listenerCount()).toBe(1);
+    watcher.emit({ mounted: true, path: "/Volumes/openswim" });
+    const res = await p;
+    expect(res).toEqual({ ok: true, path: "/Volumes/openswim" });
+    expect(watcher.listenerCount()).toBe(0);
+  });
+
+  it("a not-ready attach does NOT resolve; a later valid attach does (fail-closed park)", async () => {
+    const watcher = makeWatcher({ mounted: false });
+    let pass = false;
+    const validateFn = async (p) => (pass ? { ok: true, path: p } : { ok: false, reason: "not-writable" });
+    const { park } = makePark(watcher, validateFn);
+    const p = park.awaitDevice();
+    // A not-ready volume mounts - the park must stay parked, never resolve not-ok.
+    watcher.emit({ mounted: true, path: "/Volumes/bad" });
+    await Promise.resolve(); await Promise.resolve();
+    expect(watcher.listenerCount()).toBe(1); // still parked
+    // The real device shows up.
+    pass = true;
+    watcher.emit({ mounted: true, path: "/Volumes/openswim" });
+    const res = await p;
+    expect(res).toEqual({ ok: true, path: "/Volumes/openswim" });
+    expect(watcher.listenerCount()).toBe(0);
+  });
+
+  it("cancel via the parked resolver settles not-ok AND removes the listener", async () => {
+    const watcher = makeWatcher({ mounted: false });
+    const validateFn = async (p) => ({ ok: true, path: p });
+    const { park, getPending } = makePark(watcher, validateFn);
+    const p = park.awaitDevice();
+    expect(watcher.listenerCount()).toBe(1);
+    // cancelSync calls pendingDevice.resolve() - the park settles not-ok.
+    getPending().resolve();
+    const res = await p;
+    expect(res).toEqual({ ok: false, reason: "cancelled" });
+    expect(watcher.listenerCount()).toBe(0);
+    // A late attach after cancel must NOT resolve the (already settled) promise or leak.
+    watcher.emit({ mounted: true, path: "/Volumes/openswim" });
+    expect(watcher.listenerCount()).toBe(0);
+  });
+
+  it("a thrown validateFn is treated as not-ok (parked), then a later tick validates", async () => {
+    // A throwing validate must NEVER resolve the park ok (cardinal: no write on an
+    // unproven device). The park catches the throw, treats it as not-ok, and STAYS
+    // parked; a later watcher tick (the poll re-firing) re-validates and resolves ok.
+    // This proves a throw can neither kill the run nor pass an unvalidated device.
+    const watcher = makeWatcher({ mounted: false });
+    let throwOnce = true;
+    const validateFn = async (p) => {
+      if (throwOnce) { throwOnce = false; throw new Error("validate boom"); }
+      return { ok: true, path: p };
+    };
+    const { park } = makePark(watcher, validateFn);
+    const p = park.awaitDevice();
+    // First attach: validate throws -> stays parked.
+    watcher.emit({ mounted: true, path: "/Volumes/openswim" });
+    await Promise.resolve(); await Promise.resolve();
+    expect(watcher.listenerCount()).toBe(1);
+    // A later poll tick re-emits the same device; validate now passes.
+    watcher.emit({ mounted: true, path: "/Volumes/openswim" });
+    const res = await p;
+    expect(res).toEqual({ ok: true, path: "/Volumes/openswim" });
+    expect(watcher.listenerCount()).toBe(0);
+  });
+
+  it("does NOT busy-loop on a device that stays mounted but permanently invalid", async () => {
+    // A mounted-but-never-valid device must leave the park waiting with a BOUNDED number
+    // of validate calls (one per watcher tick), never an unbounded re-check loop.
+    const watcher = makeWatcher({ mounted: true, path: "/Volumes/bad" });
+    let calls = 0;
+    const validateFn = async (p) => { calls++; return { ok: false, reason: "not-writable" }; };
+    const { park, getPending } = makePark(watcher, validateFn);
+    const p = park.awaitDevice();
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    // The immediate check ran once; the same still-mounted path is not re-validated.
+    expect(calls).toBe(1);
+    expect(watcher.listenerCount()).toBe(1); // still parked, not resolved
+    // Cancel to settle the parked promise for a clean test exit.
+    getPending().resolve();
+    expect(await p).toEqual({ ok: false, reason: "cancelled" });
   });
 });

@@ -626,6 +626,26 @@ async function runSync({
   readDecisionsFn = defaultReadDecisions,
   readCutSetFn = defaultReadCutSet,
   awaitReview = defaultAwaitReview,
+  // The device park (slice 4). All device-touching work waits behind this gate, so a
+  // sync can be started with NO device attached: everything device-free (analyse ->
+  // review -> convert -> finished mp3s in cache) runs first, then the run PARKS here
+  // until a validated device is present. awaitDevice() resolves to { ok, path } - the
+  // VALIDATED handle to use for every device IO below (deviceRoot), NOT the entry
+  // devicePath. The default resolves IMMEDIATELY with the entry devicePath and does NO
+  // watcher/validate work, so a direct caller that passed a devicePath behaves exactly
+  // as it did before the park existed (instant resolve, same path). The IPC layer
+  // injects the real watcher-driven park. With no devicePath AND no injected
+  // awaitDevice, the run fails closed (no device to write to) rather than hanging.
+  awaitDevice = (devicePath
+    ? async () => ({ ok: true, path: devicePath })
+    : async () => ({ ok: false, reason: "no-device" })),
+  // Revalidate-before-delete (slice 4). Called on the resolved deviceRoot immediately
+  // before the destructive delete so a device that vanished or went not-ready between
+  // attach and delete fails closed - nothing is unlinked. The default is a PASS-THROUGH
+  // (the awaitDevice park already validated), so existing direct callers with a fake
+  // dir and no marker are unaffected. The IPC layer injects the real marker-checked
+  // validateDevice.
+  validateDeviceFn = async (p) => ({ ok: true, path: p }),
   // Best-effort probe of an output file's real duration (seconds). Defaults to a
   // null no-op so unit tests stay hermetic (no ffmpeg spawn); the IPC layer
   // injects the real ffmpeg-based probe so the success screen can report the
@@ -640,7 +660,8 @@ async function runSync({
   onEvent,
   signal,
 } = {}) {
-  if (!devicePath) throw new Error("devicePath is required");
+  // devicePath is OPTIONAL now (slice 4): a sync may start with no device attached and
+  // PARK behind awaitDevice until one is present. cacheDir + queue are still required.
   if (!cacheDir) throw new Error("cacheDir is required");
   if (!Array.isArray(queue)) throw new Error("queue is required");
   const needsEncode = (speed && speed !== 1.0) || !!boost;
@@ -663,12 +684,11 @@ async function runSync({
     if (signal && signal.aborted) throw new AbortError();
   };
 
-  let existingDeviceFiles = [];
-  try { existingDeviceFiles = await fsp.readdir(devicePath); } catch {}
-  const existingManifest = await readManifest(devicePath);
-
-  const plan = buildPlan({ queue, existingDeviceFiles, existingManifest, needsEncode });
-  emit({ type: "plan", plan });
+  // NOTE (slice 4): the device read (existingDeviceFiles/existingManifest), the
+  // buildPlan, and the `plan` event NO LONGER run here. There may be no device yet -
+  // the device is read FRESH after the park resolves (see the device-plan block below
+  // the park), so the plan is always computed against the just-attached device, never a
+  // stale path.
 
   // Stage: finalise
   emit({ type: "stage", stage: "finalise", state: "active" });
@@ -987,6 +1007,78 @@ async function runSync({
   }
   emit({ type: "stage", stage: "convert", state: "done" });
 
+  // Stage: await device (the park - slice 4, cardinal-critical).
+  // Everything above is device-free (finished mp3s now sit in cacheDir). PARK here until
+  // a VALIDATED device is present, so a sync can be started with no headphones attached.
+  // Emit a device-free `prepared` summary (what is ready to transfer) and the
+  // waiting-for-device stage BEFORE blocking, so the UI (slice 5) can render the parked
+  // state. awaitDevice() resolves with { ok, path }: on ok we use THIS path (deviceRoot)
+  // for every device IO below, NEVER the entry devicePath. A cancel during the park
+  // resolves it (the IPC layer settles the parked resolver), then the throwIfAborted()
+  // right after fires BEFORE any device read/write - so a cancel mid-park touches no
+  // device. A not-available resolution (no device and no real park injected) fails the
+  // run closed: there is nothing to write to.
+  emit({
+    type: "prepared",
+    items: queue.map((it) => ({ uuid: it.uuid, title: it.title, show: it.show, slot: it.slot, filename: it.filename })),
+  });
+  emit({ type: "stage", stage: "waiting-for-device", state: "active" });
+  // A reentrant cancel from the prepared / waiting-active emit above must NOT enter the
+  // park (which could otherwise hang until a later attach, or run validation after a
+  // cancel). Bail here - the run aborts before parking and touches no device. Close the
+  // stage so it is not left active in the event stream.
+  if (signal && signal.aborted) { emit({ type: "stage", stage: "waiting-for-device", state: "cancelled" }); throw new AbortError(); }
+  let resolved;
+  try {
+    resolved = await awaitDevice();
+  } catch (e) {
+    if (e && e.name === "AbortError") { emit({ type: "stage", stage: "waiting-for-device", state: "cancelled" }); throw e; }
+    emit({ type: "stage", stage: "waiting-for-device", state: "error" });
+    throw e;
+  }
+  // A cancel that arrived while parked settles awaitDevice; fail the run here, BEFORE any
+  // device IO, so a cancel-while-parked touches no device. Close the waiting stage with a
+  // terminal `cancelled` state so the UI does not see it stuck active.
+  if (signal && signal.aborted) { emit({ type: "stage", stage: "waiting-for-device", state: "cancelled" }); throw new AbortError(); }
+  if (!resolved || resolved.ok !== true || !resolved.path) {
+    emit({ type: "stage", stage: "waiting-for-device", state: "error" });
+    throw new Error(`device not available${resolved && resolved.reason ? `: ${resolved.reason}` : ""}`);
+  }
+  const deviceRoot = resolved.path;
+  emit({ type: "stage", stage: "waiting-for-device", state: "done" });
+
+  // A reentrant cancel from the waiting-done emit must abort BEFORE the fresh device
+  // read below, so no readdir/readManifest touches the device after a cancel.
+  if (signal && signal.aborted) throw new AbortError();
+
+  // Device plan (slice 4): read the JUST-ATTACHED device FRESH and build the plan
+  // against it - never a stale path. This is the device read + buildPlan + `plan` event
+  // that used to run at the top of runSync; it moved here because the device may not
+  // have existed until the park resolved.
+  let existingDeviceFiles = [];
+  try { existingDeviceFiles = await fsp.readdir(deviceRoot); } catch {}
+  const existingManifest = await readManifest(deviceRoot);
+  const plan = buildPlan({ queue, existingDeviceFiles, existingManifest, needsEncode });
+  emit({ type: "plan", plan });
+
+  // Revalidate immediately before the destructive delete (slice 4, cardinal-critical).
+  // The park validated the device at attach time, but a device can vanish or go
+  // not-ready between attach and the first unlink. Re-prove it here and FAIL CLOSED if
+  // it is not ok - throw BEFORE any unlink, so the device is left untouched. A cancel
+  // seen here also aborts before any write.
+  throwIfAborted();
+  let revalidated;
+  try {
+    revalidated = await validateDeviceFn(deviceRoot);
+  } catch (e) {
+    if (e && e.name === "AbortError") throw e;
+    revalidated = { ok: false, reason: e && e.message ? e.message : "validate-threw" };
+  }
+  if (!revalidated || revalidated.ok !== true) {
+    emit({ type: "log", stage: "delete", state: "error", text: `device revalidate failed${revalidated && revalidated.reason ? `: ${revalidated.reason}` : ""}` });
+    throw new Error(`device revalidate failed${revalidated && revalidated.reason ? `: ${revalidated.reason}` : ""}`);
+  }
+
   // Stage: delete (RUNS AFTER convert - see the convert comment above for the WHY).
   // Remove superseded device files only once convert has built every output. A
   // throwIfAborted() sits immediately before EACH unlink (not just at the loop top), so
@@ -1009,7 +1101,7 @@ async function runSync({
   // manifest that could survive a later crash as a false-complete record.
   throwIfAborted();
   let manifestRemoved = false;
-  try { await fsp.unlink(path.join(devicePath, MANIFEST_FILE)); manifestRemoved = true; }
+  try { await fsp.unlink(path.join(deviceRoot, MANIFEST_FILE)); manifestRemoved = true; }
   catch (e) {
     if (e && e.code !== "ENOENT") {
       emit({ type: "log", stage: "delete", state: "error", text: `manifest invalidate: ${e.message}` });
@@ -1021,7 +1113,7 @@ async function runSync({
   // alongside changed files - a stale false-complete. Best-effort for the same reason
   // as the post-rename dir fsync (dir-fsync is non-portable).
   if (manifestRemoved) {
-    try { const dh = await fsp.open(devicePath); try { await dh.sync(); } finally { await dh.close(); } } catch {}
+    try { const dh = await fsp.open(deviceRoot); try { await dh.sync(); } finally { await dh.close(); } } catch {}
   }
   const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
   for (const r of removals) {
@@ -1032,7 +1124,7 @@ async function runSync({
       // Guard immediately before the side effect: an emit above could, in principle,
       // drive a reentrant cancel, and no old file may be unlinked after a cancel.
       throwIfAborted();
-      try { await fsp.unlink(path.join(devicePath, r.filename)); }
+      try { await fsp.unlink(path.join(deviceRoot, r.filename)); }
       catch (e) {
         emit({ type: "log", stage: "delete", state: "error", text: `rm ${r.filename}: ${e.message}` });
         throw e;
@@ -1063,9 +1155,9 @@ async function runSync({
     for (let i = 0; i < queue.length; i++) {
       throwIfAborted();
       const it = queue[i];
-      const dest = path.join(devicePath, it.filename);
+      const dest = path.join(deviceRoot, it.filename);
       dests[i] = dest;
-      const temp = path.join(devicePath, `.${it.filename}.part-${runId}-${i}`);
+      const temp = path.join(deviceRoot, `.${it.filename}.part-${runId}-${i}`);
       tempsToClean.push(temp);
       emit({ type: "log", stage: "transfer", state: "active", uuid: it.uuid, text: it.filename });
       // Guard immediately before the copy: an emit above could drive a reentrant
@@ -1108,7 +1200,7 @@ async function runSync({
   // must not fail an otherwise-verified transfer. Guarded before the side effect so a
   // reentrant cancel after the last rename does no further device work.
   throwIfAborted();
-  try { const dh = await fsp.open(devicePath); try { await dh.sync(); } finally { await dh.close(); } } catch {}
+  try { const dh = await fsp.open(deviceRoot); try { await dh.sync(); } finally { await dh.close(); } } catch {}
   emit({ type: "stage", stage: "transfer", state: "done" });
 
   // Stage: verify. Each file was already sha256-verified before its rename, so this
@@ -1138,7 +1230,7 @@ async function runSync({
   // cancel seen here also fails the run before the manifest is written, which is the
   // correct recovery: with no manifest the device reads as not-done.
   throwIfAborted();
-  try { await writeManifest(devicePath, queue, { signal }); }
+  try { await writeManifest(deviceRoot, queue, { signal }); }
   catch (e) {
     if (e && e.name === "AbortError") throw e;
     emit({ type: "log", stage: "verify", state: "error", text: `manifest: ${e.message}` });
