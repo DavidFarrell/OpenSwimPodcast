@@ -252,9 +252,12 @@ describe("runSync failures", () => {
   });
   afterEach(() => { rmTmp(devicePath); rmTmp(cacheDir); });
 
-  it("fails verify and throws when the copy didn't land cleanly", async () => {
+  it("fails verify and throws when the copy didn't land cleanly, leaving NO final file", async () => {
     fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("correct audio"));
 
+    // copyFn writes corrupt bytes to the temp it is handed. The sha256 of the temp
+    // will not match the source, so verify-before-rename aborts and the rename never
+    // happens - no final-named file is created.
     const copyFn = async (src, dest) => {
       fs.writeFileSync(dest, Buffer.from("corrupted in flight"));
     };
@@ -266,17 +269,24 @@ describe("runSync failures", () => {
       onEvent: (e) => events.push(e),
     })).rejects.toThrow(/checksum|mismatch|verify/i);
 
-    const verifyEvents = events.filter((e) => e.stage === "verify");
-    expect(verifyEvents.some((e) => e.state === "error")).toBe(true);
+    // A mismatch surfaces an error event (now in the transfer stage, before rename).
+    expect(events.some((e) => e.state === "error" && /mismatch/i.test(e.text || ""))).toBe(true);
+    // CARDINAL: no final-named file, no manifest, and no leftover temp.
+    const remaining = fs.readdirSync(devicePath);
+    expect(remaining).not.toContain("01_hardfork.mp3");
+    expect(remaining).not.toContain(MANIFEST_FILE);
+    expect(remaining.filter((f) => f.includes(".part-"))).toEqual([]);
   });
 
-  it("aborts mid-transfer, does not proceed to verify, cleans up the partial", async () => {
+  it("aborts mid-transfer, does not proceed to verify, leaves no final file and cleans up the temp", async () => {
     fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("aaaaaaaaaaaaaaa"));
     fs.writeFileSync(path.join(cacheDir, "b.mp3"), Buffer.from("bbbbbbbbbbbbbbb"));
 
     const ctrl = new AbortController();
+    // The transfer loop now copies to a UNIQUE temp (".<final>.part-<runId>-<i>"), so
+    // we key the abort off the SECOND file's temp, not its final name.
     const copyFn = async (src, dest, { onProgress, signal }) => {
-      if (dest.endsWith("02_second.mp3")) {
+      if (dest.includes(".02_second.mp3.part-")) {
         ctrl.abort();
         const err = new Error("aborted"); err.name = "AbortError";
         throw err;
@@ -297,6 +307,256 @@ describe("runSync failures", () => {
 
     const verifyStarted = events.find((e) => e.type === "stage" && e.stage === "verify" && e.state === "active");
     expect(verifyStarted).toBeUndefined();
+    // No final-named partial for the aborted file, and the temp this run created is
+    // best-effort cleaned up. (The first file did land - it was verified + renamed
+    // before the second's abort - which is fine; the run still fails with no manifest.)
+    const remaining = fs.readdirSync(devicePath);
+    expect(remaining).not.toContain("02_second.mp3");
+    expect(remaining.filter((f) => f.includes(".part-"))).toEqual([]);
+    expect(remaining).not.toContain(MANIFEST_FILE);
+  });
+});
+
+// --- Slice 2: crash-safe transfer (copy-temp -> verify -> rename; manifest last) ---
+describe("runSync crash-safe transfer tail", () => {
+  let devicePath, cacheDir;
+  beforeEach(() => { devicePath = mkTmp("os-device-"); cacheDir = mkTmp("os-cache-"); });
+  afterEach(() => { rmTmp(devicePath); rmTmp(cacheDir); });
+
+  // THE slice-2 regression catcher. A copy that fails mid-file (writes a partial to
+  // the temp it is handed, then throws) must leave NO final-named file - only the
+  // temp, which is then cleaned up. If the crash-safety is removed (copy direct to
+  // the final name), a partial final file would survive and this test fails.
+  it("a copy that fails mid-file leaves NO final-named file; the temp is cleaned up", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("the real, complete episode audio"));
+    const copyFn = async (src, dest) => {
+      // Write a partial to the temp, then crash - exactly a mid-transfer detach.
+      fs.writeFileSync(dest, Buffer.from("the real, comp"));
+      throw new Error("device yanked mid-copy");
+    };
+    const queue = [makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" })];
+    await expect(runSync({
+      devicePath, cacheDir, queue, convertFn: async () => {}, copyFn, onEvent: () => {},
+    })).rejects.toThrow(/yanked/);
+
+    const remaining = fs.readdirSync(devicePath);
+    // No final-named file (a partial final would mean a false-complete-looking file).
+    expect(remaining).not.toContain("01_hardfork.mp3");
+    // The temp this run created is best-effort cleaned up.
+    expect(remaining.filter((f) => f.includes(".part-"))).toEqual([]);
+    // And no manifest: the run is never reported complete.
+    expect(remaining).not.toContain(MANIFEST_FILE);
+  });
+
+  // A verify mismatch must abort BEFORE the rename AND before the manifest.
+  it("a verify mismatch aborts before rename and before manifest, leaving no final + no manifest", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("correct payload"));
+    fs.writeFileSync(path.join(cacheDir, "b.mp3"), Buffer.from("also correct"));
+    const copyFn = async (src, dest) => {
+      // Corrupt only the second file's temp so verify-before-rename catches it.
+      if (dest.includes(".02_radiolab.mp3.part-")) fs.writeFileSync(dest, Buffer.from("WRONG"));
+      else fs.copyFileSync(src, dest);
+    };
+    const queue = [
+      makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" }),
+      makeItem({ uuid: "b", show: "RADIOLAB", slot: 2, ext: "mp3", filename: "02_radiolab.mp3" }),
+    ];
+    await expect(runSync({
+      devicePath, cacheDir, queue, convertFn: async () => {}, copyFn, onEvent: () => {},
+    })).rejects.toThrow(/checksum|mismatch|verify/i);
+
+    const remaining = fs.readdirSync(devicePath);
+    // The mismatched file never got a final name, and the manifest was never written
+    // (ANY file failing means the whole transfer failed).
+    expect(remaining).not.toContain("02_radiolab.mp3");
+    expect(remaining).not.toContain(MANIFEST_FILE);
+    expect(remaining.filter((f) => f.includes(".part-"))).toEqual([]);
+  });
+
+  // Manifest is absent whenever ANY file fails.
+  it("the manifest is absent when any file fails", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("good"));
+    fs.writeFileSync(path.join(cacheDir, "b.mp3"), Buffer.from("good too"));
+    const copyFn = async (src, dest) => {
+      if (dest.includes(".02_radiolab.mp3.part-")) throw new Error("second file copy failed");
+      fs.copyFileSync(src, dest);
+    };
+    const queue = [
+      makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" }),
+      makeItem({ uuid: "b", show: "RADIOLAB", slot: 2, ext: "mp3", filename: "02_radiolab.mp3" }),
+    ];
+    await expect(runSync({
+      devicePath, cacheDir, queue, convertFn: async () => {}, copyFn, onEvent: () => {},
+    })).rejects.toThrow(/second file copy failed/);
+    expect(fs.existsSync(path.join(devicePath, MANIFEST_FILE))).toBe(false);
+  });
+
+  // Unique temp names: no collision across files within a run, and a prior run's
+  // leftover temp is never reused (a new runId is minted each run).
+  it("uses unique temp names per file and per run (no collision, no blind reuse)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("aaa"));
+    fs.writeFileSync(path.join(cacheDir, "b.mp3"), Buffer.from("bbb"));
+    // A stale leftover temp from a hypothetical prior run sitting on the device.
+    const staleTemp = path.join(devicePath, ".01_hardfork.mp3.part-stale-run-0");
+    fs.writeFileSync(staleTemp, Buffer.from("garbage from a dead run"));
+
+    const seenTemps = [];
+    const copyFn = async (src, dest) => {
+      seenTemps.push(path.basename(dest));
+      // The temp we copy to must NEVER be the stale leftover (no blind reuse).
+      expect(dest).not.toBe(staleTemp);
+      fs.copyFileSync(src, dest);
+    };
+    const queue = [
+      makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" }),
+      makeItem({ uuid: "b", show: "RADIOLAB", slot: 2, ext: "mp3", filename: "02_radiolab.mp3" }),
+    ];
+    const res = await runSync({
+      devicePath, cacheDir, queue, convertFn: async () => {}, copyFn, onEvent: () => {},
+    });
+    expect(res.ok).toBe(true);
+    // The two files used distinct temp names within the run.
+    expect(new Set(seenTemps).size).toBe(2);
+    // Both finals landed; the run's own temps are gone (renamed away).
+    expect(fs.existsSync(path.join(devicePath, "01_hardfork.mp3"))).toBe(true);
+    expect(fs.existsSync(path.join(devicePath, "02_radiolab.mp3"))).toBe(true);
+  });
+
+  // A manifest write failure must NOT be swallowed into an ok:true / complete result.
+  // The renames all landed (final files exist) but the completion record could not be
+  // written, so the run must FAIL rather than report a completed transfer. The
+  // no-manifest-after-rename state recovers as not-done. We fail ONLY the manifest's
+  // own temp->final rename (spied), so the episode renames before it still land.
+  it("a manifest write failure fails the run (no false-complete after the renames)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode bytes"));
+    const fsp = require("node:fs/promises");
+    const realRename = fsp.rename.bind(fsp);
+    const spy = vi.spyOn(fsp, "rename").mockImplementation(async (from, to) => {
+      if (String(to).endsWith(MANIFEST_FILE)) throw new Error("manifest rename blew up");
+      return realRename(from, to);
+    });
+    try {
+      const queue = [makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" })];
+      const events = [];
+      await expect(runSync({
+        devicePath, cacheDir, queue, convertFn: async () => {}, copyFn: async (s, d) => fs.copyFileSync(s, d),
+        onEvent: (e) => events.push(e),
+      })).rejects.toThrow(/manifest/i);
+
+      // The episode's final file DID land (its rename ran before the manifest), but the
+      // run did NOT report completion - no complete event, no manifest on the device.
+      expect(fs.existsSync(path.join(devicePath, "01_hardfork.mp3"))).toBe(true);
+      expect(fs.existsSync(path.join(devicePath, MANIFEST_FILE))).toBe(false);
+      expect(events.some((e) => e.type === "complete")).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // A prior run's manifest must be invalidated BEFORE the destructive delete/transfer,
+  // so that if THIS run crashes mid-transfer the device carries no manifest claiming
+  // success for a state that has since changed. We simulate the crash by failing the
+  // copy after an existing manifest is present, and assert the old manifest is gone.
+  it("removes the prior manifest before transfer, so a mid-transfer crash leaves none", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("new content"));
+    // A stale manifest from a previous run, plus the file it described.
+    fs.writeFileSync(path.join(devicePath, "09_oldshow.mp3"), Buffer.from("old"));
+    await writeManifest(devicePath, [
+      { uuid: "old", title: "Old", show: "OLD SHOW", filename: "09_oldshow.mp3", sizeMB: 1, durMin: 5, ext: "mp3", slot: 9 },
+    ]);
+    expect(fs.existsSync(path.join(devicePath, MANIFEST_FILE))).toBe(true);
+
+    const copyFn = async () => { throw new Error("yanked before any file landed"); };
+    const queue = [makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" })];
+    await expect(runSync({
+      devicePath, cacheDir, queue, convertFn: async () => {}, copyFn, onEvent: () => {},
+    })).rejects.toThrow(/yanked/);
+
+    // The stale manifest was removed before the transfer crashed: the device now reads
+    // as not-done (no manifest), never as the prior run's still-present success record.
+    expect(fs.existsSync(path.join(devicePath, MANIFEST_FILE))).toBe(false);
+  });
+
+  // The manifest write is atomic: it lands via a temp+rename, so it never leaves a
+  // half-written manifest, and once written no manifest temp survives.
+  it("writes the manifest atomically (no manifest temp left behind on success)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("audio"));
+    const queue = [makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" })];
+    const res = await runSync({ devicePath, cacheDir, queue, convertFn: async () => {}, onEvent: () => {} });
+    expect(res.ok).toBe(true);
+    expect(fs.existsSync(path.join(devicePath, MANIFEST_FILE))).toBe(true);
+    // No manifest .part temp survives the atomic write.
+    expect(fs.readdirSync(devicePath).filter((f) => f.startsWith(MANIFEST_FILE) && f !== MANIFEST_FILE)).toEqual([]);
+  });
+
+  // A cancel that arrives during the manifest write (after the file renames) must not
+  // publish the completion record: the run fails as AbortError and no manifest lands.
+  it("a cancel during the manifest write does not publish a manifest (no false-complete)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode bytes"));
+    const ctrl = new AbortController();
+    const fsp = require("node:fs/promises");
+    const realWriteFile = fsp.writeFile.bind(fsp);
+    // Trip the cancel exactly when the manifest temp is being written - i.e. after the
+    // episode rename, before the manifest's atomic rename.
+    const spy = vi.spyOn(fsp, "writeFile").mockImplementation(async (p, data, opts) => {
+      if (String(p).includes(MANIFEST_FILE)) ctrl.abort();
+      return realWriteFile(p, data, opts);
+    });
+    try {
+      const queue = [makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" })];
+      const events = [];
+      await expect(runSync({
+        devicePath, cacheDir, queue, convertFn: async () => {},
+        copyFn: async (s, d) => fs.copyFileSync(s, d), signal: ctrl.signal,
+        onEvent: (e) => events.push(e),
+      })).rejects.toMatchObject({ name: "AbortError" });
+      // The episode file landed, but no manifest was published and no complete fired.
+      expect(fs.existsSync(path.join(devicePath, "01_hardfork.mp3"))).toBe(true);
+      expect(fs.existsSync(path.join(devicePath, MANIFEST_FILE))).toBe(false);
+      // No manifest temp left behind either.
+      expect(fs.readdirSync(devicePath).filter((f) => f.startsWith(MANIFEST_FILE) && f !== MANIFEST_FILE)).toEqual([]);
+      expect(events.some((e) => e.type === "complete")).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // A legitimately empty source must pass verify (the bytes are sha256-verified before
+  // the rename, so presence - not nonzero size - is the right post-rename check).
+  it("a zero-byte source still completes (verify is presence, not a size gate)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.alloc(0));
+    const queue = [makeItem({ uuid: "a", show: "HARD FORK", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" })];
+    const res = await runSync({ devicePath, cacheDir, queue, convertFn: async () => {}, onEvent: () => {} });
+    expect(res.ok).toBe(true);
+    expect(fs.existsSync(path.join(devicePath, "01_hardfork.mp3"))).toBe(true);
+    expect(fs.statSync(path.join(devicePath, "01_hardfork.mp3")).size).toBe(0);
+    expect(fs.existsSync(path.join(devicePath, MANIFEST_FILE))).toBe(true);
+  });
+
+  // Happy path: the crash-safe tail produces the SAME final files + manifest as before
+  // (temp-then-rename is invisible once it lands).
+  it("happy path produces the same final files and manifest as a direct copy would", async () => {
+    const aBytes = Buffer.from("hard fork episode");
+    const bBytes = Buffer.from("radiolab episode");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), aBytes);
+    fs.writeFileSync(path.join(cacheDir, "b.mp3"), bBytes);
+    const queue = [
+      makeItem({ uuid: "a", show: "HARD FORK", title: "HF", slot: 1, ext: "mp3", filename: "01_hardfork.mp3" }),
+      makeItem({ uuid: "b", show: "RADIOLAB", title: "RL", slot: 2, ext: "mp3", filename: "02_radiolab.mp3" }),
+    ];
+    const events = [];
+    const res = await runSync({
+      devicePath, cacheDir, queue, convertFn: async () => {}, onEvent: (e) => events.push(e),
+    });
+    expect(res.ok).toBe(true);
+    // Final files are byte-identical to the sources, no temps left behind.
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(aBytes)).toBe(true);
+    expect(fs.readFileSync(path.join(devicePath, "02_radiolab.mp3")).equals(bBytes)).toBe(true);
+    expect(fs.readdirSync(devicePath).filter((f) => f.includes(".part-"))).toEqual([]);
+    // Manifest is present and lists both finals.
+    const manifest = await readManifest(devicePath);
+    expect(manifest.map((e) => e.fname).sort()).toEqual(["01_hardfork.mp3", "02_radiolab.mp3"]);
+    expect(events.at(-1).type).toBe("complete");
   });
 });
 
