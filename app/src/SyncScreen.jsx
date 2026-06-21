@@ -8,6 +8,8 @@ import { buildTrimAudioUrls } from "./trimAudio.js";
 import { sentenceLines, preselectFromCuts, toggleSentence, selectedToRanges, selectedCount } from "./transcriptToggle.js";
 import { snapshotInitial, buildCaptureRecords } from "./reviewCapture.js";
 import { commitAndCapture, cancelTransfer } from "./commitCapture.js";
+import { sendDisabled, sendLabel } from "./sendGate.js";
+import { initWaiting, reduceWaiting, bannerVisible } from "./waitingState.js";
 
 // Two visible phases (presentational only - one runSync arc, not two IPC sessions).
 // PREPARING covers the analysis + the review gate; TRANSFERRING covers the device
@@ -192,6 +194,28 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   // raise an overlay over the running view until the user clicks Continue, then
   // call sync.resolveReview() to release the pipeline. `null` = no gate open.
   const [review, setReview] = useState(null);
+  // DEVICE-DECOUPLE (slice 5). The parked "waiting for the headphones" state +
+  // the device-free prepared summary, both derived from the slice-4 event contract
+  // by the reduceWaiting pure reducer. Like the review gate this is a transient
+  // BANNER over the running view, NOT a stage row - so the device-present case
+  // (instant active->done park) never adds a flashing row to the progress tree.
+  // `.active` is true only while parked; any terminal stage clears it.
+  const [waiting, setWaiting] = useState(initWaiting);
+  // A render nudge: bannerVisible debounces the parked banner against the grace
+  // window, so when the wait goes active we schedule ONE re-render just past the
+  // window to flip the banner on (if the wait is still active by then). The
+  // device-present instant case resolves before this fires, so the banner is never
+  // shown - no flash. `waitTick` exists only to force that single re-render.
+  const [waitTick, setWaitTick] = useState(0);
+  useEffect(() => {
+    if (!waiting.active || waiting.since == null) return;
+    const t = setTimeout(() => setWaitTick((n) => n + 1), 420);
+    return () => clearTimeout(t);
+  }, [waiting.active, waiting.since]);
+  // Read against the current clock; waitTick is the re-render trigger (referenced so
+  // the dependency is explicit and not dead).
+  void waitTick;
+  const showWaitingBanner = bannerVisible(waiting);
   // TRANSCRIPT-TOGGLE REDESIGN. The SELECTED (yellow) sentence indices per reviewed
   // episode, keyed by uuid -> Set<number>. The user reviews the whole transcript and
   // toggles sentences in/out; this is the authoritative review state. Seeded from
@@ -243,9 +267,15 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     if (phase !== "running") return;
     const api = window.openswim && window.openswim.sync;
     if (!api) { setError("sync bridge unavailable"); setPhase("error"); return; }
-    if (!devicePath) { setError("no device mounted"); setPhase("error"); return; }
+    // No device gate here any more. The backend preps device-free then PARKS until
+    // the headphones are plugged in (slice 4); a null devicePath at start is fine -
+    // the park gets its device from the watcher, not from spec.devicePath.
 
     const off = api.onEvent((evt) => {
+      // Fold every event into the parked/prepared banner state (no-op for events it
+      // does not recognise). Drives the device-free "N prepared" summary + the
+      // waiting-for-device banner; clears the banner on any terminal stage.
+      setWaiting((w) => reduceWaiting(w, evt));
       if (evt.type === "plan") setServerPlan(evt.plan);
       else if (evt.type === "stage") {
         setStageState((m) => ({ ...m, [evt.stage]: evt.state }));
@@ -294,7 +324,15 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       else { setError((r && r.error && r.error.message) || "sync failed"); setPhase("error"); }
     }).catch((e) => { setError((e && e.message) || "sync failed"); setPhase("error"); });
     return () => off && off();
-  }, [phase, devicePath]);
+    // Keyed on `phase` ONLY. The run must start exactly once when phase -> running.
+    // Before the device-decouple this also depended on devicePath, which was safe
+    // because a run could not start without a device. Now a run can start with a
+    // null device and the headphones get plugged in mid-run; re-firing on a
+    // devicePath change would call api.start() a SECOND time (a double-start). The
+    // backend park takes the device from the watcher, not spec.devicePath, so the
+    // effect deliberately does not react to devicePath.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
 
   // Cancel/abandon. Routes through cancelTransfer (the commit/capture counterpart) so
   // the "capture never fires on cancel" guarantee is structural: this path cannot reach
@@ -515,7 +553,7 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
           subtitle={error || "unknown error"}
           actions={<>
             <Btn variant="ghost" onClick={onBack}>back to line-up</Btn>
-            <Btn variant="cta" onClick={() => { setError(null); setLogByKey({}); setStageState({}); setSteps({}); setServerPlan([]); setPhase("running"); }}>
+            <Btn variant="cta" onClick={() => { setError(null); setLogByKey({}); setStageState({}); setSteps({}); setServerPlan([]); setWaiting(initWaiting()); setPhase("running"); }}>
               RETRY
             </Btn>
           </>}
@@ -533,12 +571,8 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
       <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
         <Toolbar
           label={`Transfer · ${queue.length} ready${skipped.length ? ` · ${skipped.length} skipped` : ""}`}
-          title={!devicePath ? "No headphones connected."
-            : downloadsPending ? "Preparing…"
-            : "Ready when you are."}
-          subtitle={!devicePath
-            ? "Plug in your OpenSwim Pro before transferring."
-            : downloadsPending
+          title={downloadsPending ? "Preparing…" : "Ready when you are."}
+          subtitle={downloadsPending
             ? `Preparing - waiting for ${downloadsPending} download${downloadsPending !== 1 ? "s" : ""} to finish before sending.`
             : [
                 `${totalMB.toFixed(1)}MB across ${queue.length} file${queue.length !== 1 ? "s" : ""}`,
@@ -547,14 +581,15 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
                 playbackSpeed !== 1.0 ? `re-encoding at ${playbackSpeed}× speed` : null,
                 boost ? "volume boost on" : null,
                 skipped.length ? `${skipped.length} skipped (unreachable)` : null,
+                // No device gate any more: prep runs now, transfer happens on
+                // plug-in. Say so plainly when no headphones are connected yet.
+                !devicePath ? "no headphones yet - we'll transfer when you plug in" : null,
               ].filter(Boolean).join(" · ")}
           actions={<>
             <Btn variant="ghost" onClick={onBack}>back to line-up</Btn>
-            <Btn variant="cta" onClick={() => { onArm && onArm(); setPhase("running"); }} disabled={downloadsPending > 0 || !queue.length || !devicePath}>
-              {!devicePath ? "NO HEADPHONES"
-                : downloadsPending ? `WAITING FOR ${downloadsPending} DOWNLOAD${downloadsPending !== 1 ? "S" : ""}`
-                : queue.length ? `SEND · ${queue.length} EP`
-                : "NOTHING LINED UP"}
+            <Btn variant="cta" onClick={() => { onArm && onArm(); setPhase("running"); }}
+              disabled={sendDisabled({ downloadsPending, queueLength: queue.length })}>
+              {sendLabel({ downloadsPending, queueLength: queue.length })}
             </Btn>
           </>}
         />
@@ -646,6 +681,31 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
               <Btn variant="cta" onClick={continueReview} disabled={reviewResolving}>
                 {reviewResolving ? "SAVING…" : "CONTINUE · FINISH TRANSFER"}
               </Btn>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showWaitingBanner && (
+        // PARKED, waiting for the headphones. A non-interactive banner (the only
+        // action is cancel, already in the toolbar) over the running view. It clears
+        // the moment the waiting-for-device stage goes done/cancelled/error, so the
+        // device-present instant case never flashes a stuck banner. The prepared
+        // summary (if it arrived) gives the honest "N episodes prepared" count.
+        <div style={{ margin: "12px 20px 0", padding: "12px 16px",
+          border: "1px solid var(--ct-amber)", background: "var(--ct-amber-ghost, rgba(230,170,80,0.12))",
+          display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--ct-amber)", flexShrink: 0 }}>
+            <span style={{ display: "block", width: "100%", height: "100%" }} />
+          </div>
+          <div style={{ minWidth: 0 }}>
+            <div className="ct-label" style={{ color: "var(--ct-amber)" }}>
+              Prepared - plug in your headphones to transfer
+            </div>
+            <div className="ct-meta" style={{ color: "var(--fg-dim)", marginTop: 3 }}>
+              {waiting.prepared && waiting.prepared.length
+                ? `${waiting.prepared.length} episode${waiting.prepared.length !== 1 ? "s" : ""} prepared and ready. Plug in your OpenSwim Pro and the transfer finishes on its own.`
+                : "Plug in your OpenSwim Pro and the transfer finishes on its own."}
             </div>
           </div>
         </div>
