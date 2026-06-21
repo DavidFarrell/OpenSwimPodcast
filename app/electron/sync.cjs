@@ -119,7 +119,7 @@ async function readManifest(devicePath) {
   return stubs;
 }
 
-async function writeManifest(devicePath, queue) {
+async function writeManifest(devicePath, queue, { signal } = {}) {
   if (!devicePath) return;
   const entries = queue.map((it, i) => ({
     uuid: it.uuid,
@@ -133,7 +133,27 @@ async function writeManifest(devicePath, queue) {
   }));
   const payload = { version: 1, writtenAt: new Date().toISOString(), entries };
   const manifestPath = path.join(devicePath, MANIFEST_FILE);
-  await fsp.writeFile(manifestPath, JSON.stringify(payload, null, 2));
+  // The manifest IS the completion record, so it must land atomically and durably: a
+  // yank mid-write must never leave a truncated/corrupt manifest that readManifest
+  // half-parses. Write to a temp, flush it, then rename - the rename is the atomic
+  // flip, so the manifest either is the old one (or absent) or the complete new one.
+  const tmp = path.join(devicePath, `${MANIFEST_FILE}.part-${crypto.randomUUID()}`);
+  try {
+    await fsp.writeFile(tmp, JSON.stringify(payload, null, 2));
+    // Flush the manifest temp before the rename so the completion record is durable; a
+    // real flush failure propagates (caught below, temp cleaned up) rather than
+    // publishing a manifest whose bytes may not have landed.
+    const fh = await fsp.open(tmp, "r+");
+    try { await fh.datasync(); } finally { await fh.close(); }
+    // A cancel that arrived while the temp was being written/flushed must NOT publish
+    // the completion record: abort before the atomic rename so a cancelled run is
+    // never reported done (the temp is cleaned up below).
+    if (signal && signal.aborted) throw new AbortError();
+    await fsp.rename(tmp, manifestPath);
+  } catch (e) {
+    try { await fsp.unlink(tmp); } catch {}
+    throw e;
+  }
 }
 
 async function sha256File(p) {
@@ -174,6 +194,13 @@ async function defaultCopy(src, dest, { onProgress, signal } = {}) {
     write.on("finish", () => { if (!aborted) resolve(); });
     read.pipe(write);
   });
+  // Durability before the caller renames this temp to its final name: flush the
+  // written bytes to the device so a yank right after the rename cannot expose a
+  // final-named file whose data blocks never reached the USB volume. A real flush
+  // failure (EIO/ENOSPC) is NOT swallowed - it propagates so the copy fails and the
+  // temp is cleaned up, rather than renaming bytes that never durably landed.
+  const fh = await fsp.open(dest, "r+");
+  try { await fh.datasync(); } finally { await fh.close(); }
   return { bytes: totalBytes };
 }
 
@@ -971,6 +998,31 @@ async function runSync({
   // computeRemovals on the same inputs).
   throwIfAborted();
   emit({ type: "stage", stage: "delete", state: "active" });
+  // Invalidate the prior run's manifest BEFORE the destructive delete/transfer begins.
+  // The manifest is the completion record; once we start deleting superseded files and
+  // renaming new ones, any old manifest on the device is stale. Removing it first means
+  // that throughout the crash window (delete .. renames .. new manifest write) the
+  // device carries NO manifest, so a yank recovers as not-done - never as the previous
+  // run's manifest still claiming success for a device state that has since changed. A
+  // missing manifest (ENOENT) is the desired state; ANY OTHER unlink failure must abort
+  // the run here, before the first destructive write, rather than proceed with a stale
+  // manifest that could survive a later crash as a false-complete record.
+  throwIfAborted();
+  let manifestRemoved = false;
+  try { await fsp.unlink(path.join(devicePath, MANIFEST_FILE)); manifestRemoved = true; }
+  catch (e) {
+    if (e && e.code !== "ENOENT") {
+      emit({ type: "log", stage: "delete", state: "error", text: `manifest invalidate: ${e.message}` });
+      throw e;
+    }
+  }
+  // Best-effort flush so the manifest removal itself is durable before any destructive
+  // write: otherwise a yank could leave the old manifest's directory entry on media
+  // alongside changed files - a stale false-complete. Best-effort for the same reason
+  // as the post-rename dir fsync (dir-fsync is non-portable).
+  if (manifestRemoved) {
+    try { const dh = await fsp.open(devicePath); try { await dh.sync(); } finally { await dh.close(); } } catch {}
+  }
   const removals = computeRemovals({ queue, existingDeviceFiles, existingManifest });
   for (const r of removals) {
     throwIfAborted();
@@ -990,49 +1042,108 @@ async function runSync({
   }
   emit({ type: "stage", stage: "delete", state: "done" });
 
-  // Stage: transfer
+  // Stage: transfer (CRASH-SAFE - cardinal-rule-critical).
+  // Per file: copy to a UNIQUE temp, sha256-verify the temp against its source, then
+  // rename to the final name. The rename is the atomic flip, so a final-named file only
+  // ever appears once its bytes are proven good - a mid-transfer detach leaves at most a
+  // partial TEMP, never a final-named partial. The temp suffix carries a per-run runId
+  // (so a prior run's leftover temp is never reused blindly) plus the file index (so
+  // temps are unique across files in a run). Our temps are tracked and best-effort
+  // cleaned up on ANY failure in this tail.
   emit({ type: "stage", stage: "transfer", state: "active" });
   const dests = new Array(queue.length);
-  for (let i = 0; i < queue.length; i++) {
-    throwIfAborted();
-    const it = queue[i];
-    const dest = path.join(devicePath, it.filename);
-    dests[i] = dest;
-    emit({ type: "log", stage: "transfer", state: "active", uuid: it.uuid, text: it.filename });
-    try {
-      await copyFn(sources[i], dest, {
+  const runId = crypto.randomUUID();
+  const tempsToClean = [];
+  const cleanupTemps = async () => {
+    for (const t of tempsToClean) {
+      try { await fsp.unlink(t); } catch {}
+    }
+  };
+  try {
+    for (let i = 0; i < queue.length; i++) {
+      throwIfAborted();
+      const it = queue[i];
+      const dest = path.join(devicePath, it.filename);
+      dests[i] = dest;
+      const temp = path.join(devicePath, `.${it.filename}.part-${runId}-${i}`);
+      tempsToClean.push(temp);
+      emit({ type: "log", stage: "transfer", state: "active", uuid: it.uuid, text: it.filename });
+      // Guard immediately before the copy: an emit above could drive a reentrant
+      // cancel, and no device write may start after a cancel.
+      throwIfAborted();
+      await copyFn(sources[i], temp, {
         signal,
         onProgress: ({ bytes, total }) => emit({
           type: "log", stage: "transfer", state: "active", uuid: it.uuid, text: it.filename,
           bytes, total,
         }),
       });
-    } catch (e) {
-      try { await fsp.unlink(dest); } catch {}
-      emit({ type: "log", stage: "transfer", state: "error", uuid: it.uuid, text: `${it.filename}: ${e.message}` });
-      throw e;
+      // Verify BEFORE the rename so a mismatch aborts with no final file. This is the
+      // only place each file is hashed (no double-hash); the Verify stage below is a
+      // presence check, not a re-hash.
+      const [srcHash, dstHash] = await Promise.all([sha256File(sources[i]), sha256File(temp)]);
+      if (srcHash !== dstHash) {
+        emit({ type: "log", stage: "transfer", state: "error", uuid: it.uuid, text: `${it.filename} checksum mismatch` });
+        throw new Error(`verify failed: checksum mismatch for ${it.filename}`);
+      }
+      // Guard immediately before the rename: a cancel here must leave no final file.
+      throwIfAborted();
+      await fsp.rename(temp, dest);
+      emit({ type: "log", stage: "transfer", state: "done", uuid: it.uuid, text: it.filename });
     }
-    emit({ type: "log", stage: "transfer", state: "done", uuid: it.uuid, text: it.filename });
+  } catch (e) {
+    // Any failure here - copy, verify, rename, or abort - is a failed transfer. Clean
+    // up our temps (never over-throwing the real error) and rethrow; no manifest is
+    // written, so the run is never reported complete.
+    await cleanupTemps();
+    if (!(e && e.name === "AbortError")) {
+      emit({ type: "log", stage: "transfer", state: "error", uuid: undefined, text: e.message });
+    }
+    throw e;
   }
+  // Best-effort flush of the device directory so the rename entries are durable. Kept
+  // best-effort on purpose: opening a directory for fsync is not portable (FAT/exFAT
+  // volumes and some platforms reject it), and the per-file datasync above is the
+  // load-bearing data flush. A failure here does not mean the renames were lost, so it
+  // must not fail an otherwise-verified transfer. Guarded before the side effect so a
+  // reentrant cancel after the last rename does no further device work.
+  throwIfAborted();
+  try { const dh = await fsp.open(devicePath); try { await dh.sync(); } finally { await dh.close(); } } catch {}
   emit({ type: "stage", stage: "transfer", state: "done" });
 
-  // Stage: verify
+  // Stage: verify. Each file was already sha256-verified before its rename, so this
+  // stage is a presence check on the renamed finals (no re-hash). It keeps the per-file
+  // verify events the UI renders and proves every final landed before the manifest.
   emit({ type: "stage", stage: "verify", state: "active" });
   for (let i = 0; i < queue.length; i++) {
     throwIfAborted();
     const it = queue[i];
     emit({ type: "log", stage: "verify", state: "active", uuid: it.uuid, text: it.filename });
-    const [srcHash, dstHash] = await Promise.all([sha256File(sources[i]), sha256File(dests[i])]);
-    if (srcHash !== dstHash) {
-      emit({ type: "log", stage: "verify", state: "error", uuid: it.uuid, text: `${it.filename} checksum mismatch` });
-      throw new Error(`verify failed: checksum mismatch for ${it.filename}`);
+    // Presence check, not a size gate: the bytes were already sha256-verified before
+    // the rename, so a legitimately empty source must still pass here. We only confirm
+    // the renamed final is a regular file that exists.
+    let ok = false;
+    try { ok = (await fsp.stat(dests[i])).isFile(); } catch {}
+    if (!ok) {
+      emit({ type: "log", stage: "verify", state: "error", uuid: it.uuid, text: `${it.filename} missing after rename` });
+      throw new Error(`verify failed: ${it.filename} missing after rename`);
     }
     emit({ type: "log", stage: "verify", state: "done", uuid: it.uuid, text: it.filename });
   }
   emit({ type: "stage", stage: "verify", state: "done" });
 
-  try { await writeManifest(devicePath, queue); }
-  catch (e) { emit({ type: "log", stage: "verify", state: "error", text: `manifest: ${e.message}` }); }
+  // The manifest is the completion record: write it ONLY after every rename landed, and
+  // a write failure must NOT be swallowed into an ok result - we throw so a run that
+  // could not record completion never reports one (no emit:complete, no ok:true). A
+  // cancel seen here also fails the run before the manifest is written, which is the
+  // correct recovery: with no manifest the device reads as not-done.
+  throwIfAborted();
+  try { await writeManifest(devicePath, queue, { signal }); }
+  catch (e) {
+    if (e && e.name === "AbortError") throw e;
+    emit({ type: "log", stage: "verify", state: "error", text: `manifest: ${e.message}` });
+    throw new Error(`manifest write failed: ${e.message}`);
+  }
 
   // Build the AUTHORITATIVE transferred set from the files we actually copied and
   // just checksum-verified on the device - never from the caller's queue, which
