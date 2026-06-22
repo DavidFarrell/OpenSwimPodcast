@@ -60,19 +60,27 @@ describe("TranscriptCutReview - one collapsible panel per episode", () => {
       <TranscriptCutReview uuid="e1" transcript={transcript} trimEntry={trimEntry} selected={preselected()} />
     );
     expect(html).toContain("<details");
-    expect(html).not.toContain("open"); // collapsed unless defaultOpen
+    expect(html).not.toContain("open"); // collapsed unless the `open` prop is true
     expect(html).toContain("transcript-cut-review__summary");
     // Two ad sentences in one detected mid-roll -> "1 mid-roll" and a 1-cut count.
     expect(html).toContain("1 mid-roll");
     expect(html).toContain("1 cut");
   });
 
-  it("opens when defaultOpen is set (the prop still works; the gate now passes false)", () => {
+  it("renders open when the controlled `open` prop is true", () => {
     const html = renderToStaticMarkup(
       <TranscriptCutReview uuid="e1" transcript={transcript} trimEntry={trimEntry}
-        selected={preselected()} defaultOpen />
+        selected={preselected()} open />
     );
     expect(html).toContain("open");
+  });
+
+  it("renders collapsed when `open` is false (the gate default)", () => {
+    const html = renderToStaticMarkup(
+      <TranscriptCutReview uuid="e1" transcript={transcript} trimEntry={trimEntry}
+        selected={preselected()} open={false} />
+    );
+    expect(html).not.toContain("<details open");
   });
 
   it("renders one clickable line per sentence, the whole transcript, in order", () => {
@@ -159,7 +167,7 @@ describe("TranscriptCutReview - binary colour + ⚑ as a SEPARATE annotation axi
       <TranscriptCutReview uuid="e1" transcript={heldTranscript} trimEntry={heldEntry}
         selected={new Set()} />
     );
-    // No auto-open: a held-only panel with defaultOpen unset renders no open attribute.
+    // No auto-open: a held-only panel with `open` unset renders no open attribute.
     expect(html).not.toContain("open");
     // ...but the collapsed summary still carries the held-count cue.
     expect(html).toContain("1 flagged for review");
@@ -236,44 +244,46 @@ describe("TranscriptCutReview - sentence toggle wiring (the editing gesture)", (
   });
 });
 
-describe("TranscriptCutReview - onOpen fires on user open, not on close", () => {
+describe("TranscriptCutReview - onOpenChange reports the native toggle direction", () => {
   function detailsNode(selected = preselected()) {
-    const onOpen = vi.fn();
+    const onOpenChange = vi.fn();
     const tree = renderTree(
       <TranscriptCutReview uuid="ep-o" transcript={transcript} trimEntry={trimEntry}
-        selected={selected} onOpen={onOpen} defaultOpen={false} />
+        selected={selected} onOpenChange={onOpenChange} open={false} />
     );
     // The <details> is the root element of the rendered tree.
-    return { onOpen, details: tree };
+    return { onOpenChange, details: tree };
   }
 
-  it("fires onOpen(uuid) when the panel transitions to OPEN", () => {
-    const { onOpen, details } = detailsNode();
+  it("reports onOpenChange(uuid, true) when the panel transitions to OPEN", () => {
+    const { onOpenChange, details } = detailsNode();
     details.props.onToggle({ target: { open: true } });
-    expect(onOpen).toHaveBeenCalledWith("ep-o");
+    expect(onOpenChange).toHaveBeenCalledWith("ep-o", true);
   });
 
-  it("does NOT fire onOpen when the panel transitions to CLOSED", () => {
-    const { onOpen, details } = detailsNode();
+  it("reports onOpenChange(uuid, false) when the panel transitions to CLOSED", () => {
+    // The component never owns open - it reports the DOM's desired state so the parent's
+    // open-set follows the user's native toggle (this is what avoids the desync).
+    const { onOpenChange, details } = detailsNode();
     details.props.onToggle({ target: { open: false } });
-    expect(onOpen).not.toHaveBeenCalled();
+    expect(onOpenChange).toHaveBeenCalledWith("ep-o", false);
   });
 
-  it("does not throw when no onOpen handler is wired", () => {
+  it("does not throw when no onOpenChange handler is wired", () => {
     const tree = renderTree(
       <TranscriptCutReview uuid="ep-o" transcript={transcript} trimEntry={trimEntry}
-        selected={preselected()} defaultOpen={false} />
+        selected={preselected()} open={false} />
     );
     expect(() => tree.props.onToggle({ target: { open: true } })).not.toThrow();
   });
 
-  it("defaultOpen={false} yields no open attribute even with held cuts (no auto-open)", () => {
+  it("open={false} yields no open attribute even with held cuts (no auto-open)", () => {
     const heldEntry = { cuts: [{ startSec: 600, endSec: 700, needsReview: true, label: "ad" }] };
     const html = renderToStaticMarkup(
       <TranscriptCutReview uuid="e1" transcript={transcript} trimEntry={heldEntry}
-        selected={new Set()} defaultOpen={false} />
+        selected={new Set()} open={false} />
     );
-    expect(html).not.toContain("open");
+    expect(html).not.toContain("<details open");
   });
 });
 

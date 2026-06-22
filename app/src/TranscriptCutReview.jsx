@@ -38,13 +38,15 @@ import { degradeSummary } from "./degradeSummary.js";
 //   onToggleSentence  (uuid, index) => void - toggle one sentence in/out.
 //   audioUrl          the converted-or-original episode file the <audio> previews
 //                     play; previews are disabled (and the ▶ buttons inert) without it.
-//   defaultOpen       start expanded. The SyncScreen gate now passes false for ALL
-//                     panels (every open is a deliberate user action that onOpen
-//                     reports); the held-count summary cue is the nudge, not an
-//                     auto-open. Defaults to false.
-//   onOpen            (uuid) => void - fired when the user opens the panel (the open
-//                     transition of <details>, never on close). The parent dedupes to
-//                     first-open and freezes its capture snapshot there.
+//   open              CONTROLLED open state, owned by SyncScreen (openUuids.has(uuid)).
+//                     The <details open> attribute reflects this prop; the component
+//                     does NOT self-manage open. Every open is a deliberate user (or,
+//                     in slice 4, programmatic) action routed through the parent; the
+//                     held-count summary cue is the collapsed nudge, not an auto-open.
+//   onOpenChange      (uuid, isOpen) => void - fired on the native <details> toggle,
+//                     reporting the DESIRED open/close so the parent's open-set follows
+//                     the user. The parent captures the snapshot on the FIRST open and
+//                     drops the uuid on close (no re-capture, no un-review).
 //   degrade           { degraded, windowsFailed, windowsRun } - the incomplete-detection
 //                     signal. When degraded, a warning row is rendered telling the user
 //                     the cuts shown may be missing some ads. PURELY INFORMATIONAL: it
@@ -55,7 +57,7 @@ import { degradeSummary } from "./degradeSummary.js";
 // DEGRADED episode with zero cuts is surfaced by the parent gate, not here - this
 // panel still needs a cut + a transcript body to be worth opening.)
 export function TranscriptCutReview({
-  uuid, transcript, trimEntry, selected, onToggleSentence, audioUrl, defaultOpen = false, onOpen, degrade,
+  uuid, transcript, trimEntry, selected, onToggleSentence, audioUrl, open = false, onOpenChange, degrade,
 }) {
   const cuts = selectableCuts(trimEntry);
   const lines = sentenceLines(transcript);
@@ -201,11 +203,16 @@ export function TranscriptCutReview({
   });
 
   return (
-    <details className="transcript-cut-review" data-uuid={uuid || ""} {...(defaultOpen ? { open: true } : {})}
-      // onToggle fires on BOTH open and close; report only the open transition. The
-      // parent dedupes to "first open" (it freezes the snapshot then). Since the gate
-      // always passes defaultOpen={false}, every open here is a user action.
-      onToggle={(e) => { if (e.target && e.target.open && onOpen) onOpen(uuid); }}
+    <details className="transcript-cut-review" data-uuid={uuid || ""} open={!!open}
+      // CONTROLLED <details>. The `open` attribute reflects the parent-owned prop, but a
+      // native <details> still toggles itself on a summary click BEFORE React re-renders.
+      // So on every toggle we read e.target.open (the DOM's just-set desired state) and
+      // report it up via onOpenChange; the parent updates its open-set and the `open`
+      // prop follows on the next render. That round-trip is what keeps the DOM and React
+      // in sync - without it, a fixed `open` prop would fight the user's native toggle.
+      // onToggle fires on BOTH open and close, so onOpenChange carries the direction and
+      // the parent decides (capture on first open; just drop the uuid on close).
+      onToggle={(e) => { if (onOpenChange) onOpenChange(uuid, !!(e.target && e.target.open)); }}
       style={{ borderTop: "1px solid var(--rule)", padding: "6px 20px 10px",
         background: "var(--ct-coffee-deep)" }}>
       <summary className="transcript-cut-review__summary"
