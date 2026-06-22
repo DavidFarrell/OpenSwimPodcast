@@ -4,6 +4,27 @@ import {
 } from "./transcriptToggle.js";
 import { previewJoinWindows } from "./cutlistReview.js";
 import { degradeSummary } from "./degradeSummary.js";
+import { paintDecision } from "./dragPaint.js";
+
+// Drag-paint gesture state (slice 5). MODULE-level, not a per-render object, for two
+// reasons: (a) only ONE pointer drag can be active across the whole document at a
+// time, so a singleton is the honest model; (b) the component uses no hooks, so a
+// per-render `{current}` object would be re-created on every re-render and lose the
+// in-flight gesture exactly when a paint toggles `selected` and re-renders the panel.
+// All gesture state lives here (a module ref) and never in React state - React
+// batching may not have committed before the next pointer event, which would make a
+// state read stale and miss lines. `painted` records indices toggled THIS gesture so
+// a line resolved twice toggles once and the decision stays correct against the
+// canonical parent set. `cleanup` detaches the document listeners + restores
+// user-select; it is the single teardown for pointerup AND pointercancel.
+// Exported as `__gesture` so the gesture tests can white-box the singleton (assert the
+// active-panel scope and the re-entrant teardown without a real DOM). Not part of the
+// component's public API - the leading underscore marks it internal.
+export const __gesture = {
+  dragging: false, uuid: null, pointerId: null, bodyEl: null, paintWantsSelected: false,
+  visited: null, painted: null, lastIndex: null, cleanup: null,
+};
+const gesture = __gesture;
 
 // Unified per-episode transcript-toggle review surface (redesign of CutlistReview +
 // TranscriptEvidence). ONE collapsible panel per episode that has cuts. The header
@@ -154,6 +175,169 @@ export function TranscriptCutReview({
 
   const toggle = (index) => { if (onToggleSentence) onToggleSentence(uuid, index); };
 
+  // Ref to the scrollable transcript body so a drag can suppress native text
+  // selection on it (user-select: none) - without that, dragging highlights text
+  // instead of painting. Restored when the gesture ends. Plain object ref, no hook.
+  const bodyRef = { current: null };
+
+  // Is a given line index selected RIGHT NOW for the purposes of the gesture? Reads
+  // the canonical parent set first, then overlays the indices already painted THIS
+  // gesture (the parent re-render may not have landed before the next pointermove, so
+  // `sel` can lag). This keeps paintDecision correct on a fast drag.
+  const gestureIsSelected = (index) => {
+    if (gesture.painted && gesture.painted.has(index)) return gesture.paintWantsSelected;
+    return sel.has(index);
+  };
+
+  // Resolve the line index under a pointer event via elementFromPoint + closest
+  // [data-index] - NOT pointerenter/pointerover, whose retargeting is unreliable
+  // across the nested gutter/time/text spans. SCOPED to the panel that started the
+  // gesture: the resolved line must live inside this gesture's own transcript body,
+  // so dragging out of this panel (over another episode's lines, or the modal chrome)
+  // resolves to null and paints nothing - a drag can only ever touch the lines of the
+  // panel it began in. Returns a number or null.
+  const lineIndexAtPoint = (clientX, clientY) => {
+    if (typeof document === "undefined" || !document.elementFromPoint) return null;
+    const el = document.elementFromPoint(clientX, clientY);
+    const line = el && el.closest && el.closest("[data-index]");
+    if (!line) return null;
+    const scope = gesture.bodyEl;
+    if (scope && scope.contains && !scope.contains(line)) return null;
+    const raw = line.getAttribute("data-index");
+    const idx = Number(raw);
+    return Number.isInteger(idx) ? idx : null;
+  };
+
+  // Toggle one line into the paint target, once. Pure decision via paintDecision; the
+  // gesture's `visited`/`painted` bookkeeping makes each line toggle at most once and
+  // keeps the decision correct against the canonical set even as the parent re-renders.
+  const paintOne = (index) => {
+    if (gesture.visited.has(index)) return;
+    gesture.visited.add(index);
+    if (paintDecision(gestureIsSelected(index), gesture.paintWantsSelected)) {
+      gesture.painted.add(index);
+      toggle(index);
+    }
+  };
+
+  // Paint the line under the pointer. Because lines render top-to-bottom in index
+  // order, a FAST move that skips intermediate lines is filled in: paint every index
+  // between the last-resolved line and the new one (inclusive), so a quick flick from
+  // line 0 to line 3 still paints 1 and 2 instead of dropping them (which would read
+  // as data loss). `visited` keeps each filled line a single toggle.
+  const paintAt = (clientX, clientY) => {
+    if (!gesture.dragging) return;
+    const index = lineIndexAtPoint(clientX, clientY);
+    if (index == null) {
+      // Pointer left this panel's lines. Drop the fill anchor so a later re-entry does
+      // NOT bridge the gap and toggle lines the pointer skipped OUTSIDE the panel.
+      gesture.lastIndex = null;
+      return;
+    }
+    const last = gesture.lastIndex;
+    if (last != null && last !== index) {
+      const step = index > last ? 1 : -1;
+      for (let i = last + step; i !== index; i += step) paintOne(i);
+    }
+    paintOne(index);
+    gesture.lastIndex = index;
+  };
+
+  const onLinePointerDown = (e, index, wasSelected) => {
+    // Only paint on a primary-button press. preventDefault so the drag paints instead
+    // of starting a native text selection.
+    if (e.button != null && e.button !== 0) return;
+
+    const pointerId = e.pointerId;
+    // A drag owned by a DIFFERENT live pointer is in progress (a second finger / pen
+    // pressing mid-drag). Ignore the new press entirely: do not preventDefault, do not
+    // toggle, do not hijack the gesture. Only the owning pointer drives or ends a drag.
+    if (gesture.dragging && gesture.pointerId != null && pointerId != null
+      && gesture.pointerId !== pointerId) return;
+
+    if (e.preventDefault) e.preventDefault();
+
+    // Defensive: if a previous gesture is STILL live for THIS pointer (a missed pointerup
+    // / a stale gesture), tear it down FIRST so its document listeners are removed and we
+    // never run two gestures - that would leak listeners and let a stale closure paint.
+    if (gesture.cleanup) gesture.cleanup();
+
+    // The pointerdown TOGGLES the anchor (same as a click) and seeds the gesture: the
+    // paint target is the anchor's NEW state, and the anchor counts as visited+painted
+    // so a release-in-place toggles it exactly once.
+    const wantsSelected = !wasSelected;
+    toggle(index);
+
+    const body = bodyRef.current;
+    // The pointer that owns this gesture - moves/ends from a SECOND pointer (a second
+    // finger / a pen) are ignored, so only the painting pointer drives or ends the paint.
+    gesture.dragging = true;
+    gesture.uuid = uuid;
+    gesture.pointerId = pointerId;
+    gesture.bodyEl = body;            // scope: paint only lines inside this panel's body
+    gesture.paintWantsSelected = wantsSelected;
+    gesture.visited = new Set([index]);
+    gesture.painted = new Set([index]);
+    gesture.lastIndex = index;        // anchor is the start point for fast-drag fill
+
+    // Save any prior inline user-select so we restore it (not blank it) on cleanup, then
+    // suppress text selection on the body for the duration of the drag.
+    const priorUserSelect = body ? body.style.userSelect : "";
+    if (body) body.style.userSelect = "none";
+
+    // A pointer event belongs to THIS gesture only if it carries no pointerId (mouse in
+    // some engines / our tests) or matches the pointer that started the drag. A second
+    // finger / pen must not drive or end the active paint.
+    const isOwner = (ev) => pointerId == null || ev.pointerId == null || ev.pointerId === pointerId;
+    const onMove = (ev) => {
+      if (!isOwner(ev)) return;
+      // Self-heal a MISSED pointerup (e.g. release outside the window): if no button is
+      // down on this move, the drag is over - tear down instead of painting a phantom.
+      if (ev.buttons === 0) { if (gesture.cleanup) gesture.cleanup(); return; }
+      paintAt(ev.clientX, ev.clientY);
+    };
+    // pointerup/pointercancel end the gesture only for the OWNING pointer; a second
+    // pointer's release must not tear down the active drag.
+    const onEnd = (ev) => { if (isOwner(ev || {})) { if (gesture.cleanup) gesture.cleanup(); } };
+    // window blur always ends the gesture (no pointer to own) - the release-off-window backstop.
+    const onBlur = () => { if (gesture.cleanup) gesture.cleanup(); };
+    gesture.cleanup = () => {
+      if (typeof document !== "undefined") {
+        document.removeEventListener("pointermove", onMove);
+        document.removeEventListener("pointerup", onEnd);
+        document.removeEventListener("pointercancel", onEnd);
+      }
+      // A release outside the document never fires document pointerup; window blur is the
+      // backstop that ends the gesture and frees the listeners + restores user-select.
+      if (typeof window !== "undefined") window.removeEventListener("blur", onBlur);
+      if (body) body.style.userSelect = priorUserSelect;
+      gesture.dragging = false;
+      gesture.uuid = null;
+      gesture.pointerId = null;
+      gesture.bodyEl = null;
+      gesture.visited = null;
+      gesture.painted = null;
+      gesture.lastIndex = null;
+      gesture.cleanup = null;
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", onEnd);
+      document.addEventListener("pointercancel", onEnd);
+    }
+    if (typeof window !== "undefined") window.addEventListener("blur", onBlur);
+  };
+
+  // A line's click handler. The toggle is driven by the POINTER path (onLinePointerDown)
+  // so a mouse press-and-release toggles exactly once. But pointerdown does NOT fire on
+  // keyboard activation (Enter/Space on a focused button), which still emits a click with
+  // detail === 0. So onClick toggles ONLY for keyboard activation (detail 0); mouse
+  // clicks (detail >= 1) are already handled by the pointer path and must NOT toggle
+  // again here, or a simple click would double-toggle.
+  const onLineClick = (e, index) => {
+    if (e && e.detail === 0) toggle(index);
+  };
+
   const yellowCount = selectedCount(sel);
   const cutCount = ranges.length;
 
@@ -242,6 +426,7 @@ export function TranscriptCutReview({
       )}
 
       <div className="transcript-cut-review__body"
+        ref={(el) => { bodyRef.current = el; }}
         style={{ maxHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 1 }}>
         {lines.map((line) => {
           const isSel = sel.has(line.index);
@@ -264,7 +449,8 @@ export function TranscriptCutReview({
                 // on the button's accessible NAME so keyboard / screen-reader users don't
                 // lose it. aria-pressed already conveys cut-vs-keep ("pressed" = in cut).
                 aria-label={`${line.time}${isHeld ? ", flagged for review" : ""}: ${line.text}`}
-                onClick={() => toggle(line.index)}
+                onPointerDown={(e) => onLinePointerDown(e, line.index, isSel)}
+                onClick={(e) => onLineClick(e, line.index)}
                 title={lineTitle}
                 style={rowStyle(isSel)}>
                 <span style={gutterStyle} aria-hidden="true">{isHeld ? "⚑" : ""}</span>
