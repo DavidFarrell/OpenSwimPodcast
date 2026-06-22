@@ -402,6 +402,10 @@ function looksLikeContextOverflow(bodyText) {
 //   truncated        - ok but the model hit max_tokens (finish_reason "length").
 //   empty            - ok but the content was blank.
 //   parse-error      - ok with non-blank content that did not parse.
+// When the content DID parse but the model still hit max_tokens, the outcome is
+// { ok: true, parsed, truncated: true } - the ads are usable, but the window was cut
+// short so the run is flagged degraded (the failure-path truncated above is the
+// parse-failed variant; this is the parse-succeeded variant).
 function classifyModelOutcome({ res, data, aborted, bodyText }) {
   if (aborted) return { ok: false, reason: "timeout" };
   if (!res || !res.ok) {
@@ -411,7 +415,15 @@ function classifyModelOutcome({ res, data, aborted, bodyText }) {
 
   const content = extractContent(data);
   const parsed = extractJson(content);
-  if (parsed != null) return { ok: true, parsed };
+  if (parsed != null) {
+    // A "length" finish_reason means the model hit max_tokens. Even when the JSON
+    // still happened to parse, the window was cut short, so its detection may be
+    // incomplete. We KEEP the ads it did find (they were genuinely detected) but
+    // also flag the run truncated so the "detection may be incomplete" warning
+    // surfaces - otherwise an incomplete window masquerades as fully clean.
+    if (finishReason(data) === "length") return { ok: true, parsed, truncated: true };
+    return { ok: true, parsed };
+  }
 
   // A "length" finish_reason means the JSON was cut off mid-stream, whether the
   // content came back blank or as a half-written fragment - that is truncation, not
@@ -798,7 +810,7 @@ async function detectAds({
     ads: [],
     stats: {
       windowsRun: 0, adsReturned: 0, quoteMapFailures: 0,
-      windowsFailed: 0, failureReasons: {}, degraded: false,
+      windowsFailed: 0, windowsTruncated: 0, failureReasons: {}, degraded: false,
     },
   };
 
@@ -824,12 +836,25 @@ async function detectAds({
   let adsReturned = 0;
   let quoteMapFailures = 0;
   let windowsFailed = 0;
+  let windowsTruncated = 0;
   const failureReasons = {};
-  // Record a failed window once, by reason. Additive bookkeeping - the control flow
-  // below still just skips the window, so the cut set is unchanged.
+  const noteReason = (reason) => {
+    failureReasons[reason] = (failureReasons[reason] || 0) + 1;
+  };
+  // Record a SKIPPED window (one that produced no usable ads), once, by reason.
+  // Additive bookkeeping - the control flow below still just skips the window, so
+  // the cut set is unchanged.
   const noteFailure = (reason) => {
     windowsFailed += 1;
-    failureReasons[reason] = (failureReasons[reason] || 0) + 1;
+    noteReason(reason);
+  };
+  // Record a window that DID produce usable ads but whose response was truncated
+  // (max_tokens). Its ads are still applied below; this only marks the run degraded
+  // so the "detection may be incomplete" warning surfaces. Counted separately from
+  // windowsFailed, which keeps its meaning "windows skipped with no usable ads".
+  const noteTruncatedButUsed = () => {
+    windowsTruncated += 1;
+    noteReason("truncated");
   };
 
   for (const wsegs of windows) {
@@ -870,6 +895,15 @@ async function detectAds({
       noteFailure("parse-error");
       logEvent("detect", `window ${windowsRun}/${windows.length}: parsed but no ${detectorMode === "gepa" ? "spans" : "ads"} array (parse-error)`);
       continue;
+    }
+
+    if (outcome.truncated) {
+      // The list parsed and its ads ARE used below, but the model hit max_tokens, so
+      // the reply may have been cut before listing every ad. Flag the run degraded
+      // without dropping any ad. Recorded only here, AFTER the wrong-shape skip, so a
+      // truncated-but-unusable window stays a parse-error failure, not a used window.
+      noteTruncatedButUsed();
+      logEvent("detect", `window ${windowsRun}/${windows.length}: used ads but response was truncated (detection may be incomplete)`);
     }
 
     if (detectorMode === "gepa") {
@@ -977,7 +1011,7 @@ async function detectAds({
         };
       });
 
-  logEvent("detect", `done [${detectorMode}]: ${windowsRun}/${windows.length} windows, ${windowsFailed} failed, ${adsReturned} raw ads, ${quoteMapFailures} quote-map fails -> ${ads.length} final cut(s)`);
+  logEvent("detect", `done [${detectorMode}]: ${windowsRun}/${windows.length} windows, ${windowsFailed} failed, ${windowsTruncated} truncated-but-used, ${adsReturned} raw ads, ${quoteMapFailures} quote-map fails -> ${ads.length} final cut(s)`);
   return {
     ads,
     stats: {
@@ -985,8 +1019,12 @@ async function detectAds({
       adsReturned,
       quoteMapFailures,
       windowsFailed,
+      windowsTruncated,
       failureReasons,
-      degraded: windowsFailed > 0,
+      // A truncated-but-used window produced ads but hit max_tokens, so its reply may
+      // have been cut before every ad was listed. That degrades the run just like a
+      // fully failed window.
+      degraded: windowsFailed > 0 || windowsTruncated > 0,
     },
   };
 }
