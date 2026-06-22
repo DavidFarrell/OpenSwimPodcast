@@ -9,6 +9,7 @@ import { sentenceLines, preselectFromCuts, toggleSentence, selectedToRanges, sel
 import { degradeSummary } from "./degradeSummary.js";
 import { snapshotInitial, buildCaptureRecords } from "./reviewCapture.js";
 import { shouldCaptureOnOpen, nextOpenSet } from "./panelOpen.js";
+import { buildReviewTargets, nextCursor, prevCursor, prevDisabled, nextDisabled } from "./reviewTargets.js";
 import { commitAndCapture, cancelTransfer } from "./commitCapture.js";
 import { sendDisabled, sendLabel } from "./sendGate.js";
 import { initWaiting, reduceWaiting, bannerVisible } from "./waitingState.js";
@@ -232,6 +233,17 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   // (user click now, programmatic nav in slice 4); it captures on first open then adds
   // the uuid. A user close just drops the uuid - it never re-captures or un-reviews.
   const [openUuids, setOpenUuids] = useState(new Set());
+  // FLAGGED NAVIGATION (slice 4). A single cursor (index into reviewTargets) for the
+  // one modal-level Next/Prev navigator that steps through every held cut across all
+  // episodes, in modal-then-time order. A stable index over a fixed target list (it
+  // walks ALL held cuts, not only unreviewed, so it never shrinks as the user toggles).
+  // Navigation only changes HOW the user reaches a line - it adds/removes/changes no
+  // cut (the jump routes through the same idempotent ensurePanelOpen a user click uses).
+  // Starts at the PRE-FIRST sentinel -1: no target is "current" until the user steps,
+  // so the FIRST "next flagged" lands on target 0 (otherwise a single target would be
+  // unreachable - both ends disabled - and a multi-target list would skip target 1).
+  const PRE_FIRST = -1;
+  const [reviewCursor, setReviewCursor] = useState(PRE_FIRST);
   const reviewAudioUrls = useMemo(() => buildTrimAudioUrls(downloadByUuid), [downloadByUuid]);
   // The gate is correct by construction: toggles update ONLY local state while the
   // overlay is open (no incremental IPC), then Continue RE-SENDS the authoritative
@@ -304,6 +316,8 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
         reviewToggles.current = {};
         // New gate - every panel starts collapsed (observable behaviour unchanged).
         setOpenUuids(new Set());
+        // New gate - reset the flagged-nav cursor to the pre-first sentinel.
+        setReviewCursor(PRE_FIRST);
         const items = Array.isArray(evt.items) ? evt.items : [];
         setReview({ items });
         // Seed each episode's selected (yellow) set from its detector cuts, so the
@@ -399,6 +413,58 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     if (isOpen) ensurePanelOpen(uuid);
     else setOpenUuids((cur) => nextOpenSet(cur, uuid, false));
   };
+
+  // FLAGGED-NAV targets: one { uuid, lineIndex } per held cut, in modal-then-time
+  // order. Pure (buildReviewTargets), recomputed only when the gate's items change -
+  // NOT on toggles, so the target list and the cursor stay stable while the user edits.
+  const reviewTargets = useMemo(
+    () => buildReviewTargets(review ? review.items : []),
+    [review],
+  );
+  // The active target the scroll effect tracks. NULL at the pre-first sentinel (or any
+  // out-of-range cursor) so nothing is scrolled to / treated as current until the user
+  // takes the first step. reviewTargets[-1] is undefined -> null, which is exactly right.
+  const activeTarget = reviewTargets[reviewCursor] || null;
+
+  // Jump to a target: OPEN its panel via the slice-3 ensurePanelOpen (the SAME
+  // idempotent capture-then-open path a user click uses - so a jump correctly, once,
+  // marks the episode reviewed and never alters a cut), then move the cursor. The
+  // scroll itself is a SEPARATE post-commit effect keyed on the active target (below):
+  // ensurePanelOpen owns capture, the effect owns scrolling, never the reverse.
+  const jumpToTarget = (cursor) => {
+    const target = reviewTargets[cursor];
+    if (!target) return;
+    ensurePanelOpen(target.uuid);
+    setReviewCursor(cursor);
+  };
+  // Button enablement, from the RAW cursor (which may be the -1 sentinel) via the pure
+  // sentinel-aware predicates. nextCursor/prevCursor still clamp the landing index.
+  const navPrevDisabled = prevDisabled(reviewCursor, reviewTargets.length);
+  const navNextDisabled = nextDisabled(reviewCursor, reviewTargets.length);
+  // The 1-based position shown in the progress label - 0 while at the pre-first
+  // sentinel (nothing selected yet), else cursor+1.
+  const navPosition = reviewCursor < 0 ? 0 : reviewCursor + 1;
+
+  // Post-commit scroll: after the active target's panel body has mounted, scroll its
+  // line into view. Keyed on the active {uuid, lineIndex} so it re-runs on every nav
+  // step (and after the panel opens). requestAnimationFrame defers to the next frame so
+  // the just-opened <details> body is in the DOM. Guarded - a missing element is a
+  // no-op (the panel may not render, or rAF may be absent in a test env). Scroll-only:
+  // it reads no selection and writes no cut.
+  useEffect(() => {
+    if (!review || !activeTarget) return;
+    const raf = typeof requestAnimationFrame === "function"
+      ? requestAnimationFrame : (cb) => setTimeout(cb, 0);
+    const cancel = typeof cancelAnimationFrame === "function"
+      ? cancelAnimationFrame : clearTimeout;
+    const id = raf(() => {
+      const el = document.querySelector(
+        `[data-uuid="${activeTarget.uuid}"] [data-index="${activeTarget.lineIndex}"]`,
+      );
+      if (el && typeof el.scrollIntoView === "function") el.scrollIntoView({ block: "center" });
+    });
+    return () => cancel(id);
+  }, [review, activeTarget && activeTarget.uuid, activeTarget && activeTarget.lineIndex]);
   // Per-episode final cut ranges = the contiguous selected sentence runs. Computed
   // from the live selection + the episode's sentence lines. This is exactly what
   // gets cut at Continue.
@@ -730,6 +796,30 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
                 );
               })}
             </div>
+            {reviewTargets.length > 0 && (
+              // FLAGGED NAVIGATOR (slice 4). One modal-level Prev/Next that steps
+              // through every held cut across all episodes. Always reachable (it sits
+              // above the actions row). Buttons DISABLE at the ends (clamp, no wrap);
+              // the progress label shows where the cursor is. A jump opens the target's
+              // panel and scrolls to its line - it never changes a cut.
+              <div className="ct-review-nav" style={{ display: "flex", alignItems: "center",
+                gap: 10, padding: "8px 20px", borderTop: "1px solid var(--rule)" }}>
+                <span className="ct-meta" style={{ color: "var(--ct-amber)" }}>
+                  ⚑ Flagged {navPosition} / {reviewTargets.length}
+                </span>
+                <div style={{ flex: 1 }} />
+                <Btn variant="ghost"
+                  onClick={() => jumpToTarget(prevCursor(reviewCursor, reviewTargets.length))}
+                  disabled={reviewResolving || navPrevDisabled}>
+                  ‹ prev flagged
+                </Btn>
+                <Btn variant="ghost"
+                  onClick={() => jumpToTarget(nextCursor(reviewCursor, reviewTargets.length))}
+                  disabled={reviewResolving || navNextDisabled}>
+                  next flagged ›
+                </Btn>
+              </div>
+            )}
             {reviewError && (
               <div className="ct-meta" style={{ color: "var(--ct-error)", padding: "0 20px 8px" }}>
                 ✗ {reviewError}
