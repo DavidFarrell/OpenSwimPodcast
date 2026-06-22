@@ -155,7 +155,8 @@ describe("TranscriptCutReview - binary colour + ⚑ as a SEPARATE annotation axi
     expect((html.match(/data-unreviewed="true"/g) || []).length).toBe(2);
     // ...and the ⚑ glyph is rendered (twice, one per held line).
     expect((html.match(/⚑/g) || []).length).toBeGreaterThanOrEqual(2);
-    // The jump-to button is present with the held count (reachable once opened).
+    // The collapsed-summary held-count cue carries the held count (the per-panel jump
+    // button was removed in slice 4 - one modal-level navigator now).
     expect(html).toContain("flagged for review");
   });
 
@@ -195,6 +196,22 @@ describe("TranscriptCutReview - binary colour + ⚑ as a SEPARATE annotation axi
     expect(html).toContain("flagged for review: This might be sponsored.");
     // A non-held (kept content) line's label has no "flagged for review".
     expect(html).toContain('aria-label="0:00: Welcome to the show."');
+  });
+
+  it("slice 4: the per-panel jump-to-flagged BUTTON is gone, but the ⚑ markers + held cue remain", () => {
+    // One modal-level navigator (SyncScreen) replaces the per-panel jump button. The
+    // panel keeps its nudges: the collapsed-summary held count and the ⚑ gutter markers.
+    const html = renderToStaticMarkup(
+      <TranscriptCutReview uuid="e1" transcript={heldTranscript} trimEntry={heldEntry}
+        selected={new Set()} />
+    );
+    // The jump button and its class are gone.
+    expect(html).not.toContain("transcript-cut-review__jump-flagged");
+    expect(html).not.toContain("jump to");
+    // ...but the held cue survives on the summary...
+    expect(html).toContain("flagged for review");
+    // ...and the ⚑ gutter markers are still rendered (one per held line).
+    expect((html.match(/⚑/g) || []).length).toBeGreaterThanOrEqual(2);
   });
 
   it("a CONFIDENT cut never gets a ⚑ (the marker means 'unsure', not 'will cut')", () => {

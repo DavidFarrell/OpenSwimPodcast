@@ -78,25 +78,18 @@ export function TranscriptCutReview({
   // reachable once the user opens the panel.
   const held = heldLines(lines, trimEntry);
   const heldCount = heldCutCount(trimEntry);
-  const hasUnreviewedHeld = [...held].some((i) => !sel.has(i));
 
   // Plain refs (no hooks) so the component is renderable by a direct function call
   // in tests as well as by React. A callback ref captures the shared <audio>; the
   // ▶ handlers close over it. Mirrors CutlistReview's no-hooks audio approach.
   const audioRef = { current: null };
   const pendingJoin = { current: null };
-  const bodyRef = { current: null };
   const previewsOn = !!audioUrl;
 
-  // Scroll the first unreviewed held line (held AND not yet selected) into view - so the
-  // user can FIND a held cut in a long transcript instead of hunting for it. DOM query
-  // on click (no hook needed); a no-op if the body is not mounted or nothing is held.
-  const jumpToFlagged = () => {
-    const root = bodyRef.current;
-    if (!root) return;
-    const el = root.querySelector('[data-unreviewed="true"]');
-    if (el && typeof el.scrollIntoView === "function") el.scrollIntoView({ block: "center" });
-  };
+  // Navigation to a held cut now lives in ONE modal-level navigator in SyncScreen
+  // (slice 4), not per panel - so the per-panel "jump to first" button is gone. The
+  // ⚑ gutter markers and the collapsed-summary "N flagged for review" cue remain as
+  // the nudge that a cut is held here.
 
   // The first sentence index of each contiguous selected run, so we can show a
   // single ▶ at the head of a run (preview the join across that run) rather than one
@@ -243,24 +236,12 @@ export function TranscriptCutReview({
         </div>
       )}
 
-      {hasUnreviewedHeld && (
-        <button type="button" className="transcript-cut-review__jump-flagged"
-          onClick={jumpToFlagged}
-          title="jump to the first spot the detector flagged for your review"
-          style={{ fontFamily: "var(--font-mono)", fontSize: 10, letterSpacing: ".5px",
-            color: "var(--ct-amber)", background: "transparent", cursor: "pointer",
-            border: "1px solid var(--ct-amber)", borderRadius: 2, padding: "2px 8px",
-            margin: "0 0 8px" }}>
-          ⚑ {heldCount} flagged for review - jump to {heldCount !== 1 ? "first" : "it"}
-        </button>
-      )}
-
       {audioUrl && (
         <audio ref={(el) => { audioRef.current = el; }} src={audioUrl} preload="none"
           className="transcript-cut-review__audio" data-testid="transcript-cut-audio" />
       )}
 
-      <div className="transcript-cut-review__body" ref={(el) => { bodyRef.current = el; }}
+      <div className="transcript-cut-review__body"
         style={{ maxHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 1 }}>
         {lines.map((line) => {
           const isSel = sel.has(line.index);
