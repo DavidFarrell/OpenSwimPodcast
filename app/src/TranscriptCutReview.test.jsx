@@ -235,20 +235,25 @@ describe("TranscriptCutReview - sentence toggle wiring (the editing gesture)", (
     return { onToggleSentence, tree };
   }
 
-  it("clicking a GREY line toggles it (EXTEND - add a line the detector missed)", () => {
+  // Slice 5 moved the mouse toggle to the pointer path (pointerdown), so onClick now
+  // only fires the toggle for KEYBOARD activation (a click with detail 0, no preceding
+  // pointerdown). A bare onClick() - no event - is that keyboard case. The full
+  // mouse-vs-keyboard reconciliation (and the no-double-toggle proof) lives in
+  // transcriptCutReviewDrag.test.jsx.
+  it("keyboard-activating a GREY line toggles it (EXTEND - add a line the detector missed)", () => {
     const { onToggleSentence, tree } = setup(preselected());
-    // Line 3 ("Back to the topic.") is grey; click it.
+    // Line 3 ("Back to the topic.") is grey; activate it via keyboard (detail 0).
     const lineBtns = byClass(tree, /transcript-cut-review__line(?![-\w])/);
     const grey = lineBtns.find((n) => n.props["data-index"] === 3);
-    grey.props.onClick();
+    grey.props.onClick({ detail: 0 });
     expect(onToggleSentence).toHaveBeenCalledWith("ep-x", 3);
   });
 
-  it("clicking a YELLOW line toggles it (SHRINK - keep a wrongly-grabbed line)", () => {
+  it("keyboard-activating a YELLOW line toggles it (SHRINK - keep a wrongly-grabbed line)", () => {
     const { onToggleSentence, tree } = setup(preselected());
     const lineBtns = byClass(tree, /transcript-cut-review__line(?![-\w])/);
     const yellow = lineBtns.find((n) => n.props["data-index"] === 1);
-    yellow.props.onClick();
+    yellow.props.onClick({ detail: 0 });
     expect(onToggleSentence).toHaveBeenCalledWith("ep-x", 1);
   });
 
