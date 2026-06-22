@@ -12,6 +12,9 @@ const {
   buildWindows,
   classifyRange,
   cutId,
+  callModel,
+  classifyModelOutcome,
+  readCappedBody,
   resolveMode,
   gepaLine,
   mapQuoteToOffset,
@@ -1111,5 +1114,398 @@ describe("Slice 1 cut-provenance - quotes on emitted cuts", () => {
     expect(ads[0].reasons).not.toContain("ambiguous-boundary");
     expect(ads[0].firstLineQuote).toBe("Our sponsor today is Acme VPN, the fast one.");
     expect(ads[0].lastLineQuote).toBe("Visit Acme dot com slash deal for a discount.");
+  });
+});
+
+// =====================================================================================
+// SLICE 1 (degraded-detection backend). callModel now returns a typed
+// { ok, parsed } | { ok, reason } outcome via the pure classifyModelOutcome, and
+// detectAds aggregates failed windows into stats.windowsFailed / failureReasons /
+// degraded. The cut set is unchanged (the skip-or-use control flow is the same).
+// =====================================================================================
+
+// Build the choices[].message body classifyModelOutcome reads. content carries the
+// completion text; finishReason sets choices[0].finish_reason.
+function okResponse({ content = "", finishReason } = {}) {
+  const choice = { message: { content } };
+  if (finishReason !== undefined) choice.finish_reason = finishReason;
+  return { res: { ok: true, status: 200 }, data: { choices: [choice] }, aborted: false, bodyText: "" };
+}
+
+describe("classifyModelOutcome() - pure response -> typed outcome", () => {
+  it("aborted -> timeout (no network involved)", () => {
+    expect(classifyModelOutcome({ res: null, data: null, aborted: true })).toEqual({ ok: false, reason: "timeout" });
+  });
+
+  it("finish_reason 'length' with blank content -> truncated", () => {
+    expect(classifyModelOutcome(okResponse({ content: "", finishReason: "length" })))
+      .toEqual({ ok: false, reason: "truncated" });
+  });
+
+  it("finish_reason 'length' with a half-written (unparseable) JSON -> truncated, not parse-error", () => {
+    // The reasoning ramble ate the budget and the JSON was cut mid-stream.
+    expect(classifyModelOutcome(okResponse({ content: '{"ads":[{"first_line":"buy', finishReason: "length" })))
+      .toEqual({ ok: false, reason: "truncated" });
+  });
+
+  it("ok response with blank content (no finish_reason) -> empty", () => {
+    expect(classifyModelOutcome(okResponse({ content: "" })))
+      .toEqual({ ok: false, reason: "empty" });
+  });
+
+  it("ok response with non-blank, unparseable content -> parse-error", () => {
+    expect(classifyModelOutcome(okResponse({ content: "I could not find any ads, sorry." })))
+      .toEqual({ ok: false, reason: "parse-error" });
+  });
+
+  it("ok response with parseable JSON -> { ok: true, parsed }", () => {
+    const out = classifyModelOutcome(okResponse({ content: '{"ads":[]}' }));
+    expect(out.ok).toBe(true);
+    expect(out.parsed).toEqual({ ads: [] });
+  });
+
+  it("a non-ok response whose body mentions context length -> context-exceeded (shape 1: prose)", () => {
+    expect(classifyModelOutcome({
+      res: { ok: false, status: 400 }, data: null, aborted: false,
+      bodyText: "Trying to keep the first 8192 tokens but the prompt exceeds context length of the model.",
+    })).toEqual({ ok: false, reason: "context-exceeded" });
+  });
+
+  it("a non-ok response with an LM-Studio context error CODE -> context-exceeded (shape 2: structured)", () => {
+    // A DIFFERENT shape from the prose body above - a JSON error payload whose code
+    // names the context limit. Both must classify the same way (no overfit to one
+    // string).
+    expect(classifyModelOutcome({
+      res: { ok: false, status: 400 }, data: null, aborted: false,
+      bodyText: '{"error":{"message":"too long","code":"context_length_exceeded"}}',
+    })).toEqual({ ok: false, reason: "context-exceeded" });
+  });
+
+  it("any other non-ok response -> http (not context-exceeded)", () => {
+    expect(classifyModelOutcome({
+      res: { ok: false, status: 500 }, data: null, aborted: false, bodyText: "Internal Server Error",
+    })).toEqual({ ok: false, reason: "http" });
+  });
+
+  it("a missing response -> http", () => {
+    expect(classifyModelOutcome({ res: null, data: null, aborted: false, bodyText: "" }))
+      .toEqual({ ok: false, reason: "http" });
+  });
+
+  it("a normal http error body containing the word 'context' is NOT mis-bucketed as context-exceeded", () => {
+    // 'context' alone (no limit word, no overflow code) must stay http - the context
+    // detector must not false-positive ordinary errors.
+    expect(classifyModelOutcome({
+      res: { ok: false, status: 500 }, data: null, aborted: false,
+      bodyText: '{"error":{"message":"failed to build the request context"}}',
+    })).toEqual({ ok: false, reason: "http" });
+  });
+
+  it("'context' and a limit word FAR APART in the body do NOT mis-bucket as context-exceeded", () => {
+    // The limit word ("maximum") must sit ADJACENT to "context", not just anywhere in
+    // the same body. This unrelated retry error must stay http.
+    expect(classifyModelOutcome({
+      res: { ok: false, status: 500 }, data: null, aborted: false,
+      bodyText: "failed to build the request context; maximum retries exceeded contacting upstream",
+    })).toEqual({ ok: false, reason: "http" });
+  });
+
+  it("adjacent 'context'/'window' (reversed order) still classifies as context-exceeded", () => {
+    expect(classifyModelOutcome({
+      res: { ok: false, status: 400 }, data: null, aborted: false,
+      bodyText: "the request exceeds the model context window",
+    })).toEqual({ ok: false, reason: "context-exceeded" });
+  });
+});
+
+describe("readCappedBody() - bounded, cancellable error-body read", () => {
+  // A streaming body that yields `chunks` one read() at a time and records whether it
+  // was cancelled. Mirrors the web ReadableStream reader shape callModel relies on.
+  function streamBody(chunks) {
+    const enc = new TextEncoder();
+    let i = 0;
+    const reader = {
+      cancelled: false,
+      async read() {
+        if (i >= chunks.length) return { done: true, value: undefined };
+        return { done: false, value: enc.encode(chunks[i++]) };
+      },
+      async cancel() { reader.cancelled = true; },
+    };
+    return { reader, res: { body: { getReader: () => reader } } };
+  }
+
+  it("stops at the cap and cancels the stream without reading the whole body", async () => {
+    // Three 10-char chunks but a 12-char cap: it must read at most two chunks, return
+    // exactly 12 chars, and cancel the reader (so a huge body cannot stall the window).
+    const { reader, res } = streamBody(["0123456789", "ABCDEFGHIJ", "KLMNOPQRST"]);
+    const out = await readCappedBody(res, 12);
+    expect(out).toBe("0123456789AB");
+    expect(reader.cancelled).toBe(true);
+  });
+
+  it("bounds a SINGLE oversized chunk to the cap (does not buffer the whole chunk)", async () => {
+    // One 1000-char chunk, cap 12. The returned string must be exactly 12 chars, so
+    // an oversized untrusted chunk cannot blow the budget in one read.
+    const { reader, res } = streamBody(["Z".repeat(1000)]);
+    const out = await readCappedBody(res, 12);
+    expect(out).toBe("Z".repeat(12));
+    expect(reader.cancelled).toBe(true);
+  });
+
+  it("returns the whole body when it is under the cap", async () => {
+    const { res } = streamBody(["short body"]);
+    expect(await readCappedBody(res, 4096)).toBe("short body");
+  });
+
+  it("falls back to a truncated res.text() when there is no stream reader", async () => {
+    const res = { text: async () => "x".repeat(100) };
+    expect(await readCappedBody(res, 10)).toBe("xxxxxxxxxx");
+  });
+
+  it("returns '' when the response has neither a stream nor text()", async () => {
+    expect(await readCappedBody({}, 10)).toBe("");
+  });
+});
+
+describe("callModel() - reject classification (transport vs parse vs abort)", () => {
+  const lines = ["0. Our show today is brought to you by Acme VPN."];
+
+  it("a thrown res.json() on an OK response classifies as parse-error, not timeout", async () => {
+    // The body arrived (ok response) but is unreadable JSON. That is a parse problem,
+    // not a transport timeout.
+    const fetch = vi.fn(async () => ({ ok: true, json: async () => { throw new Error("Unexpected end of JSON input"); } }));
+    const out = await callModel({ lines, fetch, url: "x", model: "m", timeoutMs: 1000 });
+    expect(out).toEqual({ ok: false, reason: "parse-error" });
+  });
+
+  it("an AbortError from fetch classifies as timeout", async () => {
+    const fetch = vi.fn(async () => {
+      const e = new Error("aborted");
+      e.name = "AbortError";
+      throw e;
+    });
+    const out = await callModel({ lines, fetch, url: "x", model: "m", timeoutMs: 1000 });
+    expect(out).toEqual({ ok: false, reason: "timeout" });
+  });
+
+  it("a non-abort transport reject classifies as http", async () => {
+    const fetch = vi.fn(async () => { throw new Error("ECONNREFUSED"); });
+    const out = await callModel({ lines, fetch, url: "x", model: "m", timeoutMs: 1000 });
+    expect(out).toEqual({ ok: false, reason: "http" });
+  });
+
+  it("a non-ok response whose body names a context overflow classifies as context-exceeded", async () => {
+    const fetch = vi.fn(async () => ({
+      ok: false, status: 400, text: async () => "the prompt exceeds the model's context length",
+    }));
+    const out = await callModel({ lines, fetch, url: "x", model: "m", timeoutMs: 1000 });
+    expect(out).toEqual({ ok: false, reason: "context-exceeded" });
+  });
+
+  it("an abort WHILE reading the non-ok error body still classifies as timeout, not http", async () => {
+    // A cancel/timeout can land after the non-ok headers arrive but before the body
+    // is read. That AbortError during res.text() must surface as timeout.
+    const fetch = vi.fn(async () => ({
+      ok: false,
+      status: 400,
+      text: async () => {
+        const e = new Error("aborted");
+        e.name = "AbortError";
+        throw e;
+      },
+    }));
+    const out = await callModel({ lines, fetch, url: "x", model: "m", timeoutMs: 1000 });
+    expect(out).toEqual({ ok: false, reason: "timeout" });
+  });
+
+  it("a non-abort error WHILE reading the non-ok body falls back to http (empty bodyText)", async () => {
+    const fetch = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      text: async () => { throw new Error("stream broke"); },
+    }));
+    const out = await callModel({ lines, fetch, url: "x", model: "m", timeoutMs: 1000 });
+    expect(out).toEqual({ ok: false, reason: "http" });
+  });
+});
+
+describe("detectAds() - degraded aggregation (stats.windowsFailed / failureReasons / degraded)", () => {
+  // A two-window transcript: segment at 0s (window 0) and at 2000s (window 1). Each
+  // window is a separate model call, so we can fail them independently.
+  const TWO_WINDOW = {
+    segments: [
+      { speaker: "S", start: 0, end: 5, text: "Our show today is brought to you by Acme VPN." },
+      { speaker: "S", start: 2000, end: 2005, text: "Visit Acme dot com slash show for three months free." },
+    ],
+  };
+
+  it("all windows OK -> degraded:false, windowsFailed:0, empty failureReasons", async () => {
+    const { stats } = await detectAds({ transcript: AD_TRANSCRIPT, fetch: fetchReturning([]) });
+    expect(stats.windowsFailed).toBe(0);
+    expect(stats.degraded).toBe(false);
+    expect(stats.failureReasons).toEqual({});
+  });
+
+  it("every window fails -> windowsFailed = N, degraded:true, reason counted", async () => {
+    // Two windows, both a non-ok http response.
+    const fetch = vi.fn(async () => ({ ok: false, status: 500, text: async () => "boom" }));
+    const { ads, stats } = await detectAds({ transcript: TWO_WINDOW, fetch });
+    expect(stats.windowsRun).toBe(2);
+    expect(stats.windowsFailed).toBe(2);
+    expect(stats.degraded).toBe(true);
+    expect(stats.failureReasons).toEqual({ http: 2 });
+    // No cuts produced from failed windows.
+    expect(ads).toEqual([]);
+  });
+
+  it("a context-overflow failure is counted under context-exceeded", async () => {
+    const fetch = vi.fn(async () => ({
+      ok: false, status: 400,
+      text: async () => "the prompt exceeds context length of the model",
+    }));
+    const { stats } = await detectAds({ transcript: AD_TRANSCRIPT, fetch });
+    expect(stats.degraded).toBe(true);
+    expect(stats.failureReasons).toEqual({ "context-exceeded": 1 });
+  });
+
+  it("an aborted fetch (AbortError) is counted under timeout", async () => {
+    // The detector's own timeout / an external cancel aborts the controller, so fetch
+    // rejects with an AbortError. That is the only reject that means "timeout".
+    const fetch = vi.fn(async () => {
+      const e = new Error("The operation was aborted");
+      e.name = "AbortError";
+      throw e;
+    });
+    const { stats } = await detectAds({ transcript: AD_TRANSCRIPT, fetch });
+    expect(stats.degraded).toBe(true);
+    expect(stats.failureReasons).toEqual({ timeout: 1 });
+  });
+
+  it("a non-abort transport reject (DNS / connection refused) is counted under http, not timeout", async () => {
+    // A plain reject is NOT an abort - it is a transport failure and must not be
+    // mislabelled as model-pressure timeout.
+    const fetch = vi.fn(async () => { throw new Error("ECONNREFUSED"); });
+    const { stats } = await detectAds({ transcript: AD_TRANSCRIPT, fetch });
+    expect(stats.degraded).toBe(true);
+    expect(stats.failureReasons).toEqual({ http: 1 });
+  });
+
+  it("mixed reasons across windows accumulate separately", async () => {
+    let call = 0;
+    const fetch = vi.fn(async () => {
+      call += 1;
+      if (call === 1) {
+        const e = new Error("aborted");
+        e.name = "AbortError";
+        throw e; // window 0 -> timeout
+      }
+      return { ok: false, status: 500, text: async () => "boom" }; // window 1 -> http
+    });
+    const { stats } = await detectAds({ transcript: TWO_WINDOW, fetch });
+    expect(stats.windowsFailed).toBe(2);
+    expect(stats.failureReasons).toEqual({ timeout: 1, http: 1 });
+  });
+
+  it("one failed + one OK window -> degraded:true with the surviving window's ads intact", async () => {
+    // Window 0 fails (http); window 1 returns a clean ad. The ad survives AND the run
+    // is marked degraded - the exact "looks clean but isn't" case this slice fixes.
+    const segments = [
+      { speaker: "S", start: 0, end: 5, text: "early chatter that is not an ad" },
+      { speaker: "S", start: 2000, end: 2005, text: "Our show today is brought to you by Acme VPN." },
+      { speaker: "S", start: 2010, end: 2015, text: "Visit Acme dot com slash show for three months free." },
+    ];
+    let call = 0;
+    const fetch = vi.fn(async () => {
+      call += 1;
+      if (call === 1) return { ok: false, status: 500, text: async () => "boom" };
+      return {
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: JSON.stringify({
+          ads: [{
+            first_line: "Our show today is brought to you by Acme VPN.",
+            last_line: "Visit Acme dot com slash show for three months free.",
+          }],
+        }) } }] }),
+      };
+    });
+    const { ads, stats } = await detectAds({ transcript: { segments }, fetch });
+    expect(stats.windowsFailed).toBe(1);
+    expect(stats.degraded).toBe(true);
+    expect(stats.failureReasons).toEqual({ http: 1 });
+    expect(ads).toHaveLength(1);
+    expect(ads[0].startIndex).toBe(1);
+  });
+
+  it("the catastrophic-empty return carries the degraded stats fields (no transcript)", async () => {
+    const { stats } = await detectAds({ transcript: null, fetch: fetchReturning([]) });
+    expect(stats.windowsFailed).toBe(0);
+    expect(stats.degraded).toBe(false);
+    expect(stats.failureReasons).toEqual({});
+  });
+
+  it("a truncated (finish_reason length) window produces no cut and is counted under truncated", async () => {
+    // The model hit max_tokens before closing the JSON: ok response, no parseable
+    // content. It must skip (no cut) AND be named truncated, not look like a clean
+    // empty result.
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ choices: [{ finish_reason: "length", message: { content: '{"ads":[' } }] }),
+    }));
+    const { ads, stats } = await detectAds({ transcript: AD_TRANSCRIPT, fetch });
+    expect(ads).toEqual([]);
+    expect(stats.degraded).toBe(true);
+    expect(stats.failureReasons).toEqual({ truncated: 1 });
+  });
+
+  it("legacy: parseable JSON missing the ads array (wrong shape) produces no cut and counts parse-error", async () => {
+    // A strict json_schema makes this rare, not impossible. A parsed body with no
+    // `ads` key must skip (never cut) and be recorded as a parse-error window - so
+    // deleting the wrong-shape guard fails here for a real reason.
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: '{"unexpected":true}' } }] }),
+    }));
+    const { ads, stats } = await detectAds({ transcript: AD_TRANSCRIPT, fetch });
+    expect(ads).toEqual([]);
+    expect(stats.degraded).toBe(true);
+    expect(stats.failureReasons).toEqual({ "parse-error": 1 });
+  });
+});
+
+describe("SLICE 1 BEHAVIOUR-NEUTRAL: the cut set is byte-identical to before the degraded signal", () => {
+  // The whole point of slice 1 is additive stats. For a NON-degraded run the emitted
+  // ads array must be exactly what detectAds produced before this change. We assert
+  // the full cut object so a regression in boundaries/needsReview/quotes fails here.
+  it("legacy: a clean ad still maps to the same indices, times, needsReview, quotes", async () => {
+    const { ads, stats } = await detectAds({
+      transcript: AD_TRANSCRIPT,
+      fetch: fetchReturning([{
+        first_line: "Our show today is brought to you by Acme VPN.",
+        last_line: "Visit Acme dot com slash show for three months free.",
+      }]),
+    });
+    expect(ads).toEqual([{
+      startIndex: 1,
+      endIndex: 2,
+      startSec: 4,
+      endSec: 14,
+      needsReview: false,
+      reasons: [],
+      firstLineQuote: "Our show today is brought to you by Acme VPN.",
+      lastLineQuote: "Visit Acme dot com slash show for three months free.",
+    }]);
+    // Non-degraded run: degraded false, no failures - the cut set stands alone.
+    expect(stats.degraded).toBe(false);
+    expect(stats.windowsFailed).toBe(0);
+  });
+
+  it("a content-only window still yields zero cuts (no phantom degradation)", async () => {
+    // An ok response that genuinely found no ads must NOT count as a failed window -
+    // empty ads is a SUCCESS, not a degraded run.
+    const { ads, stats } = await detectAds({ transcript: AD_TRANSCRIPT, fetch: fetchReturning([]) });
+    expect(ads).toEqual([]);
+    expect(stats.degraded).toBe(false);
+    expect(stats.windowsFailed).toBe(0);
   });
 });

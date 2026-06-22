@@ -368,14 +368,119 @@ function buildWindows(segments) {
   return windows;
 }
 
-// Call the LLM for one window. Returns the parsed object (legacy {ads:[...]} or
-// gepa {spans:[...]}) or null on any failure (network, non-ok, unparseable).
-// Degrades safely; never throws. The system prompt and the response schema are
-// chosen by `mode` (legacy default keeps VERIFY_INSTRUCTION + ADS_SCHEMA exactly).
+// Does this non-ok response body look like the prompt overflowed the model's
+// context? Matched conservatively so an unrelated error that merely mentions a
+// request "context" and a stray "maximum"/"exceeded" elsewhere does not
+// false-positive. Filler between the two words may not cross a clause boundary
+// (comma / semicolon / newline), which is what separates "context length exceeded"
+// (real) from "request context; maximum retries exceeded" (not). bodyText is the raw
+// error body (may be "").
+//
+// "context" paired with a SIZE word names the limit itself ("context length /
+// window / size"). "overflow" / "exceed*" / "too long" are overflow VERBS that count
+// next to "context" on either side. Bare "maximum" alone is too generic to qualify.
+const CLAUSE = "[^,;\\n]*?"; // same-clause filler only
+const CONTEXT_OVERFLOW_RE = new RegExp(
+  `context${CLAUSE}\\b(?:length|window|size|overflow|exceed(?:s|ed|ing)?|too long)\\b`
+  + `|\\b(?:overflow|exceed(?:s|ed|ing)?|too long)\\b${CLAUSE}context`,
+);
+function looksLikeContextOverflow(bodyText) {
+  const t = String(bodyText || "").toLowerCase();
+  if (CONTEXT_OVERFLOW_RE.test(t)) return true;
+  // Structured: an error code/type explicitly naming a context-length overflow.
+  if (/"(?:code|type)"\s*:\s*"[^"]*context[_ ]?length[^"]*"/i.test(t)) return true;
+  return false;
+}
+
+// Classify an already-resolved model response into a typed outcome. PURE - no
+// network. Returns { ok: true, parsed } or { ok: false, reason } with one of six
+// distinct reasons. The reason exists so a degraded run can name its cause; the cut
+// path only ever cares about ok vs not-ok.
+//   timeout          - the request was aborted (caller sets aborted).
+//   context-exceeded - non-ok whose body looks like a context overflow.
+//   http             - any other non-ok (or missing) response.
+//   truncated        - ok but the model hit max_tokens (finish_reason "length").
+//   empty            - ok but the content was blank.
+//   parse-error      - ok with non-blank content that did not parse.
+function classifyModelOutcome({ res, data, aborted, bodyText }) {
+  if (aborted) return { ok: false, reason: "timeout" };
+  if (!res || !res.ok) {
+    if (looksLikeContextOverflow(bodyText)) return { ok: false, reason: "context-exceeded" };
+    return { ok: false, reason: "http" };
+  }
+
+  const content = extractContent(data);
+  const parsed = extractJson(content);
+  if (parsed != null) return { ok: true, parsed };
+
+  // A "length" finish_reason means the JSON was cut off mid-stream, whether the
+  // content came back blank or as a half-written fragment - that is truncation, not
+  // a blank or malformed answer.
+  if (finishReason(data) === "length") return { ok: false, reason: "truncated" };
+  if (!content) return { ok: false, reason: "empty" };
+  return { ok: false, reason: "parse-error" };
+}
+
+function finishReason(data) {
+  const choice = data && data.choices && data.choices[0];
+  return choice && typeof choice.finish_reason === "string" ? choice.finish_reason : "";
+}
+
+// True when an error (or the controller state) is an abort, not a transport failure.
+// A timed-out / externally-cancelled request must classify as timeout; a DNS or
+// connection-refused reject must not.
+function isAbortError(err, controller) {
+  if (controller && controller.signal && controller.signal.aborted) return true;
+  return !!err && (err.name === "AbortError" || err.code === "ABORT_ERR");
+}
+
+// Cap on how much of a non-ok error body we read for context-overflow classification.
+// The body is untrusted and only used for a substring/regex match, so a short prefix
+// is enough and bounds memory.
+const ERROR_BODY_MAX_CHARS = 4096;
+
+// Read at most `cap` bytes of a (non-ok, untrusted) response body for classification,
+// cancelling the stream once the cap is reached so a huge or slow error body cannot
+// stall the window or balloon memory. Streams when res.body exposes a reader; falls
+// back to res.text() (truncated) when it does not (e.g. test mocks). Returns "" on any
+// read failure - the caller treats a missing body as a plain http failure. A read
+// rejection is RE-THROWN so the caller can tell an abort (timeout) from a benign read
+// error.
+async function readCappedBody(res, cap) {
+  const reader = res && res.body && typeof res.body.getReader === "function"
+    ? res.body.getReader()
+    : null;
+  if (!reader) {
+    if (res && typeof res.text === "function") {
+      return String(await res.text()).slice(0, cap);
+    }
+    return "";
+  }
+  const decoder = new TextDecoder();
+  let out = "";
+  try {
+    while (out.length < cap) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      // Slice each decoded chunk to the remaining budget before appending, so a
+      // single oversized chunk cannot buffer more than the cap.
+      const chunk = decoder.decode(value, { stream: true });
+      out += chunk.slice(0, cap - out.length);
+    }
+  } finally {
+    try { await reader.cancel(); } catch {}
+  }
+  return out;
+}
+
+// Call the LLM for one window. Returns a TYPED outcome: { ok: true, parsed } (legacy
+// {ads:[...]} or gepa {spans:[...]}) or { ok: false, reason }. Degrades safely; never
+// throws. The system prompt and response schema are chosen by `mode` (legacy default
+// keeps VERIFY_INSTRUCTION + ADS_SCHEMA exactly).
 async function callModel({
   lines, fetch, url, model, timeoutMs, signal, mode,
 }) {
-  if (typeof fetch !== "function") return null;
+  if (typeof fetch !== "function") return { ok: false, reason: "http" };
   const user = lines.join("\n");
   const resolved = resolveMode(mode);
   const system = resolved === "gepa" ? GEPA_INSTRUCTION : VERIFY_INSTRUCTION;
@@ -402,18 +507,43 @@ async function callModel({
     ],
   };
 
+  // The transport call. A reject here is either an abort (timeout) or a transport
+  // failure (DNS, connection refused) - never a parse problem, so it is classified
+  // separately from the body read below.
+  let res;
   try {
-    const res = await fetch(url, {
+    res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
       signal: controller ? controller.signal : undefined,
     });
-    if (!res || !res.ok) return null;
+  } catch (err) {
+    if (timer) clearTimeout(timer);
+    return { ok: false, reason: isAbortError(err, controller) ? "timeout" : "http" };
+  }
+
+  try {
+    if (!res || !res.ok) {
+      // Read a capped prefix of the (untrusted) error body so a context overflow can
+      // be told apart from a plain http failure. A read aborted by our own timeout or
+      // an external cancel still means timeout; any other read failure just leaves
+      // bodyText "" and classifies as http.
+      let bodyText = "";
+      try {
+        bodyText = await readCappedBody(res, ERROR_BODY_MAX_CHARS);
+      } catch (err) {
+        if (isAbortError(err, controller)) return { ok: false, reason: "timeout" };
+      }
+      return classifyModelOutcome({ res, data: null, aborted: false, bodyText });
+    }
+    // A throw from res.json() is a malformed body on an ok response - parse-error,
+    // not a timeout.
     const data = await res.json();
-    return extractJson(extractContent(data));
-  } catch {
-    return null;
+    return classifyModelOutcome({ res, data, aborted: false, bodyText: "" });
+  } catch (err) {
+    if (isAbortError(err, controller)) return { ok: false, reason: "timeout" };
+    return { ok: false, reason: "parse-error" };
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -632,11 +762,16 @@ function cutId(startSec, endSec, label) {
 // Detect ads across the whole transcript. Returns:
 //   {
 //     ads: [{ startIndex, endIndex, startSec, endSec, needsReview, reasons }],
-//     stats: { windowsRun, adsReturned, quoteMapFailures },
+//     stats: {
+//       windowsRun, adsReturned, quoteMapFailures,
+//       windowsFailed, failureReasons, degraded,
+//     },
 //   }
-// where each ad is a contiguous segment-index range. On any catastrophic failure
-// (no transcript, no fetch) it returns an empty ads list - no cuts. Per-window and
-// per-ad failures are isolated so one bad window never loses the rest.
+// `windowsFailed` / `failureReasons` / `degraded` are informational only - a failed
+// window is skipped exactly as before, so the cut set is unchanged. Each ad is a
+// contiguous segment-index range. On any catastrophic failure (no transcript, no
+// fetch) it returns an empty ads list - no cuts. Per-window and per-ad failures are
+// isolated so one bad window never loses the rest.
 async function detectAds({
   transcript,
   // Default to the process global fetch. Previously this was undefined when the
@@ -659,7 +794,13 @@ async function detectAds({
   signal,
 } = {}) {
   const detectorMode = resolveMode(mode);
-  const empty = { ads: [], stats: { windowsRun: 0, adsReturned: 0, quoteMapFailures: 0 } };
+  const empty = {
+    ads: [],
+    stats: {
+      windowsRun: 0, adsReturned: 0, quoteMapFailures: 0,
+      windowsFailed: 0, failureReasons: {}, degraded: false,
+    },
+  };
 
   const segments = toSegments(transcript);
   if (segments.length === 0) {
@@ -682,6 +823,14 @@ async function detectAds({
   let windowsRun = 0;
   let adsReturned = 0;
   let quoteMapFailures = 0;
+  let windowsFailed = 0;
+  const failureReasons = {};
+  // Record a failed window once, by reason. Additive bookkeeping - the control flow
+  // below still just skips the window, so the cut set is unchanged.
+  const noteFailure = (reason) => {
+    windowsFailed += 1;
+    failureReasons[reason] = (failureReasons[reason] || 0) + 1;
+  };
 
   for (const wsegs of windows) {
     windowsRun += 1;
@@ -693,22 +842,33 @@ async function detectAds({
       ? wsegs.map((i) => gepaLine(i, segments[i]))
       : wsegs.map((i) => `${i}. ${segments[i].text}`);
 
-    let parsed = null;
+    let outcome;
     try {
-      parsed = await callModel({ lines, fetch, url, model, timeoutMs, signal, mode: detectorMode });
+      outcome = await callModel({ lines, fetch, url, model, timeoutMs, signal, mode: detectorMode });
     } catch {
-      // callModel already swallows its own errors, but guard anyway - one bad
-      // window must never abort the rest of the episode.
-      parsed = null;
+      // callModel is contracted never to throw; this guard only catches an
+      // implementation bug, so it is bucketed as http (not as model pressure) and
+      // the window is skipped - one bad window must never abort the episode.
+      outcome = { ok: false, reason: "http" };
     }
+    if (!outcome || !outcome.ok) {
+      // A failed window is skipped exactly as before; we now also record WHY so a
+      // degraded run is not invisible (the silent "looks like no ads" path).
+      const reason = outcome && outcome.reason ? outcome.reason : "http";
+      noteFailure(reason);
+      logEvent("detect", `window ${windowsRun}/${windows.length}: model returned nothing (${reason})`);
+      continue;
+    }
+    const parsed = outcome.parsed;
     const list = detectorMode === "gepa"
       ? (parsed && Array.isArray(parsed.spans) ? parsed.spans : null)
       : (parsed && Array.isArray(parsed.ads) ? parsed.ads : null);
     if (!list) {
-      // A window the model could not answer (timeout, error, bad shape). This is
-      // the silent-failure path that made detection look like "no ads" under GPU
-      // contention - log it so an empty result is never invisible again.
-      logEvent("detect", `window ${windowsRun}/${windows.length}: model returned nothing (timeout/error/bad shape)`);
+      // Parsed JSON missing the expected ads/spans array. The strict json_schema
+      // makes this rare, but it is not a runtime guarantee, so count the wrong-shape
+      // window as a parse-error and skip it.
+      noteFailure("parse-error");
+      logEvent("detect", `window ${windowsRun}/${windows.length}: parsed but no ${detectorMode === "gepa" ? "spans" : "ads"} array (parse-error)`);
       continue;
     }
 
@@ -817,8 +977,18 @@ async function detectAds({
         };
       });
 
-  logEvent("detect", `done [${detectorMode}]: ${windowsRun}/${windows.length} windows, ${adsReturned} raw ads, ${quoteMapFailures} quote-map fails -> ${ads.length} final cut(s)`);
-  return { ads, stats: { windowsRun, adsReturned, quoteMapFailures } };
+  logEvent("detect", `done [${detectorMode}]: ${windowsRun}/${windows.length} windows, ${windowsFailed} failed, ${adsReturned} raw ads, ${quoteMapFailures} quote-map fails -> ${ads.length} final cut(s)`);
+  return {
+    ads,
+    stats: {
+      windowsRun,
+      adsReturned,
+      quoteMapFailures,
+      windowsFailed,
+      failureReasons,
+      degraded: windowsFailed > 0,
+    },
+  };
 }
 
 module.exports = {
@@ -832,6 +1002,8 @@ module.exports = {
   classifyRange,
   cutId,
   callModel,
+  classifyModelOutcome,
+  readCappedBody,
   // gepa mode (selectable; legacy stays the default)
   resolveMode,
   gepaLine,
