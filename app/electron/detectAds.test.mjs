@@ -1162,6 +1162,15 @@ describe("classifyModelOutcome() - pure response -> typed outcome", () => {
     const out = classifyModelOutcome(okResponse({ content: '{"ads":[]}' }));
     expect(out.ok).toBe(true);
     expect(out.parsed).toEqual({ ads: [] });
+    // No finish_reason "length" -> not truncated.
+    expect(out.truncated).toBeUndefined();
+  });
+
+  it("finish_reason 'length' with parseable JSON -> { ok: true, parsed, truncated: true }", () => {
+    // The model hit max_tokens but the JSON still parsed: the ads are usable, but the
+    // window was cut short, so the outcome is ok AND flagged truncated (degraded).
+    const out = classifyModelOutcome(okResponse({ content: '{"ads":[]}', finishReason: "length" }));
+    expect(out).toEqual({ ok: true, parsed: { ads: [] }, truncated: true });
   });
 
   it("a non-ok response whose body mentions context length -> context-exceeded (shape 1: prose)", () => {
@@ -1507,5 +1516,92 @@ describe("SLICE 1 BEHAVIOUR-NEUTRAL: the cut set is byte-identical to before the
     expect(ads).toEqual([]);
     expect(stats.degraded).toBe(false);
     expect(stats.windowsFailed).toBe(0);
+  });
+});
+
+describe("SLICE 6: a truncated-but-PARSED window keeps its ads AND flags the run degraded", () => {
+  // An ok response whose JSON parsed but whose finish_reason was "length" - the model
+  // hit max_tokens yet still produced usable ads. Its ads must be applied (cut set
+  // unchanged) AND the run flagged degraded, so an incomplete window stops looking
+  // fully clean.
+  function fetchTruncatedAds(ads) {
+    const content = JSON.stringify({ ads });
+    return vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ choices: [{ finish_reason: "length", message: { content } }] }),
+    }));
+  }
+
+  const AD_QUOTES = [{
+    first_line: "Our show today is brought to you by Acme VPN.",
+    last_line: "Acme encrypts everything. Visit Acme dot com slash show for three months free.",
+  }];
+
+  it("its ads ARE in the output, degraded is true, and truncated is counted", async () => {
+    const { ads, stats } = await detectAds({ transcript: AD_TRANSCRIPT, fetch: fetchTruncatedAds(AD_QUOTES) });
+    expect(ads).toHaveLength(1);
+    expect(ads[0].startIndex).toBe(1);
+    expect(stats.degraded).toBe(true);
+    expect(stats.windowsTruncated).toBe(1);
+    // A truncated-but-used window is NOT a skipped failure.
+    expect(stats.windowsFailed).toBe(0);
+    expect(stats.failureReasons).toEqual({ truncated: 1 });
+  });
+
+  it("BEHAVIOUR-NEUTRAL: the cut set is byte-identical to the non-truncated baseline", async () => {
+    // Same quotes, same transcript: the only difference is the finish_reason "length"
+    // flag. The emitted cut object must be exactly equal - the truncated flag only
+    // moves stats.degraded, never a cut.
+    const baseline = await detectAds({ transcript: AD_TRANSCRIPT, fetch: fetchReturning(AD_QUOTES) });
+    const truncated = await detectAds({ transcript: AD_TRANSCRIPT, fetch: fetchTruncatedAds(AD_QUOTES) });
+    // toStrictEqual (not toEqual) so property order / undefined differences would fail
+    // too - the cut set must be identical, not merely deep-equal.
+    expect(truncated.ads).toStrictEqual(baseline.ads);
+    // Byte-level proof: the serialized cut set is character-identical.
+    expect(JSON.stringify(truncated.ads)).toBe(JSON.stringify(baseline.ads));
+    // ...but the truncated run is degraded where the baseline is not.
+    expect(baseline.stats.degraded).toBe(false);
+    expect(truncated.stats.degraded).toBe(true);
+  });
+
+  it("a clean all-ok run is not degraded and has no truncated count", async () => {
+    const { stats } = await detectAds({ transcript: AD_TRANSCRIPT, fetch: fetchReturning(AD_QUOTES) });
+    expect(stats.degraded).toBe(false);
+    expect(stats.windowsTruncated).toBe(0);
+    expect(stats.failureReasons).toEqual({});
+  });
+
+  it("a skipped failed window still behaves as before (windowsFailed, not windowsTruncated)", async () => {
+    // Regression guard: the truncated-but-used path must not change how a genuinely
+    // failed (skipped) window is bookkept.
+    const fetch = vi.fn(async () => ({ ok: false, status: 500, text: async () => "boom" }));
+    const { ads, stats } = await detectAds({ transcript: AD_TRANSCRIPT, fetch });
+    expect(ads).toEqual([]);
+    expect(stats.windowsFailed).toBe(1);
+    expect(stats.windowsTruncated).toBe(0);
+    expect(stats.degraded).toBe(true);
+    expect(stats.failureReasons).toEqual({ http: 1 });
+  });
+
+  it("a truncated response that PARSED but is wrong-shape stays a parse-error, not truncated-but-used", async () => {
+    // finish_reason "length" with valid JSON that lacks the `ads` array: no ad is
+    // used, so it must be the skipped parse-error path (windowsFailed), NOT counted as
+    // a truncated-but-used window. Guards against double-counting / claiming an unused
+    // window contributed ads.
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ choices: [{ finish_reason: "length", message: { content: '{"unexpected":true}' } }] }),
+    }));
+    const { ads, stats } = await detectAds({ transcript: AD_TRANSCRIPT, fetch });
+    expect(ads).toEqual([]);
+    expect(stats.windowsFailed).toBe(1);
+    expect(stats.windowsTruncated).toBe(0);
+    expect(stats.failureReasons).toEqual({ "parse-error": 1 });
+  });
+
+  it("the catastrophic-empty return carries windowsTruncated:0", async () => {
+    const { stats } = await detectAds({ transcript: null, fetch: fetchReturning([]) });
+    expect(stats.windowsTruncated).toBe(0);
+    expect(stats.degraded).toBe(false);
   });
 });
