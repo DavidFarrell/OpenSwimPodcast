@@ -8,6 +8,7 @@ import { buildTrimAudioUrls } from "./trimAudio.js";
 import { sentenceLines, preselectFromCuts, toggleSentence, selectedToRanges, selectedCount, selectableCuts } from "./transcriptToggle.js";
 import { degradeSummary } from "./degradeSummary.js";
 import { snapshotInitial, buildCaptureRecords } from "./reviewCapture.js";
+import { shouldCaptureOnOpen, nextOpenSet } from "./panelOpen.js";
 import { commitAndCapture, cancelTransfer } from "./commitCapture.js";
 import { sendDisabled, sendLabel } from "./sendGate.js";
 import { initWaiting, reduceWaiting, bannerVisible } from "./waitingState.js";
@@ -224,6 +225,13 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
   // the detector's cuts start yellow (default == today). Updated ONLY locally while
   // the overlay is open; Continue commits it via trim.setCuts and fails closed.
   const [reviewSelected, setReviewSelected] = useState({});
+  // CONTROLLED-OPEN (slice 3). Which episode panels are open, owned here so a panel's
+  // <details open> is the parent's decision, not the DOM's. A Set<uuid> in STATE (it
+  // drives the open prop, so it must re-render), distinct from the capture-tracking refs
+  // below which are pure observation. ensurePanelOpen is the ONE path that opens a panel
+  // (user click now, programmatic nav in slice 4); it captures on first open then adds
+  // the uuid. A user close just drops the uuid - it never re-captures or un-reviews.
+  const [openUuids, setOpenUuids] = useState(new Set());
   const reviewAudioUrls = useMemo(() => buildTrimAudioUrls(downloadByUuid), [downloadByUuid]);
   // The gate is correct by construction: toggles update ONLY local state while the
   // overlay is open (no incremental IPC), then Continue RE-SENDS the authoritative
@@ -294,6 +302,8 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
         reviewSnapshots.current = {};
         reviewOpenedAt.current = {};
         reviewToggles.current = {};
+        // New gate - every panel starts collapsed (observable behaviour unchanged).
+        setOpenUuids(new Set());
         const items = Array.isArray(evt.items) ? evt.items : [];
         setReview({ items });
         // Seed each episode's selected (yellow) set from its detector cuts, so the
@@ -355,24 +365,39 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     reviewToggles.current[uuid] = (reviewToggles.current[uuid] || 0) + 1;
     setReviewSelected((p) => ({ ...p, [uuid]: toggleSentence(p[uuid] || new Set(), index) }));
   };
-  // The user opened an episode's panel. Record it as REVIEWED and, on the FIRST open,
-  // freeze the initial snapshot (the proposal + lines as the detector posed them) from
-  // the SAME sentenceLines the gate collapses at Continue. Wrapped so a snapshot error
-  // can never break the gate; capture for that episode is simply dropped. Best-effort
-  // and side-effect-free with respect to the cut-set.
-  const onReviewOpen = (uuid) => {
-    if (!uuid || reviewedUuids.current.has(uuid)) return;
-    reviewedUuids.current.add(uuid);
-    reviewOpenedAt.current[uuid] = Date.now();
-    try {
-      const item = (review ? review.items : []).find((it) => it.uuid === uuid);
-      if (item) {
-        const lines = sentenceLines({ segments: item.segments || [] });
-        reviewSnapshots.current[uuid] = snapshotInitial({ lines, cuts: item.cuts || [] });
+  // Open a panel. THE single open path - user click now, programmatic nav in slice 4.
+  // On the FIRST open of an episode it records it REVIEWED and freezes the initial
+  // snapshot (the proposal + lines as the detector posed them) from the SAME
+  // sentenceLines the gate collapses at Continue, BEFORE any toggle can mutate the
+  // selection. shouldCaptureOnOpen is the once-per-episode guard: a re-open after a
+  // close never re-captures. The snapshot is wrapped so a snapshot error can never
+  // break the gate; capture for that episode is simply dropped. Best-effort and
+  // side-effect-free with respect to the cut-set. THEN the uuid joins openUuids so the
+  // panel renders open.
+  const ensurePanelOpen = (uuid) => {
+    if (!uuid) return;
+    if (shouldCaptureOnOpen(reviewedUuids.current, uuid)) {
+      reviewedUuids.current.add(uuid);
+      reviewOpenedAt.current[uuid] = Date.now();
+      try {
+        const item = (review ? review.items : []).find((it) => it.uuid === uuid);
+        if (item) {
+          const lines = sentenceLines({ segments: item.segments || [] });
+          reviewSnapshots.current[uuid] = snapshotInitial({ lines, cuts: item.cuts || [] });
+        }
+      } catch {
+        // snapshot failed - leave it absent so buildCaptureRecords skips this episode
       }
-    } catch {
-      // snapshot failed - leave it absent so buildCaptureRecords skips this episode
     }
+    setOpenUuids((cur) => nextOpenSet(cur, uuid, true));
+  };
+  // The panel reported a native <details> toggle. Open routes through ensurePanelOpen
+  // (capture-then-open); close just drops the uuid from the open-set so the controlled
+  // `open` prop follows the DOM. A close NEVER re-captures or un-reviews - the snapshot
+  // and reviewed mark, once taken at first open, persist for the whole gate.
+  const onPanelToggle = (uuid, isOpen) => {
+    if (isOpen) ensurePanelOpen(uuid);
+    else setOpenUuids((cur) => nextOpenSet(cur, uuid, false));
   };
   // Per-episode final cut ranges = the contiguous selected sentence runs. Computed
   // from the live selection + the episode's sentence lines. This is exactly what
@@ -698,8 +723,8 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
                       selected={reviewSelected[item.uuid]}
                       onToggleSentence={onReviewToggle}
                       audioUrl={reviewAudioUrls[item.uuid]}
-                      defaultOpen={false}
-                      onOpen={onReviewOpen}
+                      open={openUuids.has(item.uuid)}
+                      onOpenChange={onPanelToggle}
                       degrade={item.degrade} />
                   </div>
                 );
