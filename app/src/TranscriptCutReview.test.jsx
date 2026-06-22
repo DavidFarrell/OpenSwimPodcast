@@ -277,6 +277,55 @@ describe("TranscriptCutReview - onOpen fires on user open, not on close", () => 
   });
 });
 
+describe("TranscriptCutReview - degraded-detection warning row (Slice 2)", () => {
+  it("renders the warning row when the episode is degraded", () => {
+    const html = renderToStaticMarkup(
+      <TranscriptCutReview uuid="e1" transcript={transcript} trimEntry={trimEntry}
+        selected={preselected()} degrade={{ degraded: true, windowsFailed: 2, windowsRun: 5 }} />
+    );
+    expect(html).toContain("transcript-cut-review__degraded");
+    expect(html).toContain("detection may be incomplete");
+    expect(html).toContain("2 of 5 sections");
+    // Plain declarative, no em dash.
+    expect(html).not.toContain("—");
+  });
+
+  it("renders NO warning row when the episode is not degraded", () => {
+    const html = renderToStaticMarkup(
+      <TranscriptCutReview uuid="e1" transcript={transcript} trimEntry={trimEntry}
+        selected={preselected()} degrade={{ degraded: false, windowsFailed: 0, windowsRun: 5 }} />
+    );
+    expect(html).not.toContain("transcript-cut-review__degraded");
+    expect(html).not.toContain("detection may be incomplete");
+  });
+
+  it("renders NO warning row when degrade is absent (the common case)", () => {
+    const html = renderToStaticMarkup(
+      <TranscriptCutReview uuid="e1" transcript={transcript} trimEntry={trimEntry}
+        selected={preselected()} />
+    );
+    expect(html).not.toContain("transcript-cut-review__degraded");
+  });
+
+  it("CARDINAL: the warning row changes neither the selection nor the rendered cuts", () => {
+    // The degraded warning is purely informational - the selected (yellow) lines and
+    // the cut count must be byte-identical with and without it.
+    const withWarn = renderToStaticMarkup(
+      <TranscriptCutReview uuid="e1" transcript={transcript} trimEntry={trimEntry}
+        selected={preselected()} degrade={{ degraded: true, windowsFailed: 1, windowsRun: 4 }} />
+    );
+    const withoutWarn = renderToStaticMarkup(
+      <TranscriptCutReview uuid="e1" transcript={transcript} trimEntry={trimEntry}
+        selected={preselected()} />
+    );
+    const selCount = (h) => (h.match(/data-selected="true"/g) || []).length;
+    expect(selCount(withWarn)).toBe(selCount(withoutWarn));
+    // Same cut/selected header summary in both.
+    expect(withWarn).toContain("1 cut · 2 lines selected");
+    expect(withoutWarn).toContain("1 cut · 2 lines selected");
+  });
+});
+
 describe("TranscriptCutReview - audio preview is SECONDARY", () => {
   it("renders an <audio> + a ▶ run-head button only when an audioUrl is supplied", () => {
     const withUrl = renderToStaticMarkup(

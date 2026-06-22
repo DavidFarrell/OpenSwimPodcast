@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 
 const require = createRequire(import.meta.url);
-const { runSync, isOurFilename, sha256File, buildPlan, itemNeedsEncode, readManifest, writeManifest, MANIFEST_FILE, generateCuts, adToCut, assignCutIds, resolveEpisodeCuts, EDGE_SNAP_SEC, generateIntro, INTRO_PIPELINE_VERSION } = require("./sync.cjs");
+const { runSync, isOurFilename, sha256File, buildPlan, itemNeedsEncode, readManifest, writeManifest, MANIFEST_FILE, generateCuts, adToCut, assignCutIds, resolveEpisodeCuts, degradeFromStats, EDGE_SNAP_SEC, generateIntro, INTRO_PIPELINE_VERSION } = require("./sync.cjs");
 const { cutId } = require("./detectAds.cjs");
 
 function mkTmp(label = "os-sync-") { return fs.mkdtempSync(path.join(os.tmpdir(), label)); }
@@ -1416,6 +1416,71 @@ describe("generateCuts", () => {
   });
 });
 
+describe("degradeFromStats (Slice 2) - distil the detector's failure bookkeeping", () => {
+  it("clean run -> not degraded, zero counts", () => {
+    expect(degradeFromStats({ windowsRun: 4, windowsFailed: 0, degraded: false }))
+      .toEqual({ degraded: false, windowsFailed: 0, windowsRun: 4 });
+  });
+
+  it("a failed window -> degraded with the counts carried", () => {
+    expect(degradeFromStats({ windowsRun: 6, windowsFailed: 2, degraded: true }))
+      .toEqual({ degraded: true, windowsFailed: 2, windowsRun: 6 });
+  });
+
+  it("treats a positive failure count as degraded even if the flag is missing", () => {
+    // Defence in depth: the warning must never be dropped because a derived flag was absent.
+    expect(degradeFromStats({ windowsRun: 3, windowsFailed: 1 }).degraded).toBe(true);
+  });
+
+  it("a missing / garbage stats object -> not degraded, zero counts", () => {
+    expect(degradeFromStats(undefined)).toEqual({ degraded: false, windowsFailed: 0, windowsRun: 0 });
+    expect(degradeFromStats(null)).toEqual({ degraded: false, windowsFailed: 0, windowsRun: 0 });
+    expect(degradeFromStats({})).toEqual({ degraded: false, windowsFailed: 0, windowsRun: 0 });
+    expect(degradeFromStats({ windowsFailed: -1, windowsRun: "x" }))
+      .toEqual({ degraded: false, windowsFailed: 0, windowsRun: 0 });
+  });
+});
+
+describe("generateCuts degraded propagation (Slice 2)", () => {
+  it("carries the detector's degraded signal onto the result (cuts present)", async () => {
+    const transcribeFn = vi.fn(async () => ({ segments: [
+      { start: 0, end: 10, text: "intro" },
+      { start: 600, end: 630, text: "ad" },
+      { start: 700, end: 1300, text: "content" },
+    ] }));
+    const detectAdsFn = vi.fn(async () => ({
+      ads: [{ startIndex: 1, endIndex: 1, startSec: 600, endSec: 630, needsReview: false, reasons: [] }],
+      stats: { windowsRun: 5, windowsFailed: 2, failureReasons: { timeout: 2 }, degraded: true },
+    }));
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn });
+    expect(out.degrade).toEqual({ degraded: true, windowsFailed: 2, windowsRun: 5 });
+    // Cardinal-additive: the cut is exactly what the detector proposed; degrade is metadata.
+    expect(out.cuts).toHaveLength(1);
+    expect(out.cuts[0].startSec).toBe(600);
+  });
+
+  it("a degraded ZERO-cut run still carries the degrade signal (the silent-clean case)", async () => {
+    // Every window failed -> no ads -> would look clean. The degrade signal is what
+    // lets the gate surface it instead of silently skipping.
+    const transcribeFn = vi.fn(async () => ({ segments: [{ start: 0, end: 10, text: "hi" }] }));
+    const detectAdsFn = vi.fn(async () => ({
+      ads: [],
+      stats: { windowsRun: 3, windowsFailed: 3, failureReasons: { "context-exceeded": 3 }, degraded: true },
+    }));
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn });
+    expect(out.status).toBe("ready");
+    expect(out.cuts).toEqual([]);
+    expect(out.degrade).toEqual({ degraded: true, windowsFailed: 3, windowsRun: 3 });
+  });
+
+  it("a clean run carries a not-degraded signal", async () => {
+    const transcribeFn = vi.fn(async () => ({ segments: [{ start: 0, end: 10, text: "hi" }] }));
+    const detectAdsFn = vi.fn(async () => ({ ads: [], stats: { windowsRun: 2, windowsFailed: 0, degraded: false } }));
+    const out = await generateCuts({ src: "/x.mp3", transcribeFn, detectAdsFn });
+    expect(out.degrade.degraded).toBe(false);
+  });
+});
+
 describe("generateCuts decision-cache reuse (P3c)", () => {
   // A flagged mid-roll the detector keeps surfacing. Without a cached decision it
   // should always come back needs-review.
@@ -2035,6 +2100,90 @@ describe("runSync trim stage", () => {
     expect(res.ok).toBe(true);
     expect(convertFn).not.toHaveBeenCalled();
     expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
+  });
+
+  // --- Degraded-detection gate admission (Slice 2, plan decision 8) ---
+
+  // A transcript with NO ads, but detection DEGRADED: every window failed, so it found
+  // zero cuts and would look clean. The gate must still surface it with the warning.
+  function degradedZeroTranscribe() {
+    return vi.fn(async () => ({ segments: [
+      { start: 0, end: 50, text: "the whole episode" },
+      { start: 50, end: 1200, text: "rest of the show" },
+    ] }));
+  }
+  function degradedZeroDetect() {
+    return vi.fn(async () => ({
+      ads: [],
+      stats: { windowsRun: 4, windowsFailed: 4, failureReasons: { "context-exceeded": 4 }, degraded: true },
+    }));
+  }
+
+  it("admits a DEGRADED zero-cut episode to the gate (not silently clean)", async () => {
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("episode audio"));
+    const convertFn = vi.fn(async ({ dest }) => { fs.writeFileSync(dest, Buffer.from("x")); return { bytes: 1, durationSec: 60, fromCache: false }; });
+
+    let gateSawItems = null;
+    const awaitReview = vi.fn(async (items) => { gateSawItems = items; return {}; });
+
+    const events = [];
+    await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: degradedZeroTranscribe(), detectAdsFn: degradedZeroDetect(), convertFn,
+      awaitReview, onEvent: (e) => events.push(e),
+    });
+
+    // The gate ran and was handed the degraded episode EVEN THOUGH it has zero cuts.
+    expect(awaitReview).toHaveBeenCalledOnce();
+    expect(gateSawItems).toHaveLength(1);
+    expect(gateSawItems[0].uuid).toBe("a");
+    expect(gateSawItems[0].cuts).toEqual([]);
+    expect(gateSawItems[0].degrade).toEqual({ degraded: true, windowsFailed: 4, windowsRun: 4 });
+    // The review event reached the renderer carrying the degrade signal.
+    const review = events.find((e) => e.type === "review");
+    expect(review).toBeTruthy();
+    expect(review.items[0].degrade.degraded).toBe(true);
+  });
+
+  it("CARDINAL: a degraded zero-cut episode commits NO cut (audio survives untouched)", async () => {
+    const payload = Buffer.from("episode audio that must survive untouched");
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), payload);
+    // A degraded episode with zero cuts is purely informational - the gate surfaces a
+    // warning but there is nothing to cut. The convert loop must NOT trim, and the
+    // original audio must reach the device byte-identical.
+    const convertFn = vi.fn();
+    const awaitReview = vi.fn(async () => ({}));
+
+    const res = await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: degradedZeroTranscribe(), detectAdsFn: degradedZeroDetect(), convertFn,
+      awaitReview, onEvent: () => {},
+    });
+
+    expect(res.ok).toBe(true);
+    // No cuts -> no re-encode -> plain copy; the converter is never invoked.
+    expect(convertFn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(devicePath, "01_hardfork.mp3")).equals(payload)).toBe(true);
+  });
+
+  it("a CLEAN zero-cut episode is still NOT surfaced (no warning, no panel)", async () => {
+    // Regression guard: only DEGRADED zero-cut episodes are admitted. A clean
+    // no-ads-found episode must keep skipping the gate entirely (no spurious gate).
+    fs.writeFileSync(path.join(cacheDir, "a.mp3"), Buffer.from("clean audio"));
+    const cleanTranscribe = vi.fn(async () => ({ segments: [{ start: 0, end: 50, text: "all content" }] }));
+    const cleanDetect = vi.fn(async () => ({ ads: [], stats: { windowsRun: 2, windowsFailed: 0, degraded: false } }));
+    const awaitReview = vi.fn(async () => ({}));
+
+    const events = [];
+    await runSync({
+      devicePath, cacheDir, queue: [trimItem()],
+      transcribeFn: cleanTranscribe, detectAdsFn: cleanDetect,
+      convertFn: vi.fn(), awaitReview, onEvent: (e) => events.push(e),
+    });
+
+    // No review gate fired - a clean zero-cut episode has nothing to surface.
+    expect(awaitReview).not.toHaveBeenCalled();
+    expect(events.find((e) => e.type === "review")).toBeFalsy();
   });
 
   it("a 'keep' decision drops the cut: nothing is cut even though it was reviewed", async () => {
