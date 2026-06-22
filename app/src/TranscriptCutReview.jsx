@@ -3,6 +3,7 @@ import {
   panelSummary, selectedCount, heldLines, heldCutCount,
 } from "./transcriptToggle.js";
 import { previewJoinWindows } from "./cutlistReview.js";
+import { degradeSummary } from "./degradeSummary.js";
 
 // Unified per-episode transcript-toggle review surface (redesign of CutlistReview +
 // TranscriptEvidence). ONE collapsible panel per episode that has cuts. The header
@@ -44,11 +45,17 @@ import { previewJoinWindows } from "./cutlistReview.js";
 //   onOpen            (uuid) => void - fired when the user opens the panel (the open
 //                     transition of <details>, never on close). The parent dedupes to
 //                     first-open and freezes its capture snapshot there.
+//   degrade           { degraded, windowsFailed, windowsRun } - the incomplete-detection
+//                     signal. When degraded, a warning row is rendered telling the user
+//                     the cuts shown may be missing some ads. PURELY INFORMATIONAL: it
+//                     never changes the selection or what gets cut.
 //
 // Renders nothing when there is no usable cut OR no usable transcript - no clutter
-// for episodes whose cuts all auto-applied with nothing to read, matching today.
+// for episodes whose cuts all auto-applied with nothing to read, matching today. (A
+// DEGRADED episode with zero cuts is surfaced by the parent gate, not here - this
+// panel still needs a cut + a transcript body to be worth opening.)
 export function TranscriptCutReview({
-  uuid, transcript, trimEntry, selected, onToggleSentence, audioUrl, defaultOpen = false, onOpen,
+  uuid, transcript, trimEntry, selected, onToggleSentence, audioUrl, defaultOpen = false, onOpen, degrade,
 }) {
   const cuts = selectableCuts(trimEntry);
   const lines = sentenceLines(transcript);
@@ -155,6 +162,10 @@ export function TranscriptCutReview({
   const yellowCount = selectedCount(sel);
   const cutCount = ranges.length;
 
+  // Incomplete-detection warning. Empty string when not degraded, so the row is only
+  // rendered when there is something to warn about. Informational only.
+  const degradeText = degradeSummary(degrade);
+
   // Per-sentence row styling. The cut decision is BINARY and encoded by TEXT COLOUR
   // ALONE: bright amber (+ medium weight) = in the cut, dim grey = kept. No background
   // wash, no left rule - the whole row is a button so reading + clicking is one gesture,
@@ -215,6 +226,15 @@ export function TranscriptCutReview({
         spots the detector wasn't sure about - take a look, then click to cut if you
         agree. Use the ▶ to hear how a cut joins.
       </div>
+
+      {degradeText && (
+        <div className="transcript-cut-review__degraded"
+          style={{ fontFamily: "var(--font-mono)", fontSize: 10, letterSpacing: ".5px",
+            color: "var(--ct-amber)", border: "1px solid var(--ct-amber)", borderRadius: 2,
+            padding: "4px 8px", margin: "0 0 8px" }}>
+          ⚠ {degradeText}
+        </div>
+      )}
 
       {hasUnreviewedHeld && (
         <button type="button" className="transcript-cut-review__jump-flagged"

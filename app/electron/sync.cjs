@@ -433,6 +433,24 @@ function assignCutIds(cuts) {
   return out;
 }
 
+// Distil the detector's stats into the terse degraded shape the review payload
+// carries. PURE - no side effects, no cut data. A degraded run is one where one or
+// more windows FAILED (token/context shortfall, timeout, unparseable reply), so the
+// run could look like a clean "no ads found" when it actually could not read part of
+// the episode. Returns { degraded, windowsFailed, windowsRun }: degraded false (and
+// zero counts) for a clean run or a missing/garbage stats object. This is the ONLY
+// thing that flows downstream from the failure bookkeeping - it never touches cuts.
+function degradeFromStats(stats) {
+  const s = stats && typeof stats === "object" ? stats : {};
+  const num = (n) => (Number.isFinite(n) && n > 0 ? Math.floor(n) : 0);
+  const windowsFailed = num(s.windowsFailed);
+  const windowsRun = num(s.windowsRun);
+  // Trust the detector's derived flag, but treat any positive failure count as
+  // degraded too (defence in depth - the warning must never be silently dropped).
+  const degraded = !!s.degraded || windowsFailed > 0;
+  return { degraded, windowsFailed, windowsRun };
+}
+
 // Run the detector over an episode transcript and turn the result into a cut
 // list. Returns { status, cuts } where status is one of:
 //   idle | ready | needs-review | skipped
@@ -505,6 +523,11 @@ async function generateCuts({
     }
     if (!result || !Array.isArray(result.ads)) { logEvent("trim", "detector returned no result - trim skipped (is LM Studio running with the model loaded?)"); return { status: "skipped", cuts: [] }; }
 
+    // Terse degraded signal (informational only - never touches cuts). Carried onto
+    // the result so a degraded episode surfaces in the review gate even when it found
+    // zero cuts (the silent "looks clean" failure case this exists to catch).
+    const degrade = degradeFromStats(result.stats);
+
     const detected = result.ads.map((ad) => adToCut({ ad, segments }))
       .filter((c) => Number.isFinite(c.startSec) && Number.isFinite(c.endSec) && c.endSec > c.startSec);
 
@@ -549,11 +572,12 @@ async function generateCuts({
     // endSec/label the user sees. Additive only.
     cuts = assignCutIds(cuts);
 
-    if (cuts.length === 0) return { status: "ready", cuts: [], segments: [] };
+    if (cuts.length === 0) return { status: "ready", cuts: [], segments: [], degrade };
     const status = cuts.some((c) => c.needsReview) ? "needs-review" : "ready";
     // Carry the normalised segments so the renderer's Advanced transcript-as-
     // evidence view (P3d) can highlight the cut ranges in context. Read-only data.
-    return { status, cuts, segments };
+    // degrade is the informational incomplete-detection signal (cut set is unaffected).
+    return { status, cuts, segments, degrade };
   } catch {
     return { status: "skipped", cuts: [] };
   }
@@ -818,11 +842,19 @@ async function runSync({
   const reviewItems = trimItems
     .map(({ it, i }) => {
       const cuts = (trimResults[i] && trimResults[i].cuts) || [];
-      if (!cuts.length) return null; // nothing detected -> nothing to surface
+      const degrade = (trimResults[i] && trimResults[i].degrade) || null;
+      // Surface an episode when it has cuts OR when detection was DEGRADED. A degraded
+      // episode with zero cuts (yesterday's 4096-context bug: every window failed, 0
+      // cuts, looked clean) must NOT be silently dropped - it carries a warning the
+      // user has to see. This is the only reason a zero-cut episode reaches the gate.
+      if (!cuts.length && !(degrade && degrade.degraded)) return null;
       return {
         i, uuid: it.uuid, slot: it.slot, title: it.title, ext: it.ext || "mp3",
         cuts,
         segments: Array.isArray(trimResults[i].segments) ? trimResults[i].segments : [],
+        // Informational incomplete-detection signal for the warning row. Never used to
+        // add/remove/alter a cut; a degraded zero-cut episode still resolves to no cuts.
+        degrade: degrade || undefined,
       };
     })
     .filter(Boolean);
@@ -1279,4 +1311,4 @@ async function runSync({
   return { ok: true, files: dests, transferred, totals };
 }
 
-module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, generateCuts, adToCut, assignCutIds, resolveEpisodeCuts, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE, EDGE_SNAP_SEC, HARD_FINAL_CUT_MAX_SEC, EDGE_SNAP_GROWTH_MAX_SEC, INTRO_PIPELINE_VERSION };
+module.exports = { runSync, buildPlan, itemNeedsEncode, generateIntro, generateCuts, adToCut, assignCutIds, resolveEpisodeCuts, degradeFromStats, isOurFilename, sha256File, AbortError, readManifest, writeManifest, MANIFEST_FILE, EDGE_SNAP_SEC, HARD_FINAL_CUT_MAX_SEC, EDGE_SNAP_GROWTH_MAX_SEC, INTRO_PIPELINE_VERSION };

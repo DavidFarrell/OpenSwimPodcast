@@ -5,7 +5,8 @@ import { fnameFor } from "./TodayScreen.jsx";
 import { formatMB } from "./useDevice.js";
 import { TranscriptCutReview } from "./TranscriptCutReview.jsx";
 import { buildTrimAudioUrls } from "./trimAudio.js";
-import { sentenceLines, preselectFromCuts, toggleSentence, selectedToRanges, selectedCount } from "./transcriptToggle.js";
+import { sentenceLines, preselectFromCuts, toggleSentence, selectedToRanges, selectedCount, selectableCuts } from "./transcriptToggle.js";
+import { degradeSummary } from "./degradeSummary.js";
 import { snapshotInitial, buildCaptureRecords } from "./reviewCapture.js";
 import { commitAndCapture, cancelTransfer } from "./commitCapture.js";
 import { sendDisabled, sendLabel } from "./sendGate.js";
@@ -485,6 +486,14 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
     ? review.items.reduce((n, it) => n + ((it.cuts && it.cuts.length) || 0), 0)
     : 0;
 
+  // Episodes whose detection was incomplete (degraded). Counted gate-wide so a
+  // degraded episode - especially one with ZERO cuts that would otherwise look clean -
+  // is never silently skipped: the gate header carries an "N had incomplete detection"
+  // line. Informational only; this never changes a cut.
+  const reviewDegradedCount = review
+    ? review.items.filter((it) => it.degrade && it.degrade.degraded).length
+    : 0;
+
   const stageCounts = stages.map((st) => ({
     ...st,
     count: serverPlan.filter((p) => p.stage === st.id).length,
@@ -647,6 +656,11 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
                 <div className="ct-subhead" style={{ marginTop: 4 }}>
                   {reviewCutsFound} cut{reviewCutsFound !== 1 ? "s" : ""} found · {reviewSelectedLines} line{reviewSelectedLines !== 1 ? "s" : ""} selected to cut across {review.items.length} episode{review.items.length !== 1 ? "s" : ""}
                 </div>
+                {reviewDegradedCount > 0 && (
+                  <div className="ct-meta" style={{ marginTop: 4, color: "var(--ct-amber)" }}>
+                    ⚠ {reviewDegradedCount} episode{reviewDegradedCount !== 1 ? "s" : ""} had incomplete detection - some ads may have been missed.
+                  </div>
+                )}
               </div>
               <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--ct-amber)" }}></div>
             </div>
@@ -656,20 +670,40 @@ export function SyncScreen({ items, order, onDevice, onDone, onBack, armed, onAr
                 <span style={{ color: "var(--ct-amber)" }}>Yellow</span> lines will be cut;
                 grey lines are kept. Click any line to add or remove it from the cut.
               </div>
-              {review.items.map((item) => (
-                <div key={item.uuid} style={{ marginTop: 8 }}>
-                  <div className="ct-label" style={{ padding: "0 20px" }}>{item.title}</div>
-                  <TranscriptCutReview
-                    uuid={item.uuid}
-                    transcript={item.segments}
-                    trimEntry={{ cuts: item.cuts || [] }}
-                    selected={reviewSelected[item.uuid]}
-                    onToggleSentence={onReviewToggle}
-                    audioUrl={reviewAudioUrls[item.uuid]}
-                    defaultOpen={false}
-                    onOpen={onReviewOpen} />
-                </div>
-              ))}
+              {review.items.map((item) => {
+                // Whether the per-episode panel will render at all: it needs a usable
+                // cut AND a usable transcript (TranscriptCutReview's own null-gate). A
+                // DEGRADED episode with zero cuts renders no panel, so we surface its
+                // warning here instead - otherwise that (silent "looks clean") case
+                // would show nothing, which is the whole point of this feature.
+                const panelRenders =
+                  selectableCuts({ cuts: item.cuts || [] }).length > 0
+                  && sentenceLines({ segments: item.segments || [] }).length > 0;
+                const fallbackDegradeText = (!panelRenders && item.degrade)
+                  ? degradeSummary(item.degrade) : "";
+                return (
+                  <div key={item.uuid} style={{ marginTop: 8 }}>
+                    <div className="ct-label" style={{ padding: "0 20px" }}>{item.title}</div>
+                    {fallbackDegradeText && (
+                      <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, letterSpacing: ".5px",
+                        color: "var(--ct-amber)", border: "1px solid var(--ct-amber)", borderRadius: 2,
+                        padding: "4px 8px", margin: "6px 20px 0" }}>
+                        ⚠ {fallbackDegradeText}
+                      </div>
+                    )}
+                    <TranscriptCutReview
+                      uuid={item.uuid}
+                      transcript={item.segments}
+                      trimEntry={{ cuts: item.cuts || [] }}
+                      selected={reviewSelected[item.uuid]}
+                      onToggleSentence={onReviewToggle}
+                      audioUrl={reviewAudioUrls[item.uuid]}
+                      defaultOpen={false}
+                      onOpen={onReviewOpen}
+                      degrade={item.degrade} />
+                  </div>
+                );
+              })}
             </div>
             {reviewError && (
               <div className="ct-meta" style={{ color: "var(--ct-error)", padding: "0 20px 8px" }}>
